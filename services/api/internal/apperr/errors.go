@@ -108,17 +108,23 @@ func HTTPStatus(code Code) int {
 		// 429 with a Retry-After header set by the middleware; the code alone
 		// tells the frontend to back off instead of retrying in a loop.
 		return http.StatusTooManyRequests
-	case CodeClassroomNotFound, CodeSessionNotFound, CodeUserNotFound:
+	case CodeClassroomNotFound, CodeSessionNotFound, CodeUserNotFound, CodeStudentNotFound,
+		CodeStudentNotAssigned:
 		// 404 rather than 403 for "exists but is not yours" only where the
 		// resource id is already unguessable (UUID) and the caller has a
 		// legitimate reason to distinguish "typo" from "denied".
+		//
+		// CodeStudentNotFound (no such account) and CodeStudentNotAssigned (the
+		// account exists but is not on this roster) are both 404: in each case the
+		// caller named a student who is not there, and the fix is to correct the
+		// name or add them — not to log in differently.
 		return http.StatusNotFound
 	case CodeAccountAlreadyExists:
 		// 409 — the request was well formed and would have succeeded against a
 		// different account name; the conflict is with existing state.
 		return http.StatusConflict
 	case CodeClassroomClosed, CodeClassroomAlreadyOpen, CodeClassroomAlreadyClosed,
-		CodeStudentNotAssigned, CodeSessionAlreadyActive:
+		CodeSessionAlreadyActive:
 		return http.StatusConflict // 409 — the request was valid for another state
 	case CodeCannotDisableSelf, CodeLastAdminProtected:
 		// 409 and not 400: the body was well formed and the action is legal in
@@ -126,11 +132,17 @@ func HTTPStatus(code Code) int {
 		// is calling, how many administrators remain). Retrying the identical
 		// request cannot succeed until that state changes.
 		return http.StatusConflict
-	case CodeInvalidRequest, CodePasswordPolicyViolation:
+	case CodeInvalidRequest, CodePasswordPolicyViolation, CodeNotAStudent:
 		// PASSWORD_POLICY_VIOLATION is a 400 and not a 409: nothing conflicts with
 		// existing state, the submitted value itself is unusable. The distinct
 		// code exists so the frontend can attach the message to the password
 		// field instead of showing a generic banner.
+		//
+		// NOT_A_STUDENT is a 400 for the same reason: the account named in the
+		// request exists but is not usable here, and no amount of retrying or
+		// waiting changes that — the teacher has to pick a different account. It is
+		// reported per account inside the batch-add response, so this status is
+		// only what the code would mean if it ever stood alone.
 		return http.StatusBadRequest
 	case CodeMediaTokenFailed:
 		// 502 because the failure is in the media plane, not in the request: the

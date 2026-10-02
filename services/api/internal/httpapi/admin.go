@@ -634,16 +634,16 @@ func parseUserID(c *gin.Context) (uuid.UUID, bool) {
 // bindStrictJSON decodes a request body that must be present and must contain
 // exactly the fields the endpoint declares.
 func bindStrictJSON(c *gin.Context, target any) bool {
-	return bindJSON(c, target, false)
+	return bindJSONLimit(c, target, maxAdminBodyBytes, false)
 }
 
 // bindStrictJSONAllowEmpty is bindStrictJSON for endpoints where an absent body
 // is a valid request (the teacher password reset).
 func bindStrictJSONAllowEmpty(c *gin.Context, target any) bool {
-	return bindJSON(c, target, true)
+	return bindJSONLimit(c, target, maxAdminBodyBytes, true)
 }
 
-// bindJSON is the strict request-body decoder.
+// bindJSONLimit is the strict request-body decoder.
 //
 // WHY not gin's ShouldBindJSON: it uses encoding/json's default object handling,
 // which IGNORES unknown fields. For an admin API that is a correctness problem
@@ -656,14 +656,18 @@ func bindStrictJSONAllowEmpty(c *gin.Context, target any) bool {
 // fragment of the body, and password reset bodies contain a password (§59). The
 // message the client gets names the field name from the JSON token, which is not
 // secret material.
-func bindJSON(c *gin.Context, target any, allowEmpty bool) bool {
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxAdminBodyBytes)
+//
+// The body limit is a parameter because the largest legitimate body differs per
+// endpoint (an admin password versus a 100-account import); the bound that matters
+// is that one exists at all and that it is chosen per contract, not guessed.
+func bindJSONLimit(c *gin.Context, target any, limit int64, allowEmpty bool) bool {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
 
 	// Peek first so an empty body can be distinguished from a malformed one: an
 	// empty reset-password body means "generate a password for me".
-	raw, err := io.ReadAll(io.LimitReader(c.Request.Body, maxAdminBodyBytes+1))
+	raw, err := io.ReadAll(io.LimitReader(c.Request.Body, limit+1))
 	if err != nil {
-		LoggerFrom(c).Info("admin request body could not be read", "error", err.Error())
+		LoggerFrom(c).Info("request body could not be read", "error", err.Error())
 		RespondError(c, invalidAdminRequest("the request body could not be read"))
 		return false
 	}
@@ -678,7 +682,7 @@ func bindJSON(c *gin.Context, target any, allowEmpty bool) bool {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
-		LoggerFrom(c).Info("admin request body rejected", "error", err.Error())
+		LoggerFrom(c).Info("request body rejected", "error", err.Error())
 		RespondError(c, invalidAdminRequest(describeJSONError(err)))
 		return false
 	}

@@ -25,14 +25,19 @@
 
 ```text
 services/api/migrations/
-├── 0001_bootstrap.sql        ← Phase 0（已存在）：仅创建扩展
-├── 0002_users.sql            ← Phase 1/2
-├── 0003_classrooms.sql       ← Phase 3
-├── 0004_classroom_students.sql
-├── 0005_classroom_runs.sql
-├── 0006_student_sessions.sql
-└── 0007_session_events.sql
+├── 0001_bootstrap.sql           ← Phase 0：仅创建扩展（pgcrypto / citext）
+├── 0002_users.sql               ← Phase 1：users（角色-密码约束、账号格式约束）
+├── 0003_sessions.sql            ← Phase 1：sessions（登录会话，只存 token 的 SHA-256）
+├── 0004_classrooms.sql          ← Phase 3：classrooms（含 owner 必须是 TEACHER 的触发器）
+├── 0005_classroom_students.sql  ← Phase 3：classroom_students（谁有权进入哪个课堂）
+├── 0006_classroom_runs.sql      ← Phase 3：classroom_runs（一次开启 = 一条 Run）
+├── 0007_student_sessions.sql    ← Phase 6/8：学生在某个 Run 中的课堂连接
+└── 0008_session_events.sql      ← Phase 8：会话事件（只追加）
 ```
+
+> 编号与任务书 §60 的示例（`0001_users.sql` …）相差 2：本项目把"扩展与迁移机制"独立成
+> `0001_bootstrap.sql`、把"登录会话"独立成 `0003_sessions.sql`，因此课堂三张表落在 0004–0006。
+> **编号只增不改**，对不上号时以本表为准。
 
 规则：
 
@@ -146,7 +151,9 @@ CREATE INDEX classrooms_owner_idx ON classrooms (owner_teacher_id, created_at DE
 ```sql
 CREATE TABLE classroom_students (
     classroom_id uuid        NOT NULL REFERENCES classrooms (id) ON DELETE CASCADE,
-    student_id   uuid        NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    -- student_id 用 RESTRICT 而不是 CASCADE：删除一个学生账号不应该悄悄抹掉
+    -- "他曾经被授权进入哪些课堂"这段历史。要移除授权就显式调用移除接口（会留下可审计的动作）。
+    student_id   uuid        NOT NULL REFERENCES users (id) ON DELETE RESTRICT,
     added_at     timestamptz NOT NULL DEFAULT now(),
     added_by     uuid        NULL REFERENCES users (id) ON DELETE SET NULL,
 
@@ -323,16 +330,18 @@ CREATE INDEX sessions_expires_idx ON sessions (expires_at);
 
 ## 6. 迁移历史与当前落地内容
 
-```text
-services/api/migrations/
-├── 0001_bootstrap.sql   扩展：pgcrypto（gen_random_uuid）、citext（account 大小写不敏感）
-├── 0002_users.sql       users（含角色-密码约束、账号格式约束）
-└── 0003_sessions.sql    sessions（服务端只存 token 的 SHA-256）
-```
+截至 Phase 3，迁移历史如下（完整列表见 §2）：
 
-编号与任务书 §60 示例（`0001_users.sql` …）的对应关系：本项目把"扩展与迁移机制"独立成
-`0001_bootstrap.sql`，因此业务表从 `0002` 开始编号。**迁移文件一旦合并就不再修改**，
-只追加新文件。
+| 文件 | Phase | 内容 |
+| --- | --- | --- |
+| `0001_bootstrap.sql` | 0 | 扩展 `pgcrypto`、`citext` |
+| `0002_users.sql` | 1 | `users`（角色-密码约束、账号格式约束） |
+| `0003_sessions.sql` | 1 | `sessions`（登录会话，只存 token 的 SHA-256） |
+| `0004_classrooms.sql` | 3 | `classrooms` + owner 必须是 TEACHER 的触发器 |
+| `0005_classroom_students.sql` | 3 | `classroom_students`（谁有权进入哪个课堂） |
+| `0006_classroom_runs.sql` | 3 | `classroom_runs` + 补 `classrooms.current_run_id` 外键 |
+
+**迁移文件一旦合并就不再修改**，只追加新文件。
 
 ### 6.1 Phase 0 为什么没有业务表
 
@@ -341,7 +350,7 @@ services/api/migrations/
 3. 迁移执行器（`pg_advisory_lock` + `schema_migrations` + 单文件单事务）在 Phase 0 已经可用，
    后续 Phase 只需新增 SQL 文件。
 
-### 6.2 Phase 1 新增的两张表
+### 6.2 Phase 1 的两张表
 
 | 表 | 关键约束 / 索引 | 说明 |
 | --- | --- | --- |
@@ -352,7 +361,19 @@ services/api/migrations/
 （`classwatch_session_student` / `_teacher` / `_admin`），原因见
 [auth/authentication.md](../auth/authentication.md) §3.1。
 
-### 6.3 验证方式
+### 6.3 Phase 3 的三张表
+
+| 表 | 关键约束 / 索引 | 说明 |
+| --- | --- | --- |
+| `classrooms` | `classrooms_run_consistency`（`OPEN ⇔ current_run_id IS NOT NULL`，双向）、`owner_teacher_id` 必须是 TEACHER（**触发器** + 服务端双重校验）、`classrooms_owner_idx` | 见 §4.2；`current_run_id` 的外键在 `0006` 才补上（建表顺序的循环依赖，迁移注释有说明） |
+| `classroom_students` | 复合主键 `(classroom_id, student_id)`、`classroom_id` CASCADE、`student_id` RESTRICT、`classroom_students_student_idx` | 见 §4.3：这张表就是"哪些学生有权看到并进入该课堂"的唯一答案，授权判定在服务端 JOIN 它 |
+| `classroom_runs` | `livekit_room_name` 唯一、`classroom_runs_closed_at` 一致性、**部分唯一索引** `classroom_runs_one_open_idx (classroom_id) WHERE status='OPEN'` | 见 §4.4：一次开启 = 一条 Run；部分唯一索引让"同一课堂同时开两次"在数据库层就不可能 |
+
+状态迁移的完整规则（允许哪些边、谁触发、副作用、并发分析）见
+[database/state-machines.md](state-machines.md) 与
+[architecture/control-plane.md](../architecture/control-plane.md)。
+
+### 6.4 验证方式
 
 ```bash
 make up                 # 启动 postgres 等容器（migrate 服务会自动应用迁移）
@@ -365,10 +386,11 @@ make db-shell           # 进入 psql 自行检查 \dt
 
 | 对象 | 说明 |
 | --- | --- |
-| `schema_migrations` | 迁移执行器自动创建，记录已应用的版本 |
+| `schema_migrations` | 迁移执行器自动创建，记录已应用的版本（当前应为 6 行：0001–0006） |
 | 扩展 `pgcrypto` / `citext` | `0001_bootstrap.sql` |
-| `users` / `sessions` | Phase 1；课堂相关四张表在 Phase 3 |
-| `session_events` | Phase 8（Webhook 与运行时状态就绪之后才有意义） |
+| `users` / `sessions` | Phase 1 |
+| `classrooms` / `classroom_students` / `classroom_runs` | Phase 3 |
+| `student_sessions` / `session_events` | Phase 6/8（媒体接入与 Webhook 就绪之后才有意义） |
 
 ---
 

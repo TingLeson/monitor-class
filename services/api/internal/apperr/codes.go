@@ -51,6 +51,19 @@ const (
 	CodeClassroomAlreadyClosed Code = "CLASSROOM_ALREADY_CLOSED"
 	CodeStudentNotAssigned     Code = "STUDENT_NOT_ASSIGNED"
 
+	// CodeStudentNotFound and CodeNotAStudent are the per-account refusals of the
+	// batch roster import (§11/§69).
+	//
+	// WHY the batch endpoint needs codes of its own instead of one "some accounts
+	// failed": the response is a list of {account, code} pairs, and the teacher's
+	// next action is different for each — fix a typo (STUDENT_NOT_FOUND), use a
+	// student account instead of a colleague's (NOT_A_STUDENT), or ask an
+	// administrator to re-enable the account (ACCOUNT_DISABLED). A single generic
+	// code would push the frontend into parsing the message to tell them apart,
+	// which is exactly what §58 forbids.
+	CodeStudentNotFound Code = "STUDENT_NOT_FOUND"
+	CodeNotAStudent     Code = "NOT_A_STUDENT"
+
 	// Student session lifecycle.
 	CodeSessionAlreadyActive Code = "SESSION_ALREADY_ACTIVE"
 	CodeSessionNotFound      Code = "SESSION_NOT_FOUND"
@@ -111,7 +124,12 @@ var defaultMessages = map[Code]string{
 	CodeClassroomClosed:        "This classroom is closed.",
 	CodeClassroomAlreadyOpen:   "This classroom is already open.",
 	CodeClassroomAlreadyClosed: "This classroom is already closed.",
-	CodeStudentNotAssigned:     "You are not assigned to this classroom.",
+	CodeStudentNotAssigned:     "This student is not assigned to this classroom.",
+	// Written for the batch-import result list, where they sit next to the account
+	// they describe. They stay factual and short because the frontend renders the
+	// code's own localised text; these are the fallbacks.
+	CodeStudentNotFound: "No account exists with this account name.",
+	CodeNotAStudent:     "This account is not a student account.",
 
 	CodeSessionAlreadyActive: "An active session already exists for this account.",
 	CodeSessionNotFound:      "Session not found.",

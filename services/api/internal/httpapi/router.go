@@ -41,6 +41,11 @@ type Deps struct {
 	// database answers 404 there instead of serving a management surface it
 	// cannot back with data.
 	Admin AdminService
+	// Classroom is the classroom domain service (§69). A nil value means the
+	// teacher classroom routes are not registered — same reasoning as Admin: an API
+	// that cannot read or write classrooms must not expose endpoints that pretend
+	// otherwise.
+	Classroom ClassroomService
 	// Limiter protects /api/v1 and, more strictly, the login endpoints. A nil
 	// value installs no rate limiting at all, which is only appropriate in tests:
 	// §2.2/§63 make it mandatory in every real deployment, and main always wires
@@ -139,6 +144,7 @@ func NewRouter(deps Deps) *gin.Engine {
 
 	registerAuthRoutes(v1, deps, resolver, entries)
 	registerAdminRoutes(v1, deps, entries)
+	registerTeacherRoutes(v1, deps, entries)
 
 	// Unknown routes and methods must go through the same error envelope as a
 	// handler failure. gin's defaults are bare text ("404 page not found"), which
@@ -243,6 +249,57 @@ func registerAdminRoutes(v1 *gin.RouterGroup, deps Deps, entries []AuthEntry) {
 	writes.PATCH("/users/:id", handlers.updateUser())
 	writes.PATCH("/users/:id/status", handlers.setStatus())
 	writes.POST("/teachers/:id/reset-password", handlers.resetTeacherPassword())
+}
+
+// registerTeacherRoutes mounts /api/v1/teacher/** — the classroom surface of
+// §42/§69.
+//
+// The group is bound to the TEACHER entry point exactly as /admin is bound to the
+// admin one, and the consequence is deliberate (§4): an administrator session
+// cannot satisfy RequireSession(teacher entry) and gets 403 ROLE_FORBIDDEN on every
+// route here. "Admin" is not a super-teacher in this system — the admin surface
+// manages accounts, and a classroom can only be opened or closed by the teacher who
+// owns it. Giving administrators a bypass "for support" would create exactly one
+// account class whose actions the ownership check does not cover, and that is the
+// account class an attacker would target.
+//
+// Ownership is a SECOND check, performed in the service for every endpoint, not a
+// consequence of the route prefix: the prefix answers "is this caller a TEACHER?",
+// never "is this YOUR classroom" (§37/§63).
+//
+// Reads are mounted on the outer group, writes on an inner group that carries
+// CSRFProtection, so adding a write endpoint to the wrong group is the only way to
+// lose the CSRF check — and there is no wrong group to add it to.
+func registerTeacherRoutes(v1 *gin.RouterGroup, deps Deps, entries []AuthEntry) {
+	teacherEntry, ok := entryForRole(entries, user.RoleTeacher)
+	if !ok || deps.Classroom == nil || deps.Auth == nil {
+		// No teacher entry (no configuration) or no classroom service (no
+		// database): the routes are not registered, so they answer 404 instead of
+		// existing without an authorization chain in front of them.
+		return
+	}
+
+	mw := newAuthMiddleware(deps.Auth, entries, deps.Config)
+	handlers := newClassroomHandlers(deps.Classroom)
+
+	group := v1.Group("/teacher")
+	group.Use(
+		mw.RequireSession(teacherEntry),
+		mw.RequireRole(teacherEntry),
+	)
+
+	group.GET("/classrooms", handlers.listClassrooms())
+	group.GET("/classrooms/:id", handlers.getClassroom())
+	group.GET("/classrooms/:id/students", handlers.listStudents())
+
+	writes := group.Group("")
+	writes.Use(mw.CSRFProtection(teacherEntry))
+	writes.POST("/classrooms", handlers.createClassroom())
+	writes.PATCH("/classrooms/:id", handlers.updateClassroom())
+	writes.POST("/classrooms/:id/students", handlers.addStudents())
+	writes.DELETE("/classrooms/:id/students/:studentId", handlers.removeStudent())
+	writes.POST("/classrooms/:id/open", handlers.openClassroom())
+	writes.POST("/classrooms/:id/close", handlers.closeClassroom())
 }
 
 // entryForRole finds the entry point of one role.

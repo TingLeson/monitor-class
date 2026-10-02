@@ -154,12 +154,16 @@ make list-users
 | --- | --- | --- | --- |
 | `admin` | `classwatch-admin-2026` | ADMIN | 系统管理员 |
 | `teacher001` | `classwatch-teacher-2026` | TEACHER | 李老师 |
+| `teacher002` | `classwatch-teacher2-2026` | TEACHER | 王老师（对照账号） |
 | `S10086` | 无（学生免密） | STUDENT | 张三 |
 | `S10087` | 无 | STUDENT | 李四 |
 | `S10088` | 无 | STUDENT | 王五 |
 
 > 这些是**本地开发占位凭据**，仅用于在这台机器上点开三个入口看效果。
 > 任何共享或生产环境都必须用 `make create-admin` 重新创建自己的账号与强密码。
+
+`teacher002` 是**对照账号**：用 teacher001 建一个课堂，再用 teacher002 登录去访问它，
+可以手工验证"别人的课堂一律 403 `CLASSROOM_NOT_OWNER`"这条授权规则（任务书 §4/§63）。
 
 单独操作某个前端/包：
 

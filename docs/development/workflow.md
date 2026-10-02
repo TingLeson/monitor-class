@@ -12,7 +12,7 @@
 | 0 | `phase/00-bootstrap` | 工程骨架：monorepo、容器、迁移机制、CI、文档 | ✅ 已完成 |
 | 1 | `phase/01-auth` | 三种登录、Session、RBAC、停用账号 | ✅ 已完成 |
 | 2 | `phase/02-admin-users` | 管理员用户管理（创建老师/学生、启停用、重置密码） | ✅ 已完成 |
-| 3 | `phase/03-classrooms` | Classroom 领域、授权学生、OPEN/CLOSED、ClassroomRun | ⏳ |
+| 3 | `phase/03-classrooms` | Classroom 领域、授权学生、OPEN/CLOSED、ClassroomRun | ✅ 已完成 |
 | 4 | `phase/04-student-portal` | 学生课堂门户（进入按钮 → PreJoin） | ⏳ |
 | 5 | `phase/05-screen-gate` | 整屏共享 Gate（**不接 LiveKit**，重点学习 Phase） | ⏳ |
 | 6 | `phase/06-livekit-screen` | 1 老师 + 1 学生 + 1 屏幕轨道 | ⏳ |

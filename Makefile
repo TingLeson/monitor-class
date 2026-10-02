@@ -163,9 +163,11 @@ test-integration: env ## 运行需要真实 PostgreSQL 的集成测试
 		|| $(COMPOSE) exec -T postgres createdb -U $(POSTGRES_USER) classwatch_test
 	@# DSN 在这里显式拼装：集成测试必须打真实的 compose PostgreSQL，而不是某个本地残留实例。
 	@# Phase 1 起集成测试分布在 user / auth / httpapi / ratelimit / cmd 等多个包，因此跑全量。
+	@# -p 1：这些包共用同一个 classwatch_test 库，包级并行会互相干扰（例如某个用例临时
+	@# 调整 ACTIVE 管理员集合时，另一个包同时在数管理员）。串行换来的是稳定，代价只有十几秒。
 	cd $(API_DIR) && TEST_DATABASE_URL="postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/classwatch_test?sslmode=disable" \
 		TEST_REDIS_ADDR="localhost:$(REDIS_PORT)" \
-		go test ./... -count=1
+		go test -p 1 ./... -count=1
 
 test-web: ## 运行前端单元测试
 	pnpm test

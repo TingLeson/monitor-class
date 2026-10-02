@@ -82,6 +82,19 @@ export const BACKEND_API_ERROR_CODES = [
   'CLASSROOM_ALREADY_OPEN',
   'CLASSROOM_ALREADY_CLOSED',
   'STUDENT_NOT_ASSIGNED',
+  /**
+   * 学生名单维护（Phase 3 新增，§11）。
+   *
+   * WHY 这两个码必须独立存在，而不是塌缩进 INVALID_REQUEST：批量添加是**部分成功**的，
+   * 每一行 rejected 都要告诉老师"该改哪里"——`STUDENT_NOT_FOUND` → 核对账号拼写；
+   * `NOT_A_STUDENT` → 拿成了老师/管理员的账号。两者的下一步动作完全不同，
+   * 合成一个码就只能让前端去解析后端的中文散文（§58 契约规定客户端按 code 分支）。
+   *
+   * 它们也可能作为**整批拒绝**的顶层错误出现（例如只提交了一个账号）：
+   * 前者 404，后者 400。
+   */
+  'STUDENT_NOT_FOUND',
+  'NOT_A_STUDENT',
   'SESSION_ALREADY_ACTIVE',
   'SESSION_NOT_FOUND',
   'MEDIA_TOKEN_FAILED',
@@ -151,6 +164,9 @@ export const API_ERROR_MESSAGES: Record<ApiErrorCode, string> = {
   CLASSROOM_ALREADY_CLOSED: '课堂已经处于关闭状态。',
 
   STUDENT_NOT_ASSIGNED: '你不在该课堂的学生名单中。',
+  // 逐条拒绝原因（批量添加）与顶层错误共用这两句：老师要做的动作是同一个。
+  STUDENT_NOT_FOUND: '账号不存在，请核对账号。',
+  NOT_A_STUDENT: '该账号不是学生账号。',
 
   SESSION_ALREADY_ACTIVE: '你已经在这个课堂中，请勿重复进入。',
   SESSION_NOT_FOUND: '课堂会话不存在或已结束。',

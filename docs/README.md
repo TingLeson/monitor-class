@@ -16,15 +16,15 @@
 | [auth/authentication.md](auth/authentication.md) | 三种登录方式、Argon2id 密码存储、opaque session 与 Cookie 策略、CSRF、限流、破窗工具 | Phase 1 |
 | [auth/rbac.md](auth/rbac.md) | 角色矩阵、请求授权链、入口隔离、401/403 语义、资源级授权规矩、反模式清单 | Phase 1 |
 | [frontend/admin.md](frontend/admin.md) | 管理端页面、账号列表与筛选、创建规则（为什么没有管理员选项/学生无密码框）、启停用与重置密码的取舍 | Phase 2 |
+| [frontend/teacher.md](frontend/teacher.md) | 老师端页面、课堂列表与状态、创建/编辑、学生名单（按账号添加与部分成功）、开关课堂的交互约束 | Phase 3 起（Phase 7 扩展） |
+| [database/state-machines.md](database/state-machines.md) | Classroom / ClassroomRun 状态机：允许的迁移、触发者、副作用、为什么禁止反向与跳变、并发与幂等 | Phase 3 |
+| [architecture/control-plane.md](architecture/control-plane.md) | 控制面边界与 Source of Truth、请求链中的授权位置、开课/关课事务与并发分析、错误码契约、Phase 6/8 接缝 | Phase 3 |
 
 ## 计划中的文档（按 Phase 产出）
 
 | 文档 | 内容 | Phase |
 | --- | --- | --- |
-| `database/state-machines.md` | Classroom / StudentSession 状态迁移表：允许的边、触发者、副作用 | 3 |
-| `architecture/control-plane.md` | 控制面职责边界、事务与并发（`FOR UPDATE`）、错误码契约 | 3 |
 | `frontend/student.md` | 学生端页面、PreJoin、隐私告知、状态指示器（不显示自身预览的原因） | 4 |
-| `frontend/teacher.md` | 监督墙、Focus View、手动订阅策略、私密语音交互 | 7 |
 | `labs/browser-screen-capture.md` | Screen Capture API、MediaStream/Track、`displaySurface`、浏览器隐私边界 | 5 |
 | `media/webrtc-basics.md` | SDP/ICE/Track 基础，为什么课堂场景是 1 上行 N 下行 | 6 |
 | `media/livekit-architecture.md` | Room/Participant/Track、Token 与权限位、为什么 `auto_create=false` | 6 |

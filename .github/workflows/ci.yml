@@ -90,7 +90,9 @@ jobs:
           LIVEKIT_API_URL: http://localhost:7880
         # 集成测试若缺少 TEST_DATABASE_URL 会自行 Skip；
         # CI 中该变量已注入，因此跳过即意味着配置错误，用 -count=1 防止缓存假绿。
-        run: go test ./... -count=1
+        # -p 1：所有集成测试共用一个 PostgreSQL service，包级并行会互相干扰
+        # （例如某个用例临时调整 ACTIVE 管理员集合时，另一个包同时在数管理员）。
+        run: go test -p 1 ./... -count=1
 
   web:
     name: Web · Vue

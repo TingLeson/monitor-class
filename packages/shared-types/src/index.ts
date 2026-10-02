@@ -42,8 +42,30 @@ export type {
   UpdateUserStatusRequest,
 } from './admin-user'
 
-export { CLASSROOM_STATUSES, isClassroomStatus } from './classroom'
-export type { Classroom, ClassroomRun, ClassroomStatus, ClassroomStudent } from './classroom'
+export {
+  CLASSROOM_DESCRIPTION_MAX_LENGTH,
+  CLASSROOM_NAME_MAX_LENGTH,
+  CLASSROOM_NAME_MIN_LENGTH,
+  CLASSROOM_STATUSES,
+  CLASSROOM_STUDENTS_ADD_MAX,
+  isClassroomStatus,
+} from './classroom'
+export type {
+  AddClassroomStudentsRequest,
+  AddClassroomStudentsResponse,
+  Classroom,
+  ClassroomCurrentRun,
+  ClassroomListResponse,
+  ClassroomResponse,
+  ClassroomRun,
+  ClassroomRunResponse,
+  ClassroomStatus,
+  ClassroomStudent,
+  ClassroomStudentListResponse,
+  CreateClassroomRequest,
+  RejectedClassroomStudent,
+  UpdateClassroomRequest,
+} from './classroom'
 
 export {
   SESSION_EVENT_TYPES,

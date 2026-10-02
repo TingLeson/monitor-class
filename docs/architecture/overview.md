@@ -375,7 +375,8 @@ classwatch/
 | 0 | monorepo（3 前端 + 3 共享包 + Go API）、`docker compose` 一键起 postgres/redis/livekit/api、`/healthz` `/readyz` `/api/v1/meta`、versioned migration 执行器、结构化日志、统一错误码、优雅关闭、CORS allowlist、Lint/Format/Test/CI、三个 SPA 的 §55 全部路由骨架 | —— |
 | 1 | 三种登录（学生免密 / 老师与管理员密码）、Argon2id、opaque session（服务端只存 hash）、按入口隔离的 Cookie 与 CSRF 防护、角色中间件与跨入口拒绝、停用账号立即失效、登录限流、`adminctl` 破窗工具、三个前端的登录页/会话/路由守卫 | 用户管理（Phase 2） |
 | 2 | 管理员用户管理：账号列表（筛选/分页）、创建老师与学生、编辑显示名、启停用（停用立即撤销会话）、重置老师密码（可服务端生成一次性密码）、管理端页面 | Classroom 领域与状态机（3） |
-| 3–12 | —— | Classroom 领域与状态机（3）、学生课堂门户（4）、屏幕共享 Gate（5）、LiveKit 接入（6 起）、多学生监督墙（7）、事件与 WebSocket（8）、摄像头（9）、私密语音（10）、生产加固（11）、压测（12） |
+| 3 | Classroom 领域：创建/编辑/列出自己的课堂、学生授权名单（按账号添加、部分成功）、OPEN/CLOSED 状态机、每次开启新建 ClassroomRun、严格 Ownership（ADMIN 也不能开关他人课堂）、数据库级不变量（owner 触发器 + 单课堂仅一个 OPEN Run） | 学生课堂门户（4） |
+| 4–12 | —— | 学生课堂门户（4）、屏幕共享 Gate（5）、LiveKit 接入（6 起）、多学生监督墙（7）、事件与 WebSocket（8）、摄像头（9）、私密语音（10）、生产加固（11）、压测（12） |
 
 验收标准：Phase 0 是 **`make dev` 能启动基础环境**（任务书 §66）；
 Phase 1 是**三种角色都能登录、跨入口与停用账号都被服务端正确拒绝**（§67）。

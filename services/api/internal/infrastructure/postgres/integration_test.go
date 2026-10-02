@@ -122,6 +122,18 @@ func TestMigrationUpAppliesEverythingAndIsIdempotent(t *testing.T) {
 	if names[3] != "sessions" {
 		t.Errorf("version 3 name = %q, want sessions", names[3])
 	}
+	// Phase 3 artefacts (§69). The names are pinned for the same reason: a
+	// classroom migration silently renamed would leave a database that no longer
+	// matches the constraint names the repository translates into business errors.
+	if names[4] != "classrooms" {
+		t.Errorf("version 4 name = %q, want classrooms", names[4])
+	}
+	if names[5] != "classroom_students" {
+		t.Errorf("version 5 name = %q, want classroom_students", names[5])
+	}
+	if names[6] != "classroom_runs" {
+		t.Errorf("version 6 name = %q, want classroom_runs", names[6])
+	}
 
 	// Second run must be a no-op: this is the property that lets the API boot with
 	// DB_AUTO_MIGRATE=true without racing itself.
@@ -145,10 +157,10 @@ func TestMigrationUpAppliesEverythingAndIsIdempotent(t *testing.T) {
 		}
 	}
 
-	// Phase 1 objects. Asserting on the catalog rather than on "the query works"
-	// keeps the failure message specific: a missing CHECK constraint is otherwise
-	// only noticed when bad data gets in.
-	for _, table := range []string{"users", "sessions"} {
+	// Phase 1 and Phase 3 objects. Asserting on the catalog rather than on "the
+	// query works" keeps the failure message specific: a missing CHECK constraint is
+	// otherwise only noticed when bad data gets in.
+	for _, table := range []string{"users", "sessions", "classrooms", "classroom_students", "classroom_runs"} {
 		if !objectExists(t, pool, `SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)`, table) {
 			t.Errorf("table %q does not exist", table)
 		}
@@ -156,15 +168,42 @@ func TestMigrationUpAppliesEverythingAndIsIdempotent(t *testing.T) {
 	for _, constraint := range []string{
 		"users_password_by_role", "users_account_format", "users_role_valid",
 		"users_status_valid", "users_display_name_not_blank", "sessions_expires_after_issued",
+		// Phase 3 (§10/§8): the two biconditionals, the owner FK that 0006 adds, and
+		// the run's own OPEN/closed_at consistency rule.
+		"classrooms_name_not_blank", "classrooms_status_valid", "classrooms_run_consistency",
+		"classrooms_current_run_fk", "classroom_runs_status_valid", "classroom_runs_closed_at",
 	} {
 		if !objectExists(t, pool, `SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = $1)`, constraint) {
 			t.Errorf("constraint %q does not exist", constraint)
 		}
 	}
-	for _, index := range []string{"users_role_status_idx", "sessions_user_idx", "sessions_expires_idx"} {
+	for _, index := range []string{
+		"users_role_status_idx", "sessions_user_idx", "sessions_expires_idx",
+		"classrooms_owner_idx", "classroom_students_student_idx",
+		// The partial unique index is the database-level half of "one open run per
+		// classroom"; its WHERE clause is asserted below, because an index with the
+		// right name and no predicate would let two live runs coexist.
+		"classroom_runs_one_open_idx",
+	} {
 		if !objectExists(t, pool, `SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = $1)`, index) {
 			t.Errorf("index %q does not exist", index)
 		}
+	}
+
+	// The partial predicate itself, and the owner-role trigger. Both are the kind of
+	// object whose absence is invisible until the day it matters.
+	if !objectExists(t, pool, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_indexes
+			 WHERE indexname = $1
+			   AND indexdef LIKE '%WHERE (status = ''OPEN''::text)%')`, "classroom_runs_one_open_idx") {
+		t.Error("classroom_runs_one_open_idx is not a partial index on status = 'OPEN'")
+	}
+	if !objectExists(t, pool, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_trigger
+			 WHERE tgname = $1 AND NOT tgisinternal)`, "classrooms_owner_is_teacher_trigger") {
+		t.Error("the classrooms owner-role trigger does not exist (§10)")
 	}
 
 	// Status must report every migration as applied and none as unknown.

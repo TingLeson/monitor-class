@@ -26,6 +26,7 @@ import (
 	"github.com/classwatch/classwatch/services/api/internal/admin"
 	"github.com/classwatch/classwatch/services/api/internal/auth"
 	"github.com/classwatch/classwatch/services/api/internal/auth/sessionstore"
+	"github.com/classwatch/classwatch/services/api/internal/classroom"
 	"github.com/classwatch/classwatch/services/api/internal/config"
 	"github.com/classwatch/classwatch/services/api/internal/httpapi"
 	"github.com/classwatch/classwatch/services/api/internal/infrastructure/logging"
@@ -103,12 +104,13 @@ func run() error {
 	// own would let them disagree about what a user row says.
 	users := deps.userRepository(logger)
 	router := httpapi.NewRouter(httpapi.Deps{
-		Logger:  logger,
-		Config:  cfg,
-		Ready:   deps.readiness(),
-		Auth:    deps.authService(logger, cfg, users),
-		Admin:   deps.adminService(logger, cfg, users),
-		Limiter: deps.rateLimiter(logger),
+		Logger:    logger,
+		Config:    cfg,
+		Ready:     deps.readiness(),
+		Auth:      deps.authService(logger, cfg, users),
+		Admin:     deps.adminService(logger, cfg, users),
+		Classroom: deps.classroomService(logger, users),
+		Limiter:   deps.rateLimiter(logger),
 	})
 
 	server := &http.Server{
@@ -245,6 +247,23 @@ func (d *dependencies) adminService(logger *slog.Logger, cfg *config.Config, use
 		sessionstore.New(d.postgres.Pool()),
 		auth.NewPasswordPolicy(cfg.PasswordMinLength),
 	)
+}
+
+// classroomService builds the classroom domain service (§69).
+//
+// It shares the account repository with authentication and administration: adding
+// a student to a roster must see the same account rows the login path validates,
+// and "this account is a STUDENT" has to mean one thing in the whole process. The
+// classroom repository itself is separate because it owns different tables — and,
+// more importantly, because its Open/Close transactions are the only place allowed
+// to lock a classroom row.
+func (d *dependencies) classroomService(logger *slog.Logger, users user.Repository) httpapi.ClassroomService {
+	if users == nil {
+		logger.Warn("postgres is not connected; teacher classroom routes are disabled",
+			"hint", "STARTUP_REQUIRE_DEPENDENCIES=false must only be used for local work")
+		return nil
+	}
+	return classroom.NewService(classroom.NewPostgres(d.postgres.Pool()), users)
 }
 
 // rateLimiter builds the rate limiter: Redis when it is available, degrading to

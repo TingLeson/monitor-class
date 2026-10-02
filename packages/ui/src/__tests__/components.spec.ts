@@ -10,6 +10,7 @@ import AppPagination from '../components/AppPagination.vue'
 import AppSelect from '../components/AppSelect.vue'
 import AppShell from '../components/AppShell.vue'
 import AppTable from '../components/AppTable.vue'
+import AppTextArea from '../components/AppTextArea.vue'
 import AppTextField from '../components/AppTextField.vue'
 import PhasePlaceholder from '../components/PhasePlaceholder.vue'
 import ProtectedRouteGate from '../components/ProtectedRouteGate.vue'
@@ -87,6 +88,39 @@ describe('AppTextField', () => {
     const second = mount(AppTextField, { props: { label: '密码', modelValue: '' } })
 
     expect(first.find('input').attributes('id')).not.toBe(second.find('input').attributes('id'))
+  })
+})
+
+describe('AppTextArea', () => {
+  it('label 关联到多行输入框，输入时 emit update:modelValue', async () => {
+    const wrapper = mount(AppTextArea, { props: { label: '课堂说明', modelValue: '' } })
+
+    const textarea = wrapper.find('textarea')
+    expect(wrapper.find('label').attributes('for')).toBe(textarea.attributes('id'))
+
+    await textarea.setValue('第三章 动态规划')
+    expect(wrapper.emitted('update:modelValue')?.[0]).toEqual(['第三章 动态规划'])
+  })
+
+  it('error 优先于 hint，并向读屏表达错误状态', () => {
+    const wrapper = mount(AppTextArea, {
+      props: { label: '课堂说明', modelValue: '', error: '最多 500 字', hint: '12 / 500' },
+    })
+
+    const textarea = wrapper.find('textarea')
+    expect(wrapper.text()).toContain('最多 500 字')
+    expect(wrapper.text()).not.toContain('12 / 500')
+    expect(textarea.attributes('aria-invalid')).toBe('true')
+    expect(textarea.attributes('aria-describedby')).toBeTruthy()
+  })
+
+  it('rows 与 maxlength 透传到原生 textarea（粘贴超长内容先在浏览器层被截断）', () => {
+    const wrapper = mount(AppTextArea, {
+      props: { label: '学生账号', modelValue: '', rows: 6, maxlength: 500 },
+    })
+
+    expect(wrapper.find('textarea').attributes('rows')).toBe('6')
+    expect(wrapper.find('textarea').attributes('maxlength')).toBe('500')
   })
 })
 

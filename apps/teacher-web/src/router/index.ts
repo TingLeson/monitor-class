@@ -66,12 +66,12 @@ export const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: true, title: '课堂详情' },
   },
 
-  // Phase 7：老师监督台（学生桌面网格，§29）。
+  // Phase 7：老师监督墙（多学生桌面网格 + Focus View，§29 / §30）。
   {
     path: '/teacher/classrooms/:id/monitor',
     name: 'teacher-classroom-monitor',
     component: ClassroomMonitorView,
-    meta: { requiresAuth: true, title: '课堂监督台' },
+    meta: { requiresAuth: true, title: '课堂监督墙' },
   },
 ]
 
