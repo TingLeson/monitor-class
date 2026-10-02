@@ -87,11 +87,12 @@ export type {
   StudentSessionStatus,
 } from './session'
 
-export { CONNECTION_QUALITIES, isConnectionQuality } from './monitor'
+export { CONNECTION_QUALITIES, MONITOR_TILE_STATES, isConnectionQuality } from './monitor'
 export type {
   ConnectionQuality,
   MonitorResponse,
   MonitorStudent,
+  MonitorTileState,
   TeacherMonitorStudent,
   TrackActiveState,
 } from './monitor'

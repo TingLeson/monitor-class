@@ -16,7 +16,7 @@
 | 4 | `phase/04-student-portal` | 学生课堂门户（进入按钮 → PreJoin） | ✅ 已完成 |
 | 5 | `phase/05-screen-gate` | 整屏共享 Gate（**不接 LiveKit**） | ✅ 已完成 |
 | 6 | `phase/06-livekit-screen` | 1 老师 + 1 学生 + 1 屏幕轨道 | ✅ 已完成 |
-| 7 | `phase/07-multi-student` | 多学生监督墙、Focus View、手动订阅 | ⏳ |
+| 7 | `phase/07-multi-student` | 多学生监督墙、Focus View、手动订阅 | ✅ 已完成 |
 | 8 | `phase/08-runtime-state` | WebSocket、LiveKit Webhook、StudentSession、SessionEvent | ⏳ |
 | 9 | `phase/09-camera` | 可选摄像头 + 老师端画中画 | ⏳ |
 | 10 | `phase/10-private-audio` | 学生可选麦克风 + 老师私密语音状态机 | ⏳ |

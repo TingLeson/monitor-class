@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -320,13 +321,35 @@ func (s *Service) TeacherToken(ctx context.Context, in TeacherTokenInput) (*Teac
 
 // Monitor folds the media plane's current state into the monitoring view of §51.
 //
+// # Why the list is the ROSTER and not the session table
+//
+// Phase 6 returned one tile per session row, which meant the wall could only show the
+// students who had already entered. §29's console header is "18 / 25" and its grid
+// contains the students who have NOT come in yet, so the read starts from
+// `classroom_students` and LEFT JOINs the run's sessions (see
+// Repository.ListRosterByRun). A student who was authorized and never pressed
+// "进入课堂" is a tile with sessionId=null, sessionStatus=null, three inactive media
+// blocks and connection=UNKNOWN — not a missing tile and not an invented seventh
+// status. The order is by account, so the cards never move between two polls.
+//
 // # Why this endpoint writes
 //
 // The session states are not decoration: they are the teacher's answer to "is this
 // student being supervised right now?", and they must survive a page reload, a
 // different teacher's browser and Phase 8's event log. So the observation is
 // persisted (guarded by the status it was computed from) and the response is built
-// from the stored rows.
+// from the stored rows. Only rows that HAVE a session are advanced: a student who never
+// entered has no state to move, and inventing one (CONNECTING, say) would make the wall
+// claim a media connection nobody attempted.
+//
+// # Why it also enforces §26
+//
+// The teacher polls this endpoint every ten seconds, which makes it the natural
+// reconciliation loop for the media-plane half of "students must not see each other":
+// the SAME observation that advances the states is handed to the media plane to revoke
+// peer subscriptions (see enforceStudentIsolation and media.EnforceNoPeerSubscriptions).
+// A student whose client subscribed to a classmate therefore loses that subscription and
+// leaves a log line, without a second room query and without a background worker.
 //
 // # Why a media-plane failure is NOT a business fact
 //
@@ -335,7 +358,8 @@ func (s *Service) TeacherToken(ctx context.Context, in TeacherTokenInput) (*Teac
 // DISCONNECTED for the whole class — would turn a LiveKit hiccup into a permanent
 // business record that a student was not being supervised, and the lesson report
 // would be wrong forever. So on failure this returns 200 with connection=UNKNOWN for
-// every student, advances NOTHING, and logs a warning (§33).
+// every student, advances NOTHING, revokes NOTHING (there is no observation to act on),
+// and logs a warning (§33).
 func (s *Service) Monitor(ctx context.Context, classroomID, teacherID uuid.UUID) (*MonitorView, error) {
 	current, err := s.ownedOpenClassroom(ctx, classroomID, teacherID)
 	if err != nil {
@@ -343,7 +367,7 @@ func (s *Service) Monitor(ctx context.Context, classroomID, teacherID uuid.UUID)
 	}
 	run := current.CurrentRun
 
-	stored, err := s.repo.ListByRun(ctx, run.ID)
+	roster, err := s.repo.ListRosterByRun(ctx, classroomID, run.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -353,9 +377,9 @@ func (s *Service) Monitor(ctx context.Context, classroomID, teacherID uuid.UUID)
 			"action", "monitor_unobserved",
 			logging.FieldClassroomID, classroomID.String(),
 			logging.FieldRunID, run.ID.String(),
-			"students", len(stored),
+			"roster", len(roster),
 		)
-		return unobservedView(stored), nil
+		return unobservedView(roster), nil
 	}
 
 	observed, err := s.media.ObserveRoom(ctx, run.LiveKitRoomName)
@@ -365,20 +389,31 @@ func (s *Service) Monitor(ctx context.Context, classroomID, teacherID uuid.UUID)
 			logging.FieldClassroomID, classroomID.String(),
 			logging.FieldRunID, run.ID.String(),
 			"room", run.LiveKitRoomName,
-			"students", len(stored),
+			"roster", len(roster),
 			"error", err,
 			"consequence", "the wall reports connection=UNKNOWN instead of inventing a disconnect",
 		)
-		return unobservedView(stored), nil
+		return unobservedView(roster), nil
 	}
+
+	// §26: the same observation, one reconciliation pass. Deliberately before the
+	// response is built and deliberately not fatal — see the method.
+	s.enforceStudentIsolation(ctx, classroomID, run, roster, observed)
 
 	// One warning per poll that skipped work: a session whose status changed under us
 	// (a leave that landed while we were observing) is normal, but a burst of them is
 	// the signal that something is writing sessions concurrently.
 	var stale int
-	view := make([]MonitorStudent, 0, len(stored))
-	for i := range stored {
-		session := stored[i]
+	view := make([]MonitorStudent, 0, len(roster))
+	for i := range roster {
+		entry := roster[i]
+		if entry.Session == nil {
+			// Authorized but not in this lesson (yet). Nothing to observe, nothing to
+			// advance: the tile says exactly that with its nulls.
+			view = append(view, monitorStudentOf(entry, false, media.ParticipantTracks{}))
+			continue
+		}
+		session := *entry.Session
 		tracks, present := observed[session.LiveKitIdentity]
 
 		if !session.Status.Terminal() {
@@ -393,11 +428,10 @@ func (s *Service) Monitor(ctx context.Context, classroomID, teacherID uuid.UUID)
 				if updated == nil {
 					stale++
 				} else {
-					// The write returns the ROW it stored, and a row has no display
-					// name: that column comes from the monitoring JOIN on users, not
-					// from student_sessions. Keeping the name from the read is what
-					// stops a transitioned tile from rendering as an unnamed card.
-					updated.StudentDisplayName = session.StudentDisplayName
+					// The write returns the ROW it stored, and a row carries no display
+					// name: that column comes from the roster's JOIN on users. The entry
+					// already holds it, which is what stops a transitioned tile from
+					// rendering as an unnamed card.
 					logging.FromContext(ctx).Info("student session advanced",
 						"action", "session_status_changed",
 						logging.FieldUserID, session.StudentID.String(),
@@ -410,10 +444,11 @@ func (s *Service) Monitor(ctx context.Context, classroomID, teacherID uuid.UUID)
 						"screen_shared", tracks.ScreenShare,
 					)
 					session = *updated
+					entry.Session = &session
 				}
 			}
 		}
-		view = append(view, monitorStudentOf(session, present, tracks))
+		view = append(view, monitorStudentOf(entry, present, tracks))
 	}
 	if stale > 0 {
 		logging.FromContext(ctx).Info("monitor skipped stale session states",
@@ -424,6 +459,106 @@ func (s *Service) Monitor(ctx context.Context, classroomID, teacherID uuid.UUID)
 		)
 	}
 	return &MonitorView{Students: view, MediaObserved: true}, nil
+}
+
+// enforceStudentIsolation is the server side of §26: it revokes the subscriptions
+// students still hold to each other's tracks, and reports every revocation as a Warn.
+//
+// # What it is, and what it is not
+//
+// §28 requires `canSubscribe=true` on a student token, because the teacher's private
+// audio (§31, Phase 10) must be able to reach a student. That bit is room-wide, so
+// "students do not subscribe to each other" cannot be expressed in the token; the
+// client is configured with autoSubscribe=false, and this is the SERVER side of the same
+// rule. It is NOT protocol-level isolation: a deliberately modified client keeps
+// canSubscribe=true and can re-subscribe the moment after this returns. §26's last
+// paragraph says exactly that, and nothing in this project may claim otherwise. What the
+// pass buys is that a cooperative-but-misconfigured client is corrected, and that a
+// client which keeps doing it is visible in the logs.
+//
+// # The whitelist
+//
+// A student may keep receiving tracks from a participant that is NOT a student of this
+// run. The only other token this control plane mints for a run belongs to the teacher
+// (§27), who publishes nothing in Phase 7 — so in practice students are unsubscribed to
+// nothing at all. The whitelist is an explicit argument and not an assumption, which is
+// where Phase 10 attaches: it will narrow the allowance to (the teacher, MICROPHONE),
+// and the observation already carries each track's source. Deriving it as "not a student
+// of this run" also means a student who LEFT but whose participant is still lingering
+// stays in the student set, so a classmate is still unsubscribed from their tracks.
+//
+// # Failure discipline
+//
+// Nothing here may affect the response: a failed revocation is logged as a Warn and the
+// monitor still answers 200 with the states it observed (§33).
+func (s *Service) enforceStudentIsolation(
+	ctx context.Context,
+	classroomID uuid.UUID,
+	run *classroom.Run,
+	roster []RosterEntry,
+	observed map[string]media.ParticipantTracks,
+) {
+	if s.media == nil || len(observed) == 0 {
+		return
+	}
+
+	// Every identity that belongs to a student of this run, terminal sessions included:
+	// this is what makes "not a student" mean "the teacher" and not "somebody we forgot".
+	studentIdentities := make(map[string]struct{}, len(roster))
+	for _, entry := range roster {
+		if entry.Session != nil {
+			studentIdentities[entry.Session.LiveKitIdentity] = struct{}{}
+		}
+	}
+	allowed := make([]string, 0, len(observed))
+	for identity := range observed {
+		if _, isStudent := studentIdentities[identity]; !isStudent {
+			allowed = append(allowed, identity)
+		}
+	}
+	sort.Strings(allowed)
+
+	// Only sessions that are still open are reconciled: a terminal session's participant
+	// has already been disconnected (§50), and asking LiveKit to update subscriptions for
+	// somebody who is gone can only produce a NotFound.
+	students := make([]string, 0, len(roster))
+	for _, entry := range roster {
+		if entry.Session == nil || entry.Session.Status.Terminal() {
+			continue
+		}
+		students = append(students, entry.Session.LiveKitIdentity)
+	}
+
+	revoked, err := s.media.EnforceNoPeerSubscriptions(ctx, run.LiveKitRoomName, students, observed, allowed)
+	for _, revocation := range revoked {
+		// Warn, not Info: this line is the evidence that a client tried to receive a
+		// classmate's media. It is the only trace there is — LiveKit offers no API to read
+		// subscription state — so it is what an operator greps for when the §26 rule is
+		// suspected of being broken.
+		logging.FromContext(ctx).Warn("peer subscription revoked",
+			"action", "peer_subscription_revoked",
+			logging.FieldClassroomID, classroomID.String(),
+			logging.FieldRunID, run.ID.String(),
+			"room", run.LiveKitRoomName,
+			"observer_identity", revocation.ObserverIdentity,
+			"subscribed_track_owner", revocation.TrackOwnerIdentity,
+			"track_sid", revocation.TrackSid,
+			"reason", "students must not receive each other's media (§26)",
+		)
+	}
+	if err != nil {
+		// The media plane refused (or could not be reached). The wall is unaffected: this
+		// is a media-plane fact, and the next poll retries.
+		logging.FromContext(ctx).Warn("peer subscriptions could not be revoked",
+			"action", "peer_subscription_revocation_failed",
+			logging.FieldClassroomID, classroomID.String(),
+			logging.FieldRunID, run.ID.String(),
+			"room", run.LiveKitRoomName,
+			"revoked_before_failure", len(revoked),
+			"error", err,
+			"consequence", "the monitor response is unaffected and the next poll retries",
+		)
+	}
 }
 
 // ownedOpenClassroom loads a classroom for its owner and requires it to be OPEN with
@@ -524,24 +659,36 @@ func changeFor(session StudentSession, to Status, screen bool) ObservationChange
 
 // monitorStudentOf renders one tile.
 //
-// A terminal session reports no active media and no connection quality. WHY: the
-// teacher must not see a live screen on a session that is over. A participant can
-// linger in the room for a few seconds after a leave (the removal is best effort), and
-// rendering that would make the wall contradict its own status.
-func monitorStudentOf(session StudentSession, present bool, tracks media.ParticipantTracks) MonitorStudent {
+// Two shapes come out of it, and the difference is the whole point of Phase 7:
+//
+//   - A student with NO session in this run renders as the null tile of §29: no
+//     sessionId, no sessionStatus, no media, connection=UNKNOWN. The teacher reads it as
+//     "authorized, not here yet", which is exactly what is true.
+//   - A student with a session renders as Phase 6 does, except that a terminal session
+//     reports no active media and no connection quality. WHY: the teacher must not see a
+//     live screen on a session that is over. A participant can linger in the room for a
+//     few seconds after a leave (the removal is best effort), and rendering that would
+//     make the wall contradict its own status.
+func monitorStudentOf(entry RosterEntry, present bool, tracks media.ParticipantTracks) MonitorStudent {
 	student := MonitorStudent{
-		StudentID:   session.StudentID,
-		DisplayName: session.StudentDisplayName,
-		SessionID:   session.ID,
-		Status:      session.Status,
+		StudentID:   entry.StudentID,
+		DisplayName: entry.DisplayName,
 		// UNKNOWN is the starting point, not the fallback: the control plane only
 		// claims GOOD for a participant it actually saw publishing a screen, so every
-		// other combination (absent, connecting, screen gone, terminal) is honestly
-		// "no usable observation".
-		Connection:  ConnectionUnknown,
-		JoinedAt:    session.ConnectedAt,
-		LastEventAt: lastEventAt(session),
+		// other combination (no session, absent, connecting, screen gone, terminal) is
+		// honestly "no usable observation".
+		Connection: ConnectionUnknown,
 	}
+	if entry.Session == nil {
+		return student
+	}
+
+	session := *entry.Session
+	sessionID, status := session.ID, session.Status
+	student.SessionID = &sessionID
+	student.Status = &status
+	student.JoinedAt = session.ConnectedAt
+	student.LastEventAt = lastEventAt(session)
 	if session.Status.Terminal() || !present {
 		return student
 	}
@@ -575,19 +722,27 @@ func lastEventAt(session StudentSession) *time.Time {
 // ONLINE ⇒ a screen track exists, so reporting the last thing the control plane knew
 // is more useful than reporting false, and the UNKNOWN connection is what tells the
 // frontend that this is a stale picture rather than a fresh observation.
-func unobservedView(sessions []StudentSession) *MonitorView {
-	view := make([]MonitorStudent, 0, len(sessions))
-	for _, session := range sessions {
+//
+// A roster entry without a session renders exactly like the observed case: nulls. There
+// is no stored screen to be stale about, so the outage changes nothing for that tile —
+// which is the honest answer, not a coincidence.
+func unobservedView(roster []RosterEntry) *MonitorView {
+	view := make([]MonitorStudent, 0, len(roster))
+	for _, entry := range roster {
 		student := MonitorStudent{
-			StudentID:   session.StudentID,
-			DisplayName: session.StudentDisplayName,
-			SessionID:   session.ID,
-			Status:      session.Status,
+			StudentID:   entry.StudentID,
+			DisplayName: entry.DisplayName,
 			Connection:  ConnectionUnknown,
-			JoinedAt:    session.ConnectedAt,
-			LastEventAt: lastEventAt(session),
 		}
-		student.ScreenActive = !session.Status.Terminal() && session.Status == StatusOnline
+		if entry.Session != nil {
+			session := *entry.Session
+			sessionID, status := session.ID, session.Status
+			student.SessionID = &sessionID
+			student.Status = &status
+			student.JoinedAt = session.ConnectedAt
+			student.LastEventAt = lastEventAt(session)
+			student.ScreenActive = !session.Status.Terminal() && session.Status == StatusOnline
+		}
 		view = append(view, student)
 	}
 	return &MonitorView{Students: view, MediaObserved: false}

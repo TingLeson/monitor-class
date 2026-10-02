@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 	"github.com/livekit/protocol/livekit"
@@ -24,19 +25,49 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// roomService is the slice of the LiveKit RoomService API this package uses.
+//
+// WHY an interface instead of the concrete *lksdk.RoomServiceClient: the rules that
+// matter here are about what the Control Plane DOES with a room, and the interesting
+// cases (a participant who vanished between the observation and the call, a room
+// whose subscriptions cannot be updated) are the ones that are hard to produce on
+// demand against a real SFU. A narrow interface keeps those cases unit-testable with
+// a fake, the same way internal/session fakes this whole package.
+//
+// *lksdk.RoomServiceClient satisfies it as-is, so production wiring is unchanged.
+type roomService interface {
+	CreateRoom(ctx context.Context, req *livekit.CreateRoomRequest) (*livekit.Room, error)
+	ListRooms(ctx context.Context, req *livekit.ListRoomsRequest) (*livekit.ListRoomsResponse, error)
+	DeleteRoom(ctx context.Context, req *livekit.DeleteRoomRequest) (*livekit.DeleteRoomResponse, error)
+	ListParticipants(ctx context.Context, req *livekit.ListParticipantsRequest) (*livekit.ListParticipantsResponse, error)
+	RemoveParticipant(ctx context.Context, req *livekit.RoomParticipantIdentity) (*livekit.RemoveParticipantResponse, error)
+	UpdateSubscriptions(ctx context.Context, req *livekit.UpdateSubscriptionsRequest) (*livekit.UpdateSubscriptionsResponse, error)
+}
+
 // Client is a thin wrapper around the LiveKit RoomService API.
 //
 // It exposes exactly what the Control Plane needs from the Media Plane: room
-// lifecycle (Phase 0/3/6), participant observation (Phase 6) and participant-scoped
-// token minting (Phase 6). Participant administration beyond "remove", and webhook
-// handling, arrive with the phases that actually need them (§74).
+// lifecycle (Phase 0/3/6), participant observation (Phase 6), participant-scoped
+// token minting (Phase 6) and the student-isolation reconciliation of §26 (Phase 7).
+// Participant administration beyond "remove" and "unsubscribe", and webhook handling,
+// arrive with the phases that actually need them (§74).
 type Client struct {
-	rooms *lksdk.RoomServiceClient
+	rooms roomService
 	// apiKey/apiSecret sign tokens. They exist only in this backend process and must
 	// never be logged, serialised into a response, or copied into a frontend bundle
 	// (§44/§59) — see NewClient.
 	apiKey    string
 	apiSecret string
+
+	// revoked remembers which peer-track subscriptions were already revoked, per room.
+	// WHY the media client holds state at all: §26 enforcement is a RECONCILIATION
+	// (§26/§73), and re-issuing the same UpdateSubscriptions on every 10s poll would be
+	// a stream of pointless RPCs against LiveKit Cloud. The map is guarded by mu — the
+	// monitor endpoint is served concurrently — and it is best-effort by design: it is
+	// not persisted, so a restart (or a second API instance) re-issues one revocation
+	// per live track, which is harmless and actually desirable after a redeploy.
+	mu      sync.Mutex
+	revoked map[string]map[revokedSubscription]struct{}
 }
 
 // NewClient builds a RoomService client from the API URL, key and secret.
@@ -155,14 +186,39 @@ func (c *Client) EnsureRoom(ctx context.Context, roomName string) error {
 	return err
 }
 
-// ParticipantTracks is what the media plane reports about the media one participant
-// is publishing right now.
+// ObservedTrack is one track the media plane reported as published.
 //
-// It is a derived view (booleans per track source) rather than a list of LiveKit
-// track objects on purpose: the Control Plane needs to answer "is the screen up?"
-// (§21/§51), and handing SDK structs to the session logic would make every future
-// LiveKit field a potential business fact.
+// It exists for the subscription rule of §26/§73 rather than for the teacher's wall:
+// a revocation names a track by its LiveKit sid, and the Phase 10 whitelist ("keep the
+// teacher's microphone") is expressed with a source. Nothing else about a track is
+// carried, because nothing else may become a business fact.
+type ObservedTrack struct {
+	// Sid is LiveKit's id for this publication. It is opaque and short-lived: a track
+	// that is unpublished and published again gets a new sid, which is why a revocation
+	// is remembered per sid and never per (participant, source) pair.
+	Sid string
+	// Source is the kind of media in the vocabulary the token grants already use
+	// (PublishSource): one word for "a kind of media" means a grant and an observation
+	// can never disagree about what "microphone" is. An unrecognised source is reported
+	// as "" — it matches no whitelist entry, so an unknown track fails towards
+	// revocation rather than towards being kept.
+	Source PublishSource
+}
+
+// ParticipantTracks is what the media plane reports about one participant: the media
+// it is publishing now, and the tracks somebody could be subscribed to.
+//
+// It is a derived view (booleans per track source, plus a short track list) rather
+// than a list of LiveKit track objects on purpose: the Control Plane needs to answer
+// "is the screen up?" (§21/§51) and "which tracks must this student not be receiving?"
+// (§26), and handing SDK structs to the session logic would make every future LiveKit
+// field a potential business fact.
 type ParticipantTracks struct {
+	// ParticipantSid is LiveKit's id for this participant's CONNECTION — not its
+	// identity and not a track. It changes when the same identity reconnects, which is
+	// what lets the §26 bookkeeping notice "this student is on a new connection and may
+	// have subscribed again". It is never rendered anywhere; identities are (§44).
+	ParticipantSid string
 	// ScreenShare is true when a screen-share track is published and not muted. §21
 	// makes it the invariant behind ONLINE: a student who is ONLINE is sharing.
 	ScreenShare bool
@@ -172,6 +228,13 @@ type ParticipantTracks struct {
 	// disagree about what the room looked like at one instant.
 	Camera     bool
 	Microphone bool
+	// Tracks is every track the participant has published, MUTED ONES INCLUDED, and it
+	// answers a different question from the three booleans above: those say "is media
+	// flowing right now?" (what the wall draws), this says "what could somebody be
+	// subscribed to?" (what §26 must revoke). A muted track still carries a
+	// subscription, and leaving it out would mean a peer subscription reappears the
+	// moment somebody unmutes.
+	Tracks []ObservedTrack
 }
 
 // ObserveRoom lists the participants of a room and what each one publishes.
@@ -202,26 +265,52 @@ func (c *Client) ObserveRoom(ctx context.Context, roomName string) (map[string]P
 		if !isConnectedState(participant.GetState()) {
 			continue
 		}
-		var tracks ParticipantTracks
+		tracks := ParticipantTracks{ParticipantSid: participant.GetSid()}
 		for _, track := range participant.GetTracks() {
+			// The track list is built first and unconditionally: §26 revocation works on
+			// PUBLICATIONS (something a client can be subscribed to), not on flowing media.
+			// See ParticipantTracks.Tracks.
+			if sid := track.GetSid(); sid != "" {
+				tracks.Tracks = append(tracks.Tracks, ObservedTrack{Sid: sid, Source: observedSource(track.GetSource())})
+			}
 			// A muted track is published but carries no media — a muted camera or a
 			// muted screen share is not "active" in any sense the teacher's wall
 			// cares about.
 			if track.GetMuted() {
 				continue
 			}
-			switch track.GetSource() {
-			case livekit.TrackSource_SCREEN_SHARE:
+			switch observedSource(track.GetSource()) {
+			case PublishScreenShare:
 				tracks.ScreenShare = true
-			case livekit.TrackSource_CAMERA:
+			case PublishCamera:
 				tracks.Camera = true
-			case livekit.TrackSource_MICROPHONE:
+			case PublishMicrophone:
 				tracks.Microphone = true
 			}
 		}
 		observed[participant.GetIdentity()] = tracks
 	}
 	return observed, nil
+}
+
+// observedSource maps a LiveKit track source onto the project's own vocabulary.
+//
+// It is the inverse of token.go's trackSources, and it is deliberately a total
+// function with an unnamed default: a source this project does not publish (for
+// example a data track) becomes "", which matches no publish source and therefore no
+// whitelist entry. Failing towards "unknown" is what keeps a future LiveKit source
+// from silently counting as media some role is allowed to keep (§26).
+func observedSource(source livekit.TrackSource) PublishSource {
+	switch source {
+	case livekit.TrackSource_SCREEN_SHARE:
+		return PublishScreenShare
+	case livekit.TrackSource_CAMERA:
+		return PublishCamera
+	case livekit.TrackSource_MICROPHONE:
+		return PublishMicrophone
+	default:
+		return ""
+	}
 }
 
 // RemoveParticipant disconnects one participant from a room.

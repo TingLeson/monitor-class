@@ -29,6 +29,7 @@ import {
   Room,
   RoomEvent,
   Track,
+  VideoQuality,
   type DisconnectReason,
   type RemoteParticipant,
   type RemoteTrack,
@@ -40,6 +41,7 @@ import type {
   MediaDisconnectReason,
   MediaRemoteParticipant,
   MonitorRoom,
+  ScreenQuality,
   ScreenSubscription,
 } from './media-room.ts'
 
@@ -66,6 +68,20 @@ function findScreenPublication(participant: RemoteParticipant): RemoteTrackPubli
   return undefined
 }
 
+/**
+ * 端口档位 → LiveKit 内建能力（§52：用 SDK 已有能力，不自研 RTP ABR）。
+ *
+ * WHY 只用 `setVideoQuality`，**不**顺带调 `setVideoDimensions`：
+ * 房间开了 `adaptiveStream`，SDK 会按 `<video>` 元素的实际像素尺寸挑层；
+ * 而 `setVideoDimensions` 的语义是"显式尺寸，优先于 adaptive stream"
+ * （SDK 源码原话），一旦调用就等于把自适应关掉、把尺寸写死。老师拖一下窗口
+ * 或改一下网格列数，写死的尺寸就变成了错误的尺寸。所以这里只封顶质量档，
+ * 具体分辨率交给 SDK 按元素大小决定。
+ */
+function toVideoQuality(quality: ScreenQuality): VideoQuality {
+  return quality === 'high' ? VideoQuality.HIGH : VideoQuality.LOW
+}
+
 export function createLiveKitMonitorRoom(credentials: MediaCredentials): MonitorRoom {
   const room = new Room({
     // §52：用 LiveKit 已有的自适应能力（按 <video> 实际尺寸选层、不可见时暂停下行），
@@ -76,15 +92,32 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
     disconnectOnPageLeave: true,
   })
 
-  /** 已建立的订阅：identity → 轨道与它当前挂着的元素。 */
+  /** 已建立的订阅：identity → 轨道、当前画质档与它当前挂着的元素。 */
   const subscriptions = new Map<
     string,
     {
       publication: RemoteTrackPublication
       track: RemoteVideoTrack
       elements: Set<HTMLVideoElement>
+      quality: ScreenQuality
     }
   >()
+
+  /**
+   * 切换某条订阅的画质档（§30 / §52）。
+   *
+   * WHY 在这里再判一次"档位没变就返回"：SDK 的 `setVideoQuality` 内部已经去重，
+   * 但它去重的是**它自己记的值**；本地记一份能让适配层的行为可被测试断言
+   * （"每 10 秒一轮的轮询不会反复发信令"这件事必须看得见）。
+   */
+  function applyQuality(
+    entry: { publication: RemoteTrackPublication; quality: ScreenQuality },
+    quality: ScreenQuality,
+  ): void {
+    if (entry.quality === quality) return
+    entry.quality = quality
+    entry.publication.setVideoQuality(toVideoQuality(quality))
+  }
 
   /**
    * 等一条轨道真的被订阅下来。
@@ -119,10 +152,15 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
     })
   }
 
-  /** 订阅对象：attach/detach 只操作这个 identity 的轨道。 */
+  /** 订阅对象：attach/detach/setQuality 只操作这个 identity 的轨道。 */
   function toSubscription(
     identity: string,
-    entry: { track: RemoteVideoTrack; elements: Set<HTMLVideoElement> },
+    entry: {
+      publication: RemoteTrackPublication
+      track: RemoteVideoTrack
+      elements: Set<HTMLVideoElement>
+      quality: ScreenQuality
+    },
   ): ScreenSubscription {
     return {
       identity,
@@ -134,6 +172,9 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
           entry.track.detach(element)
           entry.elements.delete(element)
         }
+      },
+      setQuality(quality: ScreenQuality): void {
+        applyQuality(entry, quality)
       },
     }
   }
@@ -161,28 +202,54 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
       }))
     },
 
-    async subscribeScreen(identity: string): Promise<ScreenSubscription | null> {
+    async subscribeScreen(
+      identity: string,
+      quality: ScreenQuality = 'low',
+    ): Promise<ScreenSubscription | null> {
       /**
        * 幂等保护的第一层：已经订阅过就直接返回同一个订阅。
        * 监督墙每 10 秒刷新一次业务状态，而"屏幕仍在共享"每次都会成立——
        * 没有这一层，每 10 秒就会重新 `setSubscribed(true)` 一次。
+       *
+       * 已经订阅过时仍然应用一次 `quality`：调用方（store）才是"这个人现在该看多清楚"
+       * 的权威（Focus 进出会改这个判断），而 applyQuality 自己会去重。
        */
       const existing = subscriptions.get(identity)
-      if (existing) return toSubscription(identity, existing)
+      if (existing) {
+        applyQuality(existing, quality)
+        return toSubscription(identity, existing)
+      }
 
       const participant = room.getParticipantByIdentity(identity) as RemoteParticipant | undefined
       if (!participant) return null
       const publication = findScreenPublication(participant)
       if (!publication) return null
 
-      // 第二层：已经订阅过（例如 SDK 因为别的原因先订阅了）就直接复用。
+      /**
+       * 顺序不能反：**先** `setSubscribed(true)`，**再** `setVideoQuality(...)`。
+       *
+       * WHY：`autoSubscribe = false` 时 publication 的 `subscribed` 初始值就是 false，
+       * 而 SDK 的 `setVideoQuality` 有一道 `isDesired`（= `subscribed !== false`）门槛——
+       * 未订阅时它直接返回。先设画质等于什么都没设，网格会按默认（最高）层推流，
+       * 正是 §52 要避免的那一刻。
+       *
+       * 那"第一秒按高码率推"呢？两条信令在同一个 tick 里发出，SFU 要在收到订阅之后
+       * 才开始推流，所以不存在"先推一秒 1080p 再降档"的窗口；§52 要防的是**持续**的
+       * 高码率下行，那由画质档位本身负责。
+       */
       if (!publication.isSubscribed) publication.setSubscribed(true)
+      publication.setVideoQuality(toVideoQuality(quality))
       const track = await waitForTrack(publication)
 
       // 等待期间可能已经被取消（学生停止共享 / 老师关掉了这个 tile）。
       if (!publication.isSubscribed) return null
 
-      const entry = { publication, track, elements: new Set<HTMLVideoElement>() }
+      const entry = {
+        publication,
+        track,
+        elements: new Set<HTMLVideoElement>(),
+        quality,
+      }
       subscriptions.set(identity, entry)
       return toSubscription(identity, entry)
     },

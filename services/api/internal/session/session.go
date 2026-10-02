@@ -133,13 +133,12 @@ type StudentSession struct {
 	LeftAt          *time.Time
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
-
-	// StudentDisplayName is users.display_name, loaded only by the monitoring read.
-	// It is here rather than in a separate type because every consumer of that read
-	// needs exactly this pair (the session and the person it belongs to), and an
-	// extra struct would only add a join to keep in sync.
-	StudentDisplayName string
 }
+
+// NOTE: a StudentSession carries no display name. The name belongs to the PERSON, not to
+// one of their sessions, and Phase 7's monitoring read gets both from the roster
+// (RosterEntry.DisplayName) — a field here would be a second copy that only one query
+// fills, which is the kind of empty column a later reader mistakes for data.
 
 // MonitorStudent is one tile of the teacher's monitoring wall (§51).
 //
@@ -148,13 +147,26 @@ type StudentSession struct {
 // observation. The teacher UI must never receive a raw LiveKit participant as its
 // model — a participant has no display name, no lesson, and no history, so a wall
 // built from participants shows the wrong things after a reconnect.
+//
+// # Why SessionID and Status are pointers
+//
+// The list is the roster, not the session table (§29's "18 / 25"): a student who was
+// authorized for the lesson but never pressed "进入课堂" is a tile the teacher must see
+// — "who has not come in yet" is half of what a supervision wall answers. That student
+// has no session, so the two session-shaped members are null rather than a zero UUID or
+// an invented seventh status. A nil here is not "unknown": it is "there is none".
 type MonitorStudent struct {
 	StudentID   uuid.UUID
 	DisplayName string
-	SessionID   uuid.UUID
-	Status      Status
+	// SessionID is the student's session in this run, or nil when they have none. It is
+	// also the LiveKit identity (§44), which is how the frontend finds the participant.
+	SessionID *uuid.UUID
+	// Status is the session state, or nil when SessionID is nil. It is never a second
+	// vocabulary for "not in": the six states of §12 are the whole set.
+	Status *Status
 	// ScreenActive, CameraActive and MicrophoneActive are the observed tracks. In
-	// Phase 6 only ScreenActive can be true (§72: no camera, no microphone).
+	// Phase 6 only ScreenActive can be true (§72: no camera, no microphone), and a
+	// student without a session has all three false.
 	ScreenActive     bool
 	CameraActive     bool
 	MicrophoneActive bool
@@ -178,6 +190,23 @@ type MonitorStudent struct {
 type MonitorView struct {
 	Students      []MonitorStudent
 	MediaObserved bool
+}
+
+// RosterEntry is one line of the monitoring wall's source: a student the classroom
+// authorizes, and — when they have one — their session in the current run.
+//
+// WHY the roster drives the wall and not the session table (§29): the header of the
+// console is "18 / 25", and a denominator cannot be computed from the students who
+// already joined. The console also has to render the tile of somebody who has not come
+// in yet ("未进入"), which is a state a session-first read simply cannot express.
+//
+// Session is a pointer for exactly that reason: nil is "this student was authorized for
+// this lesson and never entered", which is a fact about the lesson, not missing data.
+type RosterEntry struct {
+	StudentID   uuid.UUID
+	DisplayName string
+	// Session is the student's session in this run, or nil when there is none.
+	Session *StudentSession
 }
 
 // Sentinel errors, mapped to the API error codes of §58 in internal/httpapi.
@@ -250,6 +279,18 @@ type MediaPlane interface {
 	RemoveParticipant(ctx context.Context, roomName, identity string) error
 	// SignToken mints a participant-scoped token.
 	SignToken(req media.TokenRequest) (string, error)
+	// EnforceNoPeerSubscriptions revokes the subscriptions students still hold to
+	// classmates' tracks (§26). It takes the observation the caller already made, so
+	// the reconciliation costs no extra room query, and it returns what it revoked (and
+	// what it failed to revoke) instead of logging: the caller owns the classroom
+	// context and the project's log vocabulary.
+	EnforceNoPeerSubscriptions(
+		ctx context.Context,
+		roomName string,
+		students []string,
+		observed map[string]media.ParticipantTracks,
+		allowedTrackOwners []string,
+	) ([]media.PeerSubscriptionRevocation, error)
 }
 
 // CreateOrReuseParams is the input of Repository.CreateOrReuse.
@@ -297,10 +338,11 @@ type Repository interface {
 	// (or a double click) is not an error. A session that is not the caller's is
 	// ErrSessionNotFound.
 	Leave(ctx context.Context, sessionID, studentID uuid.UUID) (*StudentSession, error)
-	// ListByRun returns every session of one run, oldest first, joined with the
-	// student's display name. Terminal sessions are included: the wall of §51 shows
-	// that a student left rather than making them disappear.
-	ListByRun(ctx context.Context, runID uuid.UUID) ([]StudentSession, error)
+	// ListRosterByRun returns every student the classroom authorizes, each with their
+	// session in this run or nil when they have none (§29/§51). The order is by account
+	// and is stable across polls: a supervision wall whose tiles move while a teacher is
+	// looking at it is worse than useless.
+	ListRosterByRun(ctx context.Context, classroomID, runID uuid.UUID) ([]RosterEntry, error)
 	// ApplyObservation persists one transition, guarded by the status it was computed
 	// from. It returns the stored row, or nil when the guard did not match (the row
 	// moved on) — nil is not an error, it is "your observation is stale".

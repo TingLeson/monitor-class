@@ -22,6 +22,7 @@
 | [architecture/control-plane.md](architecture/control-plane.md) | 控制面边界与 Source of Truth、请求链中的授权位置、开课/关课事务与并发分析、错误码契约、Phase 6/8 接缝 | Phase 3 |
 | [media/webrtc-basics.md](media/webrtc-basics.md) | Track/Source、为什么课堂是 1 上行 N 下行、`autoSubscribe=false` 的理由、客户端与服务端各自能证明什么 | Phase 6 |
 | [media/livekit-architecture.md](media/livekit-architecture.md) | Room/Participant/Track、Token 权限位逐字段依据、identity 为什么必须 opaque、Room 生命周期、Cloud 与本地容器两种模式 | Phase 6 |
+| [media/track-permissions.md](media/track-permissions.md) | 谁能发布/订阅什么：Token 权限位、服务端 `UpdateSubscriptions` 撤销、客户端 `autoSubscribe=false` 三层落点，以及「合作型客户端可强制、恶意客户端不可强制」的边界 | Phase 7 |
 | [media/sfu.md](media/sfu.md) | SFU 与 Mesh/MCU 的取舍、规模假设与带宽量级、为什么不能用假 `<video>` 标签压测 | Phase 6 |
 
 ## 计划中的文档（按 Phase 产出）
@@ -31,7 +32,6 @@
 | `labs/browser-screen-capture.md` | Screen Capture API、MediaStream/Track、`displaySurface`、浏览器隐私边界 | 5 |
 | `architecture/media-plane.md` | 媒体面边界、Webhook 作为唯一权威观测、`ONLINE` 判定权 | 8 |
 | `architecture/realtime-flow.md` | WebSocket 业务事件流、与 DataChannel 的分工 | 8 |
-| `media/track-permissions.md` | 各角色的 publish/subscribe 权限矩阵、学生间隔离如何实现 | 7-10 |
 | `media/private-audio.md` | 老师私密语音状态机、订阅权限切换、学生未授权麦克风时的行为 | 10 |
 | `deployment/local.md` | 本地环境细节（与 setup.md 互链） | 0/11 |
 | `deployment/production.md` | HTTPS、TURN/TLS、反代、限流、指标、多网络测试 | 11 |

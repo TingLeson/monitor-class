@@ -379,7 +379,8 @@ classwatch/
 | 4 | 学生课堂门户：只返回被授权的课堂（服务端 JOIN）、OPEN/CLOSED 卡片、PreJoin（必选整屏 + 可选摄像头麦克风 + 隐私告知原文）；加入课堂的媒体动作留给 Phase 5/6 | 屏幕共享 Gate（5） |
 | 5 | 整屏共享 Gate：浏览器能力自检（不满足即拒绝，不降级）、`getDisplayMedia` 约束偏好（禁 surface switching）、`displaySurface === 'monitor'` 硬闸门（window/browser/undefined 一律 stop 并拒绝）、停止共享的客户端检测与重新共享入口 | LiveKit 接入（6） |
 | 6 | LiveKit 媒体接入：join API（Screen Gate 之后才建会话）、短时 Token（identity 为 opaque UUID、权限位按角色收窄）、复用同一条屏幕轨道发布、老师端手动订阅并渲染；会话状态由**服务端观测**（RoomService）推进，媒体面故障不写成业务事实；关课终止 Room | 多学生监督墙与 Focus View（7） |
-| 7–12 | —— | 多学生监督墙（7）、事件与 WebSocket（8）、摄像头（9）、私密语音（10）、生产加固（11）、压测（12） |
+| 7 | 多学生监督墙：monitor 返回**完整课堂名单**（含未进入的学生，即 `18 / 25` 的分母）、网格 + Focus View、按可见性与焦点动态订阅与画质分层、服务端 `UpdateSubscriptions` 撤销学生互订 | 事件与 WebSocket（8） |
+| 8–12 | —— | 事件与 WebSocket（8）、摄像头（9）、私密语音（10）、生产加固（11）、压测（12） |
 
 验收标准：Phase 0 是 **`make dev` 能启动基础环境**（任务书 §66）；
 Phase 1 是**三种角色都能登录、跨入口与停用账号都被服务端正确拒绝**（§67）。

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -88,6 +89,13 @@ func newFixture(t *testing.T) *fixture {
 		ClassroomID: created.ID, TeacherID: teacher.ID, RunID: runID, RoomName: classroom.RoomName(runID),
 	}); err != nil {
 		t.Fatalf("open classroom: %v", err)
+	}
+	// The monitoring wall reads the ROSTER (§29/§51), so the two students have to be
+	// authorized for the classroom, not merely created. Creating the grant here and not
+	// in the individual tests is what keeps "the wall lists exactly these people" true
+	// for every test in this file.
+	if err := classrooms.AddStudents(ctx, created.ID, []uuid.UUID{studentA.ID, studentB.ID}, teacher.ID); err != nil {
+		t.Fatalf("add students to the roster: %v", err)
 	}
 
 	t.Cleanup(func() { cleanup(t, pool, teacher.ID, studentA.ID, studentB.ID) })
@@ -436,12 +444,23 @@ func TestLeaveIsScopedToTheOwner(t *testing.T) {
 		t.Fatalf("unknown session: err = %v, want ErrSessionNotFound", err)
 	}
 	// The session is untouched by the refused calls.
-	stored, err := f.repo.ListByRun(ctx, f.runID)
+	roster, err := f.repo.ListRosterByRun(ctx, f.classroomID, f.runID)
 	if err != nil {
-		t.Fatalf("ListByRun: %v", err)
+		t.Fatalf("ListRosterByRun: %v", err)
 	}
-	if len(stored) != 1 || stored[0].Status != session.StatusConnecting {
-		t.Errorf("sessions = %+v, want the student's own session untouched", stored)
+	// Two authorized students, but only one of them has a session: the other is a row
+	// with a nil Session, which is the whole point of the roster read.
+	if len(roster) != 2 {
+		t.Fatalf("roster = %+v, want the two authorized students", roster)
+	}
+	for _, entry := range roster {
+		if entry.StudentID == f.studentA.ID {
+			if entry.Session == nil || entry.Session.Status != session.StatusConnecting {
+				t.Errorf("session = %+v, want the student's own session untouched", entry.Session)
+			}
+		} else if entry.Session != nil {
+			t.Errorf("student B has a session they never created: %+v", entry.Session)
+		}
 	}
 }
 
@@ -519,59 +538,157 @@ func TestApplyObservationIsCompareAndSet(t *testing.T) {
 	if stored != nil {
 		t.Fatalf("stored = %+v, want nil (the guard must not match)", stored)
 	}
-	sessions, err := f.repo.ListByRun(ctx, f.runID)
+	roster, err := f.repo.ListRosterByRun(ctx, f.classroomID, f.runID)
 	if err != nil {
-		t.Fatalf("ListByRun: %v", err)
+		t.Fatalf("ListRosterByRun: %v", err)
 	}
-	if sessions[0].Status != session.StatusLeft {
-		t.Errorf("status = %s, want the LEFT decision to stand", sessions[0].Status)
+	studentAEntry := rosterEntryOf(t, roster, f.studentA.ID)
+	if studentAEntry.Session == nil || studentAEntry.Session.Status != session.StatusLeft {
+		t.Errorf("session = %+v, want the LEFT decision to stand", studentAEntry.Session)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// ListByRun
+// ListRosterByRun (§29/§51)
 // ---------------------------------------------------------------------------
 
-// TestListByRunJoinsTheDisplayNameAndKeepsTerminalRows is the §51 read: the wall gets
-// the person and the session together, and a student who left stays visible as LEFT.
-func TestListByRunJoinsTheDisplayNameAndKeepsTerminalRows(t *testing.T) {
+// TestListRosterByRunIsTheRosterNotTheSessions is the Phase 7 read: the wall lists every
+// authorized student, the one who never entered is a row with a nil session rather than a
+// missing row, and a student who left stays visible as LEFT.
+func TestListRosterByRunIsTheRosterNotTheSessions(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 
-	f.create(t, f.studentA.ID)
-	second := f.create(t, f.studentB.ID)
-	if _, err := f.repo.Leave(ctx, second.ID, f.studentB.ID); err != nil {
+	// Only student A enters.
+	created := f.create(t, f.studentA.ID)
+	if _, err := f.repo.Leave(ctx, created.ID, f.studentA.ID); err != nil {
 		t.Fatalf("Leave: %v", err)
 	}
 
 	// A session of another run must not appear.
 	_, otherStudent := otherRun(t, f)
 
-	sessions, err := f.repo.ListByRun(ctx, f.runID)
+	roster, err := f.repo.ListRosterByRun(ctx, f.classroomID, f.runID)
 	if err != nil {
-		t.Fatalf("ListByRun: %v", err)
+		t.Fatalf("ListRosterByRun: %v", err)
 	}
-	if len(sessions) != 2 {
-		t.Fatalf("sessions = %d, want 2 (one per student)", len(sessions))
+	if len(roster) != 2 {
+		t.Fatalf("roster = %d rows, want 2 (every authorized student)", len(roster))
 	}
 	names := map[uuid.UUID]string{}
-	statuses := map[uuid.UUID]session.Status{}
-	for _, stored := range sessions {
-		names[stored.StudentID] = stored.StudentDisplayName
-		statuses[stored.StudentID] = stored.Status
-		if stored.ClassroomRunID != f.runID {
-			t.Errorf("session %s belongs to run %s, not %s", stored.ID, stored.ClassroomRunID, f.runID)
+	for _, entry := range roster {
+		names[entry.StudentID] = entry.DisplayName
+		if entry.Session != nil && entry.Session.ClassroomRunID != f.runID {
+			t.Errorf("session %s belongs to run %s, not %s", entry.Session.ID, entry.Session.ClassroomRunID, f.runID)
 		}
 	}
 	if names[f.studentA.ID] != "张三" || names[f.studentB.ID] != "李四" {
 		t.Errorf("display names = %v, want the joined account names", names)
 	}
-	if statuses[f.studentB.ID] != session.StatusLeft {
-		t.Errorf("left student status = %s, want LEFT (the wall shows that they left)", statuses[f.studentB.ID])
+
+	// A student who joined and then left is LEFT — not absent, and not null: leaving is
+	// a decision the wall must show.
+	joinedThenLeft := rosterEntryOf(t, roster, f.studentA.ID).Session
+	if joinedThenLeft == nil || joinedThenLeft.Status != session.StatusLeft {
+		t.Errorf("student A session = %+v, want LEFT (the wall shows that they left)", joinedThenLeft)
+	}
+	// A student who never pressed "进入课堂" has no session at all.
+	if waiting := rosterEntryOf(t, roster, f.studentB.ID).Session; waiting != nil {
+		t.Errorf("student B session = %+v, want nil (never entered)", waiting)
 	}
 	if _, ok := names[otherStudent]; ok {
-		t.Error("a session of another run leaked into the wall")
+		t.Error("a student of another classroom leaked into the wall")
 	}
+}
+
+// TestListRosterByRunOrdersByAccountAndPrefersTheActiveSession covers the two rules that
+// make the grid usable: the order is the account's (stable between polls, and independent
+// of who joined first), and a student who left and re-entered is shown by their ACTIVE
+// session rather than by the LEFT record they left behind.
+func TestListRosterByRunOrdersByAccountAndPrefersTheActiveSession(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	users := user.NewPostgres(f.pool)
+	classrooms := classroom.NewPostgres(f.pool)
+
+	// A third authorized student. The account is random like the fixture's (a fixed one
+	// would collide with a previous run of this suite) and the expected order is computed
+	// from the generated values below, so the test does not depend on the draw.
+	early, err := users.Create(ctx, user.CreateParams{
+		Account: dbtest.RandomAccount("a"), DisplayName: "最早", Role: user.RoleStudent,
+	})
+	if err != nil {
+		t.Fatalf("create third student: %v", err)
+	}
+	if err := classrooms.AddStudents(ctx, f.classroomID, []uuid.UUID{early.ID}, f.teacher.ID); err != nil {
+		t.Fatalf("add third student: %v", err)
+	}
+	// The grant has to go before the account can (classroom_students → users is
+	// ON DELETE RESTRICT), and this cleanup runs before the fixture's own.
+	t.Cleanup(func() {
+		if _, err := f.pool.Exec(ctx, `DELETE FROM classroom_students WHERE student_id = $1`, early.ID); err != nil {
+			t.Logf("cleanup: grant of %s: %v", early.ID, err)
+		}
+		if _, err := f.pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, early.ID); err != nil {
+			t.Logf("cleanup: account %s: %v", early.ID, err)
+		}
+	})
+
+	// Student A joins, leaves, and joins again: two rows in the same run, one terminal.
+	first := f.create(t, f.studentA.ID)
+	if _, err := f.repo.Leave(ctx, first.ID, f.studentA.ID); err != nil {
+		t.Fatalf("Leave: %v", err)
+	}
+	second := f.create(t, f.studentA.ID)
+	if second.ID == first.ID {
+		t.Fatal("the re-entry reused the LEFT session, want a new row")
+	}
+
+	roster, err := f.repo.ListRosterByRun(ctx, f.classroomID, f.runID)
+	if err != nil {
+		t.Fatalf("ListRosterByRun: %v", err)
+	}
+	if len(roster) != 3 {
+		t.Fatalf("roster = %d rows, want 3 (one per authorized student)", len(roster))
+	}
+	// The expected order is computed from the accounts that were actually generated: the
+	// fixture's accounts are random, so hard-coding them would assert the test's luck.
+	// The comparison lowercases, mirroring the citext column the ORDER BY runs on.
+	type member struct {
+		id      uuid.UUID
+		account string
+	}
+	members := []member{
+		{early.ID, early.Account}, {f.studentA.ID, f.studentA.Account}, {f.studentB.ID, f.studentB.Account},
+	}
+	sort.Slice(members, func(i, j int) bool {
+		left, right := strings.ToLower(members[i].account), strings.ToLower(members[j].account)
+		if left != right {
+			return left < right
+		}
+		return members[i].id.String() < members[j].id.String()
+	})
+	for i, want := range members {
+		if roster[i].StudentID != want.id {
+			t.Errorf("row %d = %s, want %s (account %s)", i, roster[i].StudentID, want.id, want.account)
+		}
+	}
+	active := rosterEntryOf(t, roster, f.studentA.ID).Session
+	if active == nil || active.ID != second.ID || active.Status != session.StatusConnecting {
+		t.Errorf("student A session = %+v, want the ACTIVE re-entry %s", active, second.ID)
+	}
+}
+
+// rosterEntryOf finds one student's row in a roster read.
+func rosterEntryOf(t *testing.T, roster []session.RosterEntry, studentID uuid.UUID) session.RosterEntry {
+	t.Helper()
+	for _, entry := range roster {
+		if entry.StudentID == studentID {
+			return entry
+		}
+	}
+	t.Fatalf("student %s is missing from the roster: %+v", studentID, roster)
+	return session.RosterEntry{}
 }
 
 // otherRun creates a second open run (a second classroom, so the one-open-run index
@@ -621,8 +738,8 @@ func TestRepositoryWithoutAPoolFailsLoudly(t *testing.T) {
 	if _, err := repo.Leave(ctx, uuid.New(), uuid.New()); err == nil {
 		t.Error("Leave on a nil pool succeeded")
 	}
-	if _, err := repo.ListByRun(ctx, uuid.New()); err == nil {
-		t.Error("ListByRun on a nil pool succeeded")
+	if _, err := repo.ListRosterByRun(ctx, uuid.New(), uuid.New()); err == nil {
+		t.Error("ListRosterByRun on a nil pool succeeded")
 	}
 	if _, err := repo.ApplyObservation(ctx, session.ObservationChange{SessionID: uuid.New()}); err == nil {
 		t.Error("ApplyObservation on a nil pool succeeded")

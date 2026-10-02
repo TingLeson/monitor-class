@@ -7,8 +7,14 @@ import {
   type MediaDisconnectReason,
   type MediaRemoteParticipant,
   type MonitorRoom,
+  type ScreenQuality,
   type ScreenSubscription,
 } from '../lib/media/media-room.ts'
+import {
+  resetTileVisibilityFactory,
+  setTileVisibilityFactory,
+  type TileVisibilityHandle,
+} from '../lib/tile-visibility.ts'
 
 /**
  * 老师端媒体测试替身（§51 / §52）。
@@ -30,6 +36,15 @@ export interface FakeMonitorRoom {
    * "不重复订阅"的防线就永远不会被测出来——而这正是本 Phase 最要盯的性质之一。
    */
   readonly subscribeCalls: string[]
+  /**
+   * 每次订阅请求带的画质档（§52 的"网格低 / Focus 高"）。
+   *
+   * 与 subscribeCalls 一一对应；分开记录是为了让断言能直接写成
+   * `qualitiesFor('session-1') === ['low', 'high']` 这样的一行。
+   */
+  readonly subscribeQualities: ScreenQuality[]
+  /** 每条订阅上的 setQuality 调用（切换 Focus 时必须走这条路，而不是重新订阅）。 */
+  readonly qualityChanges: { identity: string; quality: ScreenQuality }[]
   readonly unsubscribeCalls: string[]
   /** 被 attach 过的 `<video>`（断言"画面真的挂上去了"）。 */
   readonly attachedElements: HTMLVideoElement[]
@@ -56,6 +71,14 @@ export interface MonitorRoomHarness {
   flags: {
     connectError: Error | null
     subscribeError: Error | null
+    /**
+     * 订阅闸门：非 null 时 `subscribeScreen` 会一直挂到它 resolve。
+     *
+     * 用来验证"订阅请求是**并发**发出的"。真实场景里轨道要几百毫秒才推下来，
+     * 如果实现是串行 await，第 N 张卡片要等前面 N-1 条轨道全部到位才开始请求，
+     * 一面 20 人的监督墙就得十几秒才填满——这个 bug 在假房间里只有靠闸门才看得见。
+     */
+    subscribeGate: Promise<void> | null
   }
   current(): FakeMonitorRoom
 }
@@ -69,6 +92,7 @@ export function installFakeMonitorRoom(
   const flags = {
     connectError: options.connectError ?? null,
     subscribeError: null as Error | null,
+    subscribeGate: null as Promise<void> | null,
   }
   /**
    * 媒体层里"真的有谁"。
@@ -102,6 +126,7 @@ export function installFakeMonitorRoom(
 function makeFakeMonitorRoom(flags: {
   connectError: Error | null
   subscribeError: Error | null
+  subscribeGate: Promise<void> | null
 }): FakeMonitorRoom {
   const participantsChanged: (() => void)[] = []
   const subscribed: ((identity: string) => void)[] = []
@@ -109,6 +134,8 @@ function makeFakeMonitorRoom(flags: {
   const disconnected: ((reason: MediaDisconnectReason) => void)[] = []
 
   const subscribeCalls: string[] = []
+  const subscribeQualities: ScreenQuality[] = []
+  const qualityChanges: { identity: string; quality: ScreenQuality }[] = []
   const unsubscribeCalls: string[] = []
   const attachedElements: HTMLVideoElement[] = []
   let connectCalls = 0
@@ -125,26 +152,42 @@ function makeFakeMonitorRoom(flags: {
       return Promise.resolve()
     },
     participants: () => [...self.participants],
-    subscribeScreen(identity: string): Promise<ScreenSubscription | null> {
+    subscribeScreen(
+      identity: string,
+      quality: ScreenQuality = 'low',
+    ): Promise<ScreenSubscription | null> {
+      // 调用**发起**的顺序与画质在这里就记下来：闸门开着时（订阅还没结果）
+      // 也能量出"请求是不是并发发出的"。
       subscribeCalls.push(identity)
-      if (flags.subscribeError) return Promise.reject(flags.subscribeError)
-      // 与真实适配层一致：房间里根本没有这个参与者时返回 null
-      // （业务状态可能领先于媒体状态，此时卡片显示"正在订阅画面…"）。
-      if (!self.participants.some((participant) => participant.identity === identity)) {
-        return Promise.resolve(null)
+      subscribeQualities.push(quality)
+      const respond = (): Promise<ScreenSubscription | null> => {
+        if (flags.subscribeError) return Promise.reject(flags.subscribeError)
+        // 与真实适配层一致：房间里根本没有这个参与者时返回 null
+        // （业务状态可能领先于媒体状态，此时卡片显示"正在订阅画面…"）。
+        if (!self.participants.some((participant) => participant.identity === identity)) {
+          return Promise.resolve(null)
+        }
+        if (!self.screenAvailable) return Promise.resolve(null)
+        const current: { quality: ScreenQuality } = { quality }
+        const subscription: ScreenSubscription = {
+          identity,
+          attach(element: HTMLVideoElement): () => void {
+            attachedElements.push(element)
+            return () => {
+              const index = attachedElements.indexOf(element)
+              if (index >= 0) attachedElements.splice(index, 1)
+            }
+          },
+          setQuality(next: ScreenQuality): void {
+            // 与真实适配层一样对重复档位免疫：测试要断言的正是"没有多余的切换"。
+            if (current.quality === next) return
+            current.quality = next
+            qualityChanges.push({ identity, quality: next })
+          },
+        }
+        return Promise.resolve(subscription)
       }
-      if (!self.screenAvailable) return Promise.resolve(null)
-      const subscription: ScreenSubscription = {
-        identity,
-        attach(element: HTMLVideoElement): () => void {
-          attachedElements.push(element)
-          return () => {
-            const index = attachedElements.indexOf(element)
-            if (index >= 0) attachedElements.splice(index, 1)
-          }
-        },
-      }
-      return Promise.resolve(subscription)
+      return flags.subscribeGate === null ? respond() : flags.subscribeGate.then(respond)
     },
     unsubscribeScreen(identity: string): Promise<void> {
       unsubscribeCalls.push(identity)
@@ -177,6 +220,8 @@ function makeFakeMonitorRoom(flags: {
       return disconnectCalls
     },
     subscribeCalls,
+    subscribeQualities,
+    qualityChanges,
     unsubscribeCalls,
     attachedElements,
     participants: [],
@@ -210,7 +255,72 @@ function removeFrom<T>(list: T[], item: T): void {
 
 afterEach(() => {
   resetMonitorRoomFactory()
+  resetTileVisibilityFactory()
 })
+
+/* -------------------------------------------------------------------------- */
+/* 可见性替身（§52 的动态订阅）                                                */
+/* -------------------------------------------------------------------------- */
+
+export interface TileVisibilityHarness {
+  /** 已经被观察过的卡片（studentId，按 observe 的先后顺序）。 */
+  readonly observed: string[]
+  /** 当前在视口里的卡片。 */
+  readonly visible: Set<string>
+  /** 把某个学生切进/切出视口（等价于老师滚动到/滚离那张卡片）。 */
+  setVisible(studentId: string, visible: boolean): void
+  /** 不再观察某张卡片（组件卸载）。 */
+  release(studentId: string): void
+}
+
+/**
+ * 装上假的可见性工厂（每个测试结束后由本文件的 afterEach 还原）。
+ *
+ * WHY 必须注入：happy-dom 没有布局引擎，真实 `IntersectionObserver` 永远不会回调，
+ * 于是"只有可见卡片被订阅"这条本 Phase 最核心的性质在测试里根本跑不到。
+ * 但真实 IO 会**在 observe 之后立刻为每个目标回调一次当前状态**，所以替身的默认
+ * 行为就是"观察即视为可见"——测试若不断言可见性，看到的行为与真机上"卡片就在首屏"一致。
+ */
+export function installFakeVisibility(): TileVisibilityHarness {
+  const listeners = new Map<string, (visible: boolean) => void>()
+  const observed: string[] = []
+  const visible = new Set<string>()
+
+  setTileVisibilityFactory((studentId, onChange) => {
+    observed.push(studentId)
+    listeners.set(studentId, onChange)
+    visible.add(studentId)
+    // 真实 IO 的首次回调是异步的（下一帧），这里同步触发：调用方（卡片 → 视图 → store）
+    // 本来就会把结果交给 subscribe 的异步链路，同步触发不会掩盖任何时序问题。
+    onChange(true)
+    const handle: TileVisibilityHandle = {
+      observe(): void {
+        // 替身按 studentId 记账（真实实现按元素记账）。
+      },
+      disconnect(): void {
+        // 卡片卸载 = 它不在视口里了：两个集合都要收敛，否则"在视口里的学生"
+        // 会随着老师反复进出页面慢慢变成一份历史记录。
+        listeners.delete(studentId)
+        visible.delete(studentId)
+      },
+    }
+    return handle
+  })
+
+  return {
+    observed,
+    visible,
+    setVisible(studentId: string, next: boolean): void {
+      if (next) visible.add(studentId)
+      else visible.delete(studentId)
+      listeners.get(studentId)?.(next)
+    },
+    release(studentId: string): void {
+      visible.delete(studentId)
+      listeners.delete(studentId)
+    },
+  }
+}
 
 /* -------------------------------------------------------------------------- */
 /* Monitor DTO 夹具（§51）                                                     */
@@ -219,7 +329,7 @@ afterEach(() => {
 /**
  * 一个"正在上课、屏幕正常"的学生。
  *
- * 默认值刻意选成**最完整**的在线形态：任何"未连接 / 屏幕中断"的断言都必须显式
+ * 默认值刻意选成**最完整**的在线形态：任何"未进入 / 已断开 / 屏幕中断"的断言都必须显式
  * 覆盖 sessionStatus 或 screen.active——这样就不会出现"夹具默认值让测试误判通过"。
  */
 export function makeMonitorStudent(overrides: Partial<MonitorStudent> = {}): MonitorStudent {
@@ -238,6 +348,19 @@ export function makeMonitorStudent(overrides: Partial<MonitorStudent> = {}): Mon
   }
 }
 
+/** 连接中（后端已建 Session、学生还没连上媒体，§12）的学生。 */
+export function makeConnectingStudent(overrides: Partial<MonitorStudent> = {}): MonitorStudent {
+  return makeMonitorStudent({
+    studentId: 'student-connecting',
+    displayName: '赵六',
+    sessionId: 'session-connecting',
+    sessionStatus: 'CONNECTING',
+    screen: { active: false },
+    connection: 'UNKNOWN',
+    ...overrides,
+  })
+}
+
 /** 屏幕中断的学生（§22 在老师端的形态）。 */
 export function makeScreenLostStudent(overrides: Partial<MonitorStudent> = {}): MonitorStudent {
   return makeMonitorStudent({
@@ -250,13 +373,59 @@ export function makeScreenLostStudent(overrides: Partial<MonitorStudent> = {}): 
   })
 }
 
-/** 从未进入课堂的学生（名单里有他，但没有 Active Session）。 */
-export function makeOfflineStudent(overrides: Partial<MonitorStudent> = {}): MonitorStudent {
+/**
+ * 连过但已经断开的学生（网络掉线，可能自动恢复）。
+ *
+ * 注意它与"从未进入"的区别：断开的**有** sessionId，未进入的没有。
+ */
+export function makeDisconnectedStudent(overrides: Partial<MonitorStudent> = {}): MonitorStudent {
   return makeMonitorStudent({
-    studentId: 'student-offline',
+    studentId: 'student-disconnected',
+    displayName: '孙七',
+    sessionId: 'session-disconnected',
+    sessionStatus: 'DISCONNECTED',
+    screen: { active: false },
+    connection: 'UNKNOWN',
+    ...overrides,
+  })
+}
+
+/** 已经离开本次课堂的学生（LEFT）。 */
+export function makeLeftStudent(overrides: Partial<MonitorStudent> = {}): MonitorStudent {
+  return makeMonitorStudent({
+    studentId: 'student-left',
+    displayName: '周八',
+    sessionId: 'session-left',
+    sessionStatus: 'LEFT',
+    screen: { active: false },
+    ...overrides,
+  })
+}
+
+/** 课堂被关闭后收尾的学生（ROOM_CLOSED）。 */
+export function makeRoomClosedStudent(overrides: Partial<MonitorStudent> = {}): MonitorStudent {
+  return makeMonitorStudent({
+    studentId: 'student-closed',
+    displayName: '吴九',
+    sessionId: 'session-closed',
+    sessionStatus: 'ROOM_CLOSED',
+    screen: { active: false },
+    ...overrides,
+  })
+}
+
+/**
+ * 本次 Run 从未进入课堂的学生（名单里有他，但没有 Active Session）。
+ *
+ * `sessionId` 与 `sessionStatus` **同时**为 null——这是冻结契约里唯一的表达方式
+ * （shared-types 明确禁止为"没进过课堂"发明第 7 个状态值）。
+ */
+export function makeNotJoinedStudent(overrides: Partial<MonitorStudent> = {}): MonitorStudent {
+  return makeMonitorStudent({
+    studentId: 'student-not-joined',
     displayName: '王五',
     sessionId: null,
-    sessionStatus: 'DISCONNECTED',
+    sessionStatus: null,
     screen: { active: false },
     connection: 'UNKNOWN',
     joinedAt: null,

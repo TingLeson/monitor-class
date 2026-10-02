@@ -163,15 +163,14 @@ func sampleSession(t *testing.T, status session.Status) *session.StudentSession 
 	id := uuid.New()
 	now := time.Date(2026, 3, 4, 19, 0, 0, 0, time.UTC)
 	return &session.StudentSession{
-		ID:                 id,
-		ClassroomRunID:     uuid.New(),
-		StudentID:          uuid.New(),
-		LiveKitIdentity:    id.String(),
-		Status:             status,
-		ConnectedAt:        &now,
-		CreatedAt:          now,
-		UpdatedAt:          now,
-		StudentDisplayName: "张三",
+		ID:              id,
+		ClassroomRunID:  uuid.New(),
+		StudentID:       uuid.New(),
+		LiveKitIdentity: id.String(),
+		Status:          status,
+		ConnectedAt:     &now,
+		CreatedAt:       now,
+		UpdatedAt:       now,
 	}
 }
 
@@ -674,8 +673,9 @@ func TestTeacherMediaTokenErrorMapping(t *testing.T) {
 // GET /teacher/classrooms/:id/monitor
 // ---------------------------------------------------------------------------
 
-// TestMonitorResponseShape pins the §51 DTO member by member: the frontend's monitoring
-// wall is written against this exact object, including the nested media blocks.
+// TestMonitorResponseShape pins the §51/§29 DTO member by member: the frontend's
+// monitoring wall is written against this exact object, including the nested media
+// blocks, and including the two members that are null for a student who has not entered.
 func TestMonitorResponseShape(t *testing.T) {
 	h := newSessionHarness(t, nil, nil)
 	teacher, cookies, _ := h.teacherSession(t, "teacher-01")
@@ -688,19 +688,23 @@ func TestMonitorResponseShape(t *testing.T) {
 	lost := sampleSession(t, session.StatusScreenLost)
 	lost.ConnectedAt = nil
 	lost.UpdatedAt = event
+	onlineStatus, lostStatus := session.StatusOnline, session.StatusScreenLost
+	// A student who is authorized but has never entered: the null tile of §29.
+	never := session.MonitorStudent{StudentID: uuid.New(), DisplayName: "王五", Connection: session.ConnectionUnknown}
 	h.sessions.monitorResult = &session.MonitorView{
 		MediaObserved: true,
 		Students: []session.MonitorStudent{
 			{
-				StudentID: online.StudentID, DisplayName: "张三", SessionID: online.ID,
-				Status: session.StatusOnline, ScreenActive: true, Connection: session.ConnectionGood,
+				StudentID: online.StudentID, DisplayName: "张三", SessionID: &online.ID,
+				Status: &onlineStatus, ScreenActive: true, Connection: session.ConnectionGood,
 				JoinedAt: &joined, LastEventAt: &event,
 			},
 			{
-				StudentID: lost.StudentID, DisplayName: "李四", SessionID: lost.ID,
-				Status: session.StatusScreenLost, ScreenActive: false, CameraActive: false, MicrophoneActive: false,
+				StudentID: lost.StudentID, DisplayName: "李四", SessionID: &lost.ID,
+				Status: &lostStatus, ScreenActive: false, CameraActive: false, MicrophoneActive: false,
 				Connection: session.ConnectionUnknown, LastEventAt: &event,
 			},
+			never,
 		},
 	}
 
@@ -716,8 +720,8 @@ func TestMonitorResponseShape(t *testing.T) {
 
 	body := jsonBodyOf(t, rec)
 	students, ok := body["students"].([]any)
-	if !ok || len(students) != 2 {
-		t.Fatalf("students = %v, want two tiles", body["students"])
+	if !ok || len(students) != 3 {
+		t.Fatalf("students = %v, want three tiles", body["students"])
 	}
 	if len(body) != 1 {
 		t.Errorf("response has %d members (%v), want only students", len(body), body)
@@ -756,10 +760,27 @@ func TestMonitorResponseShape(t *testing.T) {
 	if second["joinedAt"] != nil {
 		t.Errorf("joinedAt = %v, want null for a student never observed in the room", second["joinedAt"])
 	}
+
+	// The tile of a student who never entered: the two session members must be JSON
+	// null (not "", not a zero UUID, and not a seventh status), and the media blocks must
+	// be present and false so the card renders the same shape as every other card.
+	third, _ := students[2].(map[string]any)
+	if third["sessionId"] != nil || third["sessionStatus"] != nil {
+		t.Errorf("session members = %v/%v, want null for a student with no session", third["sessionId"], third["sessionStatus"])
+	}
+	if third["connection"] != "UNKNOWN" || third["joinedAt"] != nil || third["lastEventAt"] != nil {
+		t.Errorf("third tile = %v, want UNKNOWN connection and null timestamps", third)
+	}
+	for _, member := range []string{"screen", "camera", "microphone"} {
+		track, ok := third[member].(map[string]any)
+		if !ok || track["active"] != false {
+			t.Errorf("%s = %v, want {active:false}", member, third[member])
+		}
+	}
 }
 
-// TestMonitorEmptyWallIsAnArray: "nobody has joined yet" must serialise as [] so the
-// console renders its empty state instead of special-casing null.
+// TestMonitorEmptyWallIsAnArray: "this classroom authorizes nobody" must serialise as []
+// so the console renders its empty state instead of special-casing null.
 func TestMonitorEmptyWallIsAnArray(t *testing.T) {
 	h := newSessionHarness(t, nil, nil)
 	_, cookies, _ := h.teacherSession(t, "teacher-01")

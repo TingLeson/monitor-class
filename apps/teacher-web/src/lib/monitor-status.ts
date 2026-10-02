@@ -1,7 +1,7 @@
-import type { MonitorStudent } from '@classwatch/shared-types'
+import type { ConnectionQuality, MonitorStudent, MonitorTileState } from '@classwatch/shared-types'
 
 /**
- * 监督卡片的状态映射（§22 / §29 / §51）。
+ * 监督卡片的状态映射（§12 / §22 / §29 / §30 / §51）。
  *
  * 这里是**业务状态 + 媒体状态合成卡片**那一步的一半（另一半在 store 里）：
  *
@@ -24,64 +24,135 @@ import type { MonitorStudent } from '@classwatch/shared-types'
  *
  * 用 @classwatch/ui 的 **BadgeTone** 词表（不是 StatusDot 的 StatusTone）：
  * 监督墙上的徽章是一个分类标签而不是"运行状态"，借用 open/closed 那套词
- * 会让"未连接"看起来像"课堂已关闭"（§35 的语义色纪律）。
+ * 会让"未进入"看起来像"课堂已关闭"（§35 的语义色纪律）。
+ *
+ * 四档而不是三档：Phase 7 的名单里有"连接中"（🟡），它既不是正常也不是故障，
+ * 借用 danger 会让老师以为出了问题，借用 muted 又会让它淹没在一片灰里。
  */
-export type MonitorBadgeTone = 'positive' | 'danger' | 'muted'
+export type MonitorBadgeTone = 'positive' | 'danger' | 'muted' | 'attention'
 
 export interface MonitorBadge {
-  /** §29 的三种徽章：🟢 正常 / 🔴 屏幕中断 / ⚪ 未连接。 */
+  /** §29 的状态色，Phase 7 覆盖 6 个落库状态 + 未进入。 */
   emoji: string
   label: string
   tone: MonitorBadgeTone
 }
 
 /**
- * 徽章映射。
+ * 会话是否"在线类"：学生本人确实在这节课里。
  *
- * 判定顺序（顺序即优先级）：
- * 1. `SCREEN_LOST` → 🔴 屏幕中断。这是 §22 的专用状态，后端已经明确告诉我们
- *    "这个学生屏幕断了"，不必再去看 `screen.active`；
- * 2. `ONLINE` 但 `screen.active === false` → 同样按屏幕中断处理。§21 的不变量是
- *    "ONLINE ⇒ screen track 存在且在发布"，这个组合说明不变量已经被破坏，
- *    显示"正常"等于对老师撒谎，而这是监督系统里最不能犯的错；
- * 3. 其余（CONNECTING / DISCONNECTED / LEFT / ROOM_CLOSED）→ ⚪ 未连接。
- *    注意**不能**把这几档归到"屏幕中断"：屏幕中断意味着"学生还在，只是没画面"，
- *    而这几档是"学生根本不在课堂上"，老师要做的事完全不同（一个去提醒学生，
- *    一个去确认学生是不是掉线了）。
+ * 只包含 ONLINE / SCREEN_LOST：
+ * - CONNECTING 是"后端已建 Session、学生还没连上媒体"（§12），人还没进来；
+ * - DISCONNECTED 是"连过但断了"，需要老师去确认，不是"在上课"；
+ * - LEFT / ROOM_CLOSED 是已经结束。
+ *
+ * WHY 把它单独提出来：头部计数（已进入 N）与订阅判据必须用**同一把尺子**，
+ * 否则会出现"头说 5 人在线，网格里只有 3 张卡片有画面"这种自己和自己矛盾的界面。
  */
-export function describeMonitorBadge(student: MonitorStudent): MonitorBadge {
-  if (student.sessionStatus === 'SCREEN_LOST') {
-    return { emoji: '🔴', label: '屏幕中断', tone: 'danger' }
-  }
-  if (student.sessionStatus === 'ONLINE') {
-    return student.screen.active
-      ? { emoji: '🟢', label: '正常', tone: 'positive' }
-      : { emoji: '🔴', label: '屏幕中断', tone: 'danger' }
-  }
-  return { emoji: '⚪', label: '未连接', tone: 'muted' }
+function isSessionLive(status: MonitorStudent['sessionStatus']): boolean {
+  return status === 'ONLINE' || status === 'SCREEN_LOST'
 }
 
 /**
- * 这张卡片是否应该订阅屏幕轨道（§52 的"按需订阅"在 Phase 6 的最小形态）。
+ * 学生是否已经进入本次 Run（头部"已进入 N"的分子，也是"能不能有画面"的前提）。
  *
- * 判据只有两个：业务上屏幕是活的（`screen.active`），且有会话可以对应到
- * LiveKit identity。**刻意不**用"当前可见/滚动位置"来筛——那属于 Phase 7 的
- * 动态订阅优化（§52 / §73），本 Phase 先把"不多订阅、不重复订阅"做对。
+ * 两个条件缺一不可：有会话 identity（`sessionId`），且会话在线。
+ * 后端契约保证二者同时为空或同时有值（见 shared-types 的 MonitorStudent 说明），
+ * 这里仍然两个都判，是因为**媒体订阅必须拿到 identity**，而"没有 identity 却显示在线"
+ * 的一行如果在运行期真的出现，宁可算作未进入，也不能拿一个空字符串去订轨道。
+ */
+export function isStudentEntered(student: MonitorStudent): boolean {
+  return (
+    student.sessionId !== null && student.sessionId !== '' && isSessionLive(student.sessionStatus)
+  )
+}
+
+/**
+ * 派生展示状态（§29）。
+ *
+ * 判定顺序即优先级，两条容易写错的边界：
+ * 1. **`sessionStatus === null` 优先于一切**：没有会话就没有 screen 状态可言，
+ *    必须显示"未进入"。这是老师最需要一眼看到的信息——名单里 25 个人到底进来了几个。
+ * 2. `ONLINE` 但 `screen.active === false` 归到 `SCREEN_LOST`。§21 的不变量是
+ *    "ONLINE ⇒ screen track 存在且在发布"，这个组合说明不变量已经被破坏；
+ *    显示"正常"等于对老师撒谎，而这是监督系统里最不能犯的错。
+ */
+export function deriveMonitorTileState(student: MonitorStudent): MonitorTileState {
+  switch (student.sessionStatus) {
+    case null:
+      return 'NOT_JOINED'
+    case 'CONNECTING':
+      return 'CONNECTING'
+    case 'ONLINE':
+      return student.screen.active ? 'NORMAL' : 'SCREEN_LOST'
+    case 'SCREEN_LOST':
+      return 'SCREEN_LOST'
+    case 'DISCONNECTED':
+      return 'DISCONNECTED'
+    case 'LEFT':
+    case 'ROOM_CLOSED':
+      // 合并成一档：对老师来说"学生自己走了"和"课堂关掉了"是同一件事——
+      // 这个人已经不在这节课里，能采取的动作没有差别（§29 的六色语义）。
+      return 'LEFT'
+  }
+}
+
+/**
+ * 徽章映射（§29 的六色 + 未进入）。
+ *
+ * WHY 断开（⚪）和已离开（⚫）要用两个颜色：它们都"没有画面"，但老师要做的事
+ * 完全不同——断开的要判断是不是网络问题、要不要等重连；离开的是这件事已经结束。
+ * 把两者涂成同一个灰，监督墙就退化成了"一片灰"。
+ */
+export function describeMonitorBadge(student: MonitorStudent): MonitorBadge {
+  switch (deriveMonitorTileState(student)) {
+    case 'NORMAL':
+      return { emoji: '🟢', label: '正常', tone: 'positive' }
+    case 'SCREEN_LOST':
+      return { emoji: '🔴', label: '屏幕中断', tone: 'danger' }
+    case 'CONNECTING':
+      return { emoji: '🟡', label: '连接中', tone: 'attention' }
+    case 'DISCONNECTED':
+      return { emoji: '⚪', label: '已断开', tone: 'muted' }
+    case 'LEFT':
+      return { emoji: '⚫', label: '已离开', tone: 'muted' }
+    case 'NOT_JOINED':
+      return { emoji: '⚪', label: '未进入', tone: 'muted' }
+  }
+}
+
+/**
+ * 这张卡片是否**值得**订阅屏幕轨道（§52 的业务侧判据，可见性由 store 再叠一层）。
+ *
+ * 三个条件：会话在线 + 屏幕在发布 + 有 identity 可用。
+ *
+ * WHY 必须包含"会话在线"这一条：名单里那些从未进入、已断开、已离开的学生
+ * 不该留下任何订阅（§52 的"离线卡片不保留订阅"）。只判 `screen.active` 会留一个
+ * 窗口期——后端把某个学生标成 DISCONNECTED 之后，`screen.active` 可能还会是 true
+ * 直到下一次观测，那几秒里老师端会一直挂着一条永远不会有画面的下行。
  */
 export function shouldSubscribeScreen(student: MonitorStudent): boolean {
-  return student.screen.active && student.sessionId !== null && student.sessionId !== ''
+  if (!isStudentEntered(student)) return false
+  return student.screen.active
 }
 
 /**
  * 卡片主体该显示什么。
  *
- * 四种情形必须区分开，因为老师看到的"没有画面"有四种完全不同的原因：
- * - `waiting`：业务上说他该在共享，但媒体还没到 → "正在订阅画面…"
- * - `lost`：业务上他就没在共享 → "等待共享"
- * - `offline`：他不在课堂上 → "未连接"
- * - `failed`：媒体订阅失败 → 给重试入口（视图负责）
+ * 七种情形必须区分开，因为老师看到的"没有画面"有七种完全不同的原因：
+ * - `waiting`：业务上说他该在共享，媒体还没到 → "正在订阅画面…"
+ * - `lost`：屏幕中断 → "等待共享"
+ * - `connecting`：还没连上媒体 → "正在连接…"
+ * - `disconnected`：连过但掉了 → "连接已断开"
+ * - `left`：已经离开 → "已离开课堂"
+ * - `notJoined`：本次 Run 从未进入 → "未进入课堂"
+ * - `failed`：媒体订阅失败 → "画面订阅失败"（视图给重试入口）
+ *
+ * 合成规则只有一条：**有订阅就是 live**；没有订阅时，原因完全由业务状态决定
+ * （`failed` 例外，那是媒体层的失败，与业务状态无关）。
  */
-export type MonitorTileBody = 'waiting' | 'lost' | 'offline' | 'failed' | 'live'
+export type MonitorTileBody =
+  'live' | 'waiting' | 'lost' | 'connecting' | 'disconnected' | 'left' | 'notJoined' | 'failed'
 
 /** 单个学生的媒体订阅状态（由 store 维护，界面据此渲染主体）。 */
 export type MonitorMediaState = 'none' | 'pending' | 'subscribed' | 'failed'
@@ -92,16 +163,85 @@ export function describeTileBody(
 ): MonitorTileBody {
   if (media.state === 'failed') return 'failed'
   if (media.hasSubscription) return 'live'
-  const badge = describeMonitorBadge(student)
-  if (badge.label === '未连接') return 'offline'
-  if (!student.screen.active) return 'lost'
-  return 'waiting'
+  switch (deriveMonitorTileState(student)) {
+    case 'NORMAL':
+      // 业务说该有画面、媒体还没到。可能是刚发布，也可能是这一格根本不在视口里
+      // （§52 的按可见性订阅：不可见的卡片本来就不该有画面）。
+      return 'waiting'
+    case 'SCREEN_LOST':
+      return 'lost'
+    case 'CONNECTING':
+      return 'connecting'
+    case 'DISCONNECTED':
+      return 'disconnected'
+    case 'LEFT':
+      return 'left'
+    case 'NOT_JOINED':
+      return 'notJoined'
+  }
 }
 
-/** 卡片主体文案（与上面的四种情形一一对应）。 */
+/** 卡片主体文案（与上面的七种情形一一对应，`live` 没有文案因为它渲染的是画面）。 */
 export const TILE_BODY_TEXT: Record<Exclude<MonitorTileBody, 'live'>, string> = {
   waiting: '正在订阅画面…',
   lost: '等待共享',
-  offline: '未连接',
+  connecting: '正在连接…',
+  disconnected: '连接已断开',
+  left: '已离开课堂',
+  notJoined: '未进入课堂',
   failed: '画面订阅失败',
+}
+
+/**
+ * 卡片主体占位的补充说明（"为什么没有画面"的下一句）。
+ *
+ * WHY 要有第二行：只有"未进入课堂"四个字时，老师会怀疑是不是画面没加载出来；
+ * 补一句原因，监督墙才能替代"挨个问学生"。
+ */
+export const TILE_BODY_HINT: Partial<Record<Exclude<MonitorTileBody, 'live'>, string>> = {
+  notJoined: '本次课堂该学生尚未进入',
+  disconnected: '连接已中断，可能正在重连',
+  left: '该学生已结束本次课堂',
+  lost: '学生已停止共享，等待重新共享',
+}
+
+/**
+ * 网格卡片页脚的连接提示（§29 的 `connection`）。
+ *
+ * 用短词而不是百分比/延迟数字：`connection` 是后端的定性判断（§51），
+ * 把它渲染成"32ms"这种精确数字会暗示一个并不存在的数据源。
+ * UNKNOWN 单独成词而不是"正常"——老师看到的"未知"是真的没有数据（§51 明令
+ * 不许用 GOOD 兜底）。
+ */
+export function describeConnectionHint(connection: ConnectionQuality): string {
+  switch (connection) {
+    case 'GOOD':
+      return '正常'
+    case 'FAIR':
+      return '一般'
+    case 'POOR':
+      return '较差'
+    case 'UNKNOWN':
+      return '未知'
+  }
+}
+
+/**
+ * Focus 面板的 Network 行（§30 的"Network Good"）。
+ *
+ * 沿用 §30 线框图的英文等级词：这三档就是 DTO 的取值本身，翻译成中文反而
+ * 会让老师无法把它和排障时看到的接口报文对上。UNKNOWN 是"还没有数据"，
+ * 不是一个等级，所以它用中文的"未知"——措辞不同正是为了让这件事一眼可辨。
+ */
+export function describeNetworkLevel(connection: ConnectionQuality): string {
+  switch (connection) {
+    case 'GOOD':
+      return 'Good'
+    case 'FAIR':
+      return 'Fair'
+    case 'POOR':
+      return 'Poor'
+    case 'UNKNOWN':
+      return '未知'
+  }
 }

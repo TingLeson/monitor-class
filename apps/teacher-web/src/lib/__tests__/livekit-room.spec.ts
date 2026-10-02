@@ -22,13 +22,18 @@ const lk = vi.hoisted(() => ({
   instances: [] as { remoteParticipants: Map<string, unknown> }[],
 }))
 
-/** publication 替身：记录 setSubscribed / setEnabled 的调用。 */
+/** publication 替身：记录 setSubscribed / setVideoQuality 的调用。 */
 interface FakePublication {
   trackSid: string
   source: string
+  /** 与 SDK 一致：`autoSubscribe = false` 时初始值就是 false（即"未订阅"）。 */
   isSubscribed: boolean
   track?: unknown
   subscribedCalls: boolean[]
+  /** 每次生效的画质调整（§52：网格 LOW / Focus HIGH）。 */
+  qualityCalls: number[]
+  /** 被 SDK 门槛丢弃的画质调整——非空就说明调用顺序写反了。 */
+  droppedQualityCalls: number[]
 }
 
 function makePublication(sid: string, source: string): FakePublication {
@@ -37,14 +42,30 @@ function makePublication(sid: string, source: string): FakePublication {
     source,
     isSubscribed: false,
     subscribedCalls: [],
+    qualityCalls: [],
+    droppedQualityCalls: [],
   }
   return Object.assign(publication, {
     setSubscribed(value: boolean): void {
       publication.subscribedCalls.push(value)
       publication.isSubscribed = value
     },
+    setVideoQuality(quality: number): void {
+      /**
+       * 照抄真实 SDK 的门槛：`isDesired` 为假（未订阅）时 setVideoQuality 直接返回
+       * （源码里的 `isManualOperationAllowed`）。没有这一条，"先设画质再订阅"这种
+       * 顺序错误在测试里就永远不会暴露。
+       */
+      if (!publication.isSubscribed) {
+        publication.droppedQualityCalls.push(quality)
+        return
+      }
+      // 真实 SDK 内部也会去重；替身只记录调用，让"没有多余的切换"可被断言。
+      if (publication.qualityCalls.at(-1) === quality) return
+      publication.qualityCalls.push(quality)
+    },
     setEnabled(): void {
-      // Phase 6 不使用它（那是 Phase 7 的按可见性暂停下行）。
+      // 按可见性暂停下行由 LiveKit 的 adaptiveStream 负责，我们不直接调用它。
     },
   })
 }
@@ -107,6 +128,8 @@ vi.mock('livekit-client', () => {
     Track: {
       Source: { ScreenShare: 'screen_share', Camera: 'camera', Microphone: 'microphone' },
     },
+    // §52 的画质分层：适配层必须用 SDK 内建的 VideoQuality，而不是自研 RTP ABR。
+    VideoQuality: { LOW: 0, MEDIUM: 1, HIGH: 2 },
   }
 })
 
@@ -213,6 +236,59 @@ describe('LiveKit 适配层（老师端）', () => {
 
     detach?.()
     expect(track.detach).toHaveBeenCalledWith(element)
+  })
+
+  it('§52：订阅时的画质档默认 LOW，且画质必须在 setSubscribed 之后下发', async () => {
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    const screen = makePublication('TR_screen', 'screen_share')
+    joinParticipant('session-1', [screen])
+
+    const pending = room.subscribeScreen('session-1')
+
+    // VideoQuality.LOW = 0（替身按 SDK 枚举取值）。
+    expect(screen.subscribedCalls).toEqual([true])
+    expect(screen.qualityCalls).toEqual([0])
+    // 顺序写反的话画质会被 SDK 丢掉，这一条就是那个坑的守卫。
+    expect(screen.droppedQualityCalls).toEqual([])
+
+    deliverTrack(screen)
+    await pending
+  })
+
+  it('§30：Focus 用 HIGH 订阅，并且可以事后降回 LOW（同一条订阅，不是重订）', async () => {
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    const screen = makePublication('TR_screen', 'screen_share')
+    joinParticipant('session-1', [screen])
+
+    const pending = room.subscribeScreen('session-1', 'high')
+    expect(screen.subscribedCalls).toEqual([true])
+    expect(screen.qualityCalls).toEqual([2])
+    expect(screen.droppedQualityCalls).toEqual([])
+    deliverTrack(screen)
+    const subscription = await pending
+
+    subscription?.setQuality('low')
+    expect(screen.qualityCalls).toEqual([2, 0])
+    expect(screen.subscribedCalls).toEqual([true])
+
+    // 幂等：重复切到同一档不会再发一次信令。
+    subscription?.setQuality('low')
+    expect(screen.qualityCalls).toEqual([2, 0])
+  })
+
+  it('§52：已订阅的 participant 再次订阅时只调整画质，不会重新 setSubscribed', async () => {
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    const screen = makePublication('TR_screen', 'screen_share')
+    joinParticipant('session-1', [screen])
+    const pending = room.subscribeScreen('session-1')
+    deliverTrack(screen)
+    await pending
+
+    // 老师点开 Focus：store 会带着 high 再问一次（适配层复用手上的订阅）。
+    await room.subscribeScreen('session-1', 'high')
+
+    expect(screen.subscribedCalls).toEqual([true])
+    expect(screen.qualityCalls).toEqual([0, 2])
   })
 
   it('§52：同一个 participant 重复订阅不会再次 setSubscribed（10 秒一轮的刷新不会变成订阅风暴）', async () => {

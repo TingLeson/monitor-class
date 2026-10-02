@@ -137,61 +137,119 @@ func (p *Postgres) Leave(ctx context.Context, sessionID, studentID uuid.UUID) (*
 	return stored, nil
 }
 
-// ListByRun returns every session of one run, oldest first.
+// ListRosterByRun returns every authorized student of a classroom with their session in
+// one run, ordered by account (§29/§51).
 //
-// JOIN users, not LEFT JOIN: student_id is NOT NULL and FK-enforced, so the account
-// always exists and an INNER JOIN states that. A broken row then shows up as a missing
-// tile (loud) rather than as a tile with a blank name (quiet, and mistaken for a
-// frontend bug).
+// # Why the roster is the driving table
 //
-// The order is `created_at, id`. created_at is the transaction timestamp, so a class
-// that joins in the same second shares it — the id tiebreaker is what keeps the wall
-// from reshuffling between two refreshes of the same page, which teachers read as
-// "the tiles are jumping around".
+// §29 draws "18 / 25": the console needs the denominator, and it needs a tile for a
+// student who has not entered yet. A read that starts from `student_sessions` can
+// produce neither. So `classroom_students` is the FROM, and the session is LEFT JOINed
+// onto it — an authorized student with no session is a row with NULL session columns,
+// not a missing row.
 //
-// Terminal sessions are included: §51 shows that a student left. Hiding them would
-// make a student who left look like a student who never existed.
-func (p *Postgres) ListByRun(ctx context.Context, runID uuid.UUID) ([]StudentSession, error) {
+// JOIN users (not LEFT JOIN): a grant's student_id is NOT NULL and FK-enforced, so the
+// account always exists. An INNER JOIN says that, and a broken grant shows up as a
+// missing tile (loud) instead of a tile with a blank name (quiet, and blamed on the
+// frontend).
+//
+// # Why LATERAL, and not a plain LEFT JOIN
+//
+// One student can have SEVERAL sessions in one run: LEFT is terminal, so leaving and
+// re-entering creates a second row (the partial unique index allows exactly that) — and
+// the wall must still show one card per person, or "张三" appears twice and both cards
+// change places as the polls go by. The subquery picks the ONE row that answers "what is
+// this student doing in this lesson?": an active session if there is one (a re-entry
+// beats the LEFT row it followed), otherwise the newest, which is how the tile of a
+// student who left reads LEFT instead of null.
+//
+// # Why the order is `account, student_id`
+//
+// §29's wall is a grid of cards a teacher scans while teaching: if two polls return the
+// same students in different positions, the teacher reads it as cards jumping around.
+// `account` is unique per account, so it is already a total order; the id tiebreaker is
+// there so a future change to that uniqueness cannot silently make the order
+// plan-dependent. Ordering by account (and not by display name) also keeps the order
+// independent of what a student is called, which is what makes it stable across a
+// rename.
+//
+// # Why the account is not selected
+//
+// It is the sort key, and that is all it is: the wall's DTO carries the display name and
+// the student id, never the account (the console needs to recognise a person, not to
+// look up their login). ORDER BY may reference a column the SELECT list omits, so the
+// sort happens where the roster is known and the value never leaves the database.
+func (p *Postgres) ListRosterByRun(ctx context.Context, classroomID, runID uuid.UUID) ([]RosterEntry, error) {
 	if p == nil || p.pool == nil {
 		return nil, errors.New("session: repository is not connected")
 	}
-	query := `SELECT` + sessionColumns("s.") + `, u.display_name
-		FROM student_sessions s
-		JOIN users u ON u.id = s.student_id
-		WHERE s.classroom_run_id = $1
-		ORDER BY s.created_at ASC, s.id ASC`
+	query := `
+		SELECT cs.student_id, u.display_name,` + sessionColumns("s.") + `
+		FROM classroom_students cs
+		JOIN users u ON u.id = cs.student_id
+		LEFT JOIN LATERAL (
+			SELECT` + sessionColumns("ss.") + `
+			FROM student_sessions ss
+			WHERE ss.classroom_run_id = $2 AND ss.student_id = cs.student_id
+			ORDER BY (ss.status IN ('CONNECTING', 'ONLINE', 'SCREEN_LOST', 'DISCONNECTED')) DESC,
+			         ss.created_at DESC, ss.id DESC
+			LIMIT 1
+		) s ON true
+		WHERE cs.classroom_id = $1
+		ORDER BY u.account ASC, cs.student_id ASC`
 
-	rows, err := p.pool.Query(ctx, query, runID)
+	rows, err := p.pool.Query(ctx, query, classroomID, runID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	// Non-nil empty slice: a run nobody joined answers `"students": []`, not null, so
-	// the wall renders its empty state without a null check.
-	out := make([]StudentSession, 0, 32)
+	// Non-nil empty slice: a classroom with nobody on its roster answers `"students": []`,
+	// not null, so the wall renders its empty state without a null check.
+	out := make([]RosterEntry, 0, 32)
 	for rows.Next() {
 		var (
-			session     StudentSession
-			status      string
+			entry       RosterEntry
+			sessionID   *uuid.UUID
+			runID       *uuid.UUID
+			studentID   *uuid.UUID
+			identity    *string
+			status      *string
 			connectedAt *time.Time
 			screenStart *time.Time
 			screenLost  *time.Time
 			leftAt      *time.Time
+			createdAt   *time.Time
+			updatedAt   *time.Time
 		)
 		if err := rows.Scan(
-			&session.ID, &session.ClassroomRunID, &session.StudentID, &session.LiveKitIdentity, &status,
-			&connectedAt, &screenStart, &screenLost, &leftAt, &session.CreatedAt, &session.UpdatedAt,
-			&session.StudentDisplayName,
+			&entry.StudentID, &entry.DisplayName,
+			&sessionID, &runID, &studentID, &identity, &status,
+			&connectedAt, &screenStart, &screenLost, &leftAt, &createdAt, &updatedAt,
 		); err != nil {
 			return nil, err
 		}
-		session.Status = Status(status)
-		session.ConnectedAt = connectedAt
-		session.ScreenStartedAt = screenStart
-		session.ScreenLostAt = screenLost
-		session.LeftAt = leftAt
-		out = append(out, session)
+		// Every NOT NULL half of the joined session is required before a session is
+		// reported. A partial row would mean the LEFT JOIN matched something that is not a
+		// session, and inventing the missing values would be worse than reporting the
+		// truth: this student has not entered.
+		if sessionID != nil && runID != nil && studentID != nil && identity != nil &&
+			status != nil && createdAt != nil && updatedAt != nil {
+			entry.Session = &StudentSession{
+				ID:              *sessionID,
+				ClassroomRunID:  *runID,
+				StudentID:       *studentID,
+				LiveKitIdentity: *identity,
+				Status:          Status(*status),
+				ConnectedAt:     connectedAt,
+				ScreenStartedAt: screenStart,
+				ScreenLostAt:    screenLost,
+				LeftAt:          leftAt,
+				CreatedAt:       *createdAt,
+				UpdatedAt:       *updatedAt,
+			}
+		}
+		out = append(out, entry)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

@@ -334,3 +334,10 @@ curl -s localhost:8090/readyz            # {"status":"ready","checks":{"livekit"
 | TURN / 生产网络加固 | ❌ | Phase 11 |
 | 真实多人带宽压测 | ❌ | Phase 12（禁止用假 `<video>` 标签宣布通过，§78） |
 | Webhook 签名校验 | ❌ | Phase 8（`/internal/livekit/webhook`） |
+
+---
+
+## 相关文档
+
+- [track-permissions.md](track-permissions.md)：谁能发布什么、谁能订阅什么（三层落点与边界）
+- [webrtc-basics.md](webrtc-basics.md)、[sfu.md](sfu.md)

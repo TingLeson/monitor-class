@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -56,6 +57,18 @@ type fakeMediaPlane struct {
 	ensureCalls  []string
 	removed      [][2]string
 	tokenRequest []media.TokenRequest
+
+	// The §26 half: what the monitor asked to revoke, and what the fake reports back.
+	enforceCalls []enforceCall
+	enforceErr   error
+	revoked      []media.PeerSubscriptionRevocation
+}
+
+// enforceCall is one EnforceNoPeerSubscriptions invocation.
+type enforceCall struct {
+	room     string
+	students []string
+	allowed  []string
 }
 
 func newFakeMediaPlane() *fakeMediaPlane {
@@ -98,6 +111,27 @@ func (f *fakeMediaPlane) SignToken(req media.TokenRequest) (string, error) {
 	defer f.mu.Unlock()
 	f.tokenRequest = append(f.tokenRequest, req)
 	return "fake-token." + req.Identity + "." + req.RoomName, nil
+}
+
+// EnforceNoPeerSubscriptions is the §26 half of the fake. It applies the revocation to
+// its own subscription bookkeeping instead of calling LiveKit, so an integration test can
+// assert what the wall asked for without a real SFU.
+func (f *fakeMediaPlane) EnforceNoPeerSubscriptions(
+	_ context.Context,
+	roomName string,
+	students []string,
+	observed map[string]media.ParticipantTracks,
+	allowedTrackOwners []string,
+) ([]media.PeerSubscriptionRevocation, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.enforceCalls = append(f.enforceCalls, enforceCall{
+		room: roomName, students: append([]string{}, students...), allowed: append([]string{}, allowedTrackOwners...),
+	})
+	if f.enforceErr != nil {
+		return nil, f.enforceErr
+	}
+	return append([]media.PeerSubscriptionRevocation{}, f.revoked...), nil
 }
 
 func (f *fakeMediaPlane) publish(identity string, tracks media.ParticipantTracks) {
@@ -392,6 +426,39 @@ func (e *mediaE2E) storedSession(t *testing.T, sessionID uuid.UUID) storedSessio
 	return row
 }
 
+// assertNoSession asserts the null tile of §29: a student who is authorized but has no
+// session in this run. The two session members must be null — not an empty string, not a
+// zero uuid, and not a seventh status — and every media block must be present and false.
+func assertNoSession(t *testing.T, tile map[string]any) {
+	t.Helper()
+	if tile["sessionId"] != nil || tile["sessionStatus"] != nil {
+		t.Errorf("tile %v has a session, want null: this student never entered", tile)
+	}
+	if tile["connection"] != "UNKNOWN" || tile["joinedAt"] != nil || tile["lastEventAt"] != nil {
+		t.Errorf("tile %v = %v/%v/%v, want UNKNOWN and null timestamps", tile, tile["connection"], tile["joinedAt"], tile["lastEventAt"])
+	}
+	for _, member := range []string{"screen", "camera", "microphone"} {
+		track, ok := tile[member].(map[string]any)
+		if !ok || track["active"] != false {
+			t.Errorf("%s = %v, want {active:false}", member, tile[member])
+		}
+	}
+}
+
+// monitorOrder calls the monitor endpoint and returns the tiles' student ids IN ORDER.
+func (e *mediaE2E) monitorOrder(t *testing.T, teacherCookies []*http.Cookie, classroomID uuid.UUID) []string {
+	t.Helper()
+	rec := e.teacherCall(t, http.MethodGet, "/api/v1/teacher/classrooms/"+classroomID.String()+"/monitor", "", teacherCookies)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("monitor: status = %d (%s)", rec.Code, rec.Body.String())
+	}
+	order := make([]string, 0, 8)
+	for _, tile := range studentsOf(t, jsonBody(t, rec)) {
+		order = append(order, tile["studentId"].(string))
+	}
+	return order
+}
+
 // monitorOf calls the monitor endpoint and returns the tiles keyed by student id.
 func (e *mediaE2E) monitorOf(t *testing.T, teacherCookies []*http.Cookie, classroomID uuid.UUID) map[string]map[string]any {
 	t.Helper()
@@ -606,10 +673,17 @@ func TestJoinIsRefusedForAnUnassignedStudent(t *testing.T) {
 	if rec.Code != http.StatusNotFound || errorCode(t, rec) != "STUDENT_NOT_ASSIGNED" {
 		t.Errorf("unknown classroom: status = %d, code = %s, want 404 STUDENT_NOT_ASSIGNED", rec.Code, errorCode(t, rec))
 	}
-	// And the lesson is untouched.
-	if tiles := e.monitorOf(t, teacherCookies, classroomID); len(tiles) != 0 {
-		t.Errorf("monitor shows %d tiles, want 0: nobody joined", len(tiles))
+	// And the lesson is untouched: the wall shows the authorized student — who has not
+	// joined, so their tile is the null one — and nothing at all for the outsider, who
+	// was refused before a session could exist.
+	tiles := e.monitorOf(t, teacherCookies, classroomID)
+	if len(tiles) != 1 {
+		t.Fatalf("monitor shows %d tiles, want 1 (the authorized student)", len(tiles))
 	}
+	if _, ok := tiles[outsider.ID.String()]; ok {
+		t.Error("a student whose join was refused appears on the wall")
+	}
+	assertNoSession(t, tiles[assigned.ID.String()])
 }
 
 // TestLeaveRejectsAnotherStudentsSession is §58 on the real stack: a student cannot end
@@ -906,4 +980,215 @@ func TestJoinRateLimitStillApplies(t *testing.T) {
 	if !strings.Contains(e.logs.String(), "/api/v1/student/classrooms/") {
 		t.Error("the join request was not access-logged")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// The monitoring wall is the roster (§29/§73)
+// ---------------------------------------------------------------------------
+
+// TestMonitorListsTheWholeRoster is the Phase 7 contract end to end, against a real
+// PostgreSQL: the wall lists every authorized student, not only the ones with a session
+// row. A student who never joined is a tile whose session members are null (not a
+// missing tile, and not an invented status), joining fills that tile in, and leaving
+// turns it into LEFT — which is still a session, and still not null.
+func TestMonitorListsTheWholeRoster(t *testing.T) {
+	e := newMediaE2E(t)
+	teacher, teacherCookies := e.staff(t)
+	first, firstCookies := e.student(t)
+	second, secondCookies := e.student(t)
+	e.cleanupAccounts(t, teacher.ID, first.ID, second.ID)
+
+	classroomID := e.openClassroom(t, teacherCookies, first, second)
+
+	// --- 1. the classroom is open and nobody has joined: two tiles, two null sessions ---
+	tiles := e.monitorOf(t, teacherCookies, classroomID)
+	if len(tiles) != 2 {
+		t.Fatalf("monitor returned %d tiles, want the whole roster (2): %v", len(tiles), tiles)
+	}
+	for _, student := range []*user.User{first, second} {
+		tile, ok := tiles[student.ID.String()]
+		if !ok {
+			t.Fatalf("student %s has no tile", student.Account)
+		}
+		assertNoSession(t, tile)
+	}
+
+	// The order is by ACCOUNT, not by who joined first: §29's grid must not reshuffle
+	// between two polls while a teacher is looking at it.
+	ordered := e.monitorOrder(t, teacherCookies, classroomID)
+	accounts := []string{first.Account, second.Account}
+	sort.Strings(accounts)
+	for i, account := range accounts {
+		idOf := first.ID
+		if account == second.Account {
+			idOf = second.ID
+		}
+		if ordered[i] != idOf.String() {
+			t.Errorf("tile %d = %s, want the student with account %s", i, ordered[i], account)
+		}
+	}
+
+	// --- 2. one student joins: that tile gets a session, the other stays null ---
+	rec := e.studentCall(t, http.MethodPost, "/api/v1/student/classrooms/"+classroomID.String()+"/join", "", firstCookies)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("join: status = %d (%s)", rec.Code, rec.Body.String())
+	}
+	joinedID, err := uuid.Parse(jsonBody(t, rec)["sessionId"].(string))
+	if err != nil {
+		t.Fatalf("sessionId: %v", err)
+	}
+
+	tiles = e.monitorOf(t, teacherCookies, classroomID)
+	if len(tiles) != 2 {
+		t.Fatalf("monitor returned %d tiles after one join, want 2", len(tiles))
+	}
+	joined := tiles[first.ID.String()]
+	if joined["sessionId"] != joinedID.String() {
+		t.Errorf("sessionId = %v, want %s", joined["sessionId"], joinedID)
+	}
+	// No participant was published to the fake media plane, so the honest state is
+	// DISCONNECTED (Phase 6's transition), never ONLINE.
+	if joined["sessionStatus"] != "DISCONNECTED" {
+		t.Errorf("sessionStatus = %v, want DISCONNECTED (nobody was observed in the room)", joined["sessionStatus"])
+	}
+	assertNoSession(t, tiles[second.ID.String()])
+
+	// --- 3. both joined: two sessions ---
+	if rec := e.studentCall(t, http.MethodPost, "/api/v1/student/classrooms/"+classroomID.String()+"/join", "", secondCookies); rec.Code != http.StatusOK {
+		t.Fatalf("second join: status = %d (%s)", rec.Code, rec.Body.String())
+	}
+	tiles = e.monitorOf(t, teacherCookies, classroomID)
+	for _, student := range []*user.User{first, second} {
+		if tiles[student.ID.String()]["sessionId"] == nil {
+			t.Errorf("student %s still has a null session after joining", student.Account)
+		}
+	}
+
+	// --- 4. one leaves: LEFT, not null ---
+	rec = e.studentCall(t, http.MethodPost, "/api/v1/student/sessions/"+joinedID.String()+"/leave", "", firstCookies)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("leave: status = %d (%s)", rec.Code, rec.Body.String())
+	}
+	tiles = e.monitorOf(t, teacherCookies, classroomID)
+	left := tiles[first.ID.String()]
+	if left["sessionId"] == nil {
+		t.Fatal("sessionId = null after leaving, want the LEFT session to stay visible")
+	}
+	if left["sessionStatus"] != "LEFT" {
+		t.Errorf("sessionStatus = %v, want LEFT", left["sessionStatus"])
+	}
+	if stored := e.storedSession(t, joinedID); stored.Status != "LEFT" {
+		t.Errorf("stored status = %v, want LEFT", stored.Status)
+	}
+}
+
+// TestMonitorIsolatesStudentsInTheMediaPlane is the §26 half end to end: the monitor poll
+// calls the media plane with the run's student identities, the teacher whitelisted, and
+// logs what it revoked.
+func TestMonitorIsolatesStudentsInTheMediaPlane(t *testing.T) {
+	e := newMediaE2E(t)
+	teacher, teacherCookies := e.staff(t)
+	first, firstCookies := e.student(t)
+	second, secondCookies := e.student(t)
+	e.cleanupAccounts(t, teacher.ID, first.ID, second.ID)
+
+	classroomID := e.openClassroom(t, teacherCookies, first, second)
+	rec := e.studentCall(t, http.MethodPost, "/api/v1/student/classrooms/"+classroomID.String()+"/join", "", firstCookies)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("join: status = %d (%s)", rec.Code, rec.Body.String())
+	}
+	firstSession, err := uuid.Parse(jsonBody(t, rec)["sessionId"].(string))
+	if err != nil {
+		t.Fatalf("sessionId: %v", err)
+	}
+	if rec := e.studentCall(t, http.MethodPost, "/api/v1/student/classrooms/"+classroomID.String()+"/join", "", secondCookies); rec.Code != http.StatusOK {
+		t.Fatalf("second join: status = %d (%s)", rec.Code, rec.Body.String())
+	}
+	secondSession, err := uuid.Parse(jsonBody(t, rec)["sessionId"].(string))
+	if err != nil {
+		t.Fatalf("second sessionId: %v", err)
+	}
+
+	// The teacher's media identity is their login session id (§44), which this control
+	// plane mints but never stores in student_sessions — so it is exactly the identity the
+	// whitelist has to recognise as "not a student".
+	e.media.publish("teacher-login-session", media.ParticipantTracks{Microphone: true})
+	e.media.publish(firstSession.String(), media.ParticipantTracks{ScreenShare: true})
+
+	// The media plane reports one revocation, which the service must log with the fields
+	// operations greps for.
+	e.media.mu.Lock()
+	e.media.revoked = []media.PeerSubscriptionRevocation{{
+		ObserverIdentity:   secondSession.String(),
+		TrackOwnerIdentity: firstSession.String(),
+		TrackSid:           "TR_FIRST",
+	}}
+	e.media.mu.Unlock()
+
+	e.monitorOf(t, teacherCookies, classroomID)
+
+	e.media.mu.Lock()
+	calls := append([]enforceCall{}, e.media.enforceCalls...)
+	e.media.mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("enforcement calls = %d, want one per observation", len(calls))
+	}
+	if len(calls[0].students) != 2 {
+		t.Errorf("students = %v, want both session identities", calls[0].students)
+	}
+	found := false
+	for _, allowed := range calls[0].allowed {
+		if allowed == "teacher-login-session" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("allowed = %v, want the teacher's identity whitelisted", calls[0].allowed)
+	}
+	for _, want := range []string{
+		"action=peer_subscription_revoked",
+		"observer_identity=" + secondSession.String(),
+		"subscribed_track_owner=" + firstSession.String(),
+		"track_sid=TR_FIRST",
+	} {
+		if !strings.Contains(e.logs.String(), want) {
+			t.Errorf("the revocation log line is missing %q", want)
+		}
+	}
+}
+
+// TestMonitorKeepsDisabledStudentsOnTheWall: a student whose account was disabled is
+// still on the roster — they were authorized for this course and may be re-enabled — so
+// the wall keeps their tile. The DTO is frozen and carries no account-status member, so
+// what this test pins is exactly the contract: the row stays, and it is the null tile
+// unless they had already entered this lesson.
+func TestMonitorKeepsDisabledStudentsOnTheWall(t *testing.T) {
+	e := newMediaE2E(t)
+	teacher, teacherCookies := e.staff(t)
+	present, _ := e.student(t)
+	disabled, _ := e.student(t)
+	e.cleanupAccounts(t, teacher.ID, present.ID, disabled.ID)
+
+	classroomID := e.openClassroom(t, teacherCookies, present, disabled)
+	if err := e.users.SetStatus(context.Background(), disabled.ID, user.StatusDisabled); err != nil {
+		t.Fatalf("disable student: %v", err)
+	}
+	// The disabled account cannot log in any more (§2.2), so it cannot produce a session.
+	rec := e.call(t, http.MethodPost, "/api/v1/student/auth/login", `{"account":"`+disabled.Account+`"}`, nil, nil)
+	if rec.Code == http.StatusOK {
+		t.Error("a disabled account could still log in")
+	}
+
+	tiles := e.monitorOf(t, teacherCookies, classroomID)
+	if len(tiles) != 2 {
+		t.Fatalf("monitor returned %d tiles, want 2 (the whole roster)", len(tiles))
+	}
+	tile, ok := tiles[disabled.ID.String()]
+	if !ok {
+		t.Fatal("a disabled but authorized student disappeared from the wall")
+	}
+	if tile["displayName"] != disabled.DisplayName {
+		t.Errorf("displayName = %v, want the roster's name", tile["displayName"])
+	}
+	assertNoSession(t, tile)
 }

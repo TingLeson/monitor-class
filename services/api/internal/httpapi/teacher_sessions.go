@@ -42,7 +42,8 @@ type monitorResponse struct {
 	Students []monitorStudentDTO `json:"students"`
 }
 
-// monitorStudentDTO is one tile of §51.
+// monitorStudentDTO is one tile of §51, extended in Phase 7 to cover the students who
+// have not entered yet.
 //
 // WHY sessionId is exposed even though the tile is keyed by studentId: the wall has to
 // be able to leave a session (and, from Phase 8, to subscribe to one session's events),
@@ -50,11 +51,20 @@ type monitorResponse struct {
 // name is the only piece of account data here — no account, no email (§26 is about
 // students seeing each other, but a teacher's wall has no use for an account name
 // either).
+//
+// WHY sessionId and sessionStatus are nullable, and why that is a contract and not a
+// convenience: the list is the classroom ROSTER, which includes students who were
+// authorized for the lesson and never pressed "进入课堂" (§29's "18 / 25" needs the
+// denominator). Such a student has no session, so both members are null — a real,
+// renderable state ("未进入"), not missing data. There is deliberately NO seventh
+// status for it: a client that reads sessionStatus == null as "not in this lesson" is
+// reading the whole truth, and a "NOT_JOINED" value would have to be filtered out of
+// every state machine that already handles the six states of §12.
 type monitorStudentDTO struct {
 	StudentID     string          `json:"studentId"`
 	DisplayName   string          `json:"displayName"`
-	SessionID     string          `json:"sessionId"`
-	SessionStatus string          `json:"sessionStatus"`
+	SessionID     *string         `json:"sessionId"`
+	SessionStatus *string         `json:"sessionStatus"`
 	Screen        monitorTrackDTO `json:"screen"`
 	Camera        monitorTrackDTO `json:"camera"`
 	Microphone    monitorTrackDTO `json:"microphone"`
@@ -172,17 +182,22 @@ func (h *teacherSessionHandlers) monitor() gin.HandlerFunc {
 
 // newMonitorStudentDTOs renders the wall, always as a non-nil slice.
 //
-// An empty run answers `"students": []` and not null: "nobody has joined yet" is a real
-// state of the wall (the teacher opened the lesson two minutes ago), and a null would
-// make every client special-case it before rendering its own empty state.
+// An empty roster answers `"students": []` and not null: "this classroom authorizes
+// nobody yet" is a real state of the wall (the teacher opened the lesson before adding
+// students), and a null would make every client special-case it before rendering its own
+// empty state.
+//
+// The nullable members are rendered from the nullable domain fields, and the mapping is
+// one-to-one on purpose: the DTO has no fallback of its own, so "no session" cannot
+// become a zero UUID or a status nobody stored (§29).
 func newMonitorStudentDTOs(students []session.MonitorStudent) []monitorStudentDTO {
 	dtos := make([]monitorStudentDTO, 0, len(students))
 	for _, student := range students {
 		dtos = append(dtos, monitorStudentDTO{
 			StudentID:     student.StudentID.String(),
 			DisplayName:   student.DisplayName,
-			SessionID:     student.SessionID.String(),
-			SessionStatus: string(student.Status),
+			SessionID:     formatOptionalUUID(student.SessionID),
+			SessionStatus: formatOptionalStatus(student.Status),
 			Screen:        monitorTrackDTO{Active: student.ScreenActive},
 			Camera:        monitorTrackDTO{Active: student.CameraActive},
 			Microphone:    monitorTrackDTO{Active: student.MicrophoneActive},
@@ -192,6 +207,27 @@ func newMonitorStudentDTOs(students []session.MonitorStudent) []monitorStudentDT
 		})
 	}
 	return dtos
+}
+
+// formatOptionalUUID renders a nullable identifier as its string form or JSON null.
+func formatOptionalUUID(value *uuid.UUID) *string {
+	if value == nil {
+		return nil
+	}
+	formatted := value.String()
+	return &formatted
+}
+
+// formatOptionalStatus renders a nullable session status as its wire value or JSON null.
+//
+// The status is a *session.Status rather than a string so an invented value cannot be
+// written here: whatever reaches the response was produced by the state machine of §12.
+func formatOptionalStatus(value *session.Status) *string {
+	if value == nil {
+		return nil
+	}
+	formatted := string(*value)
+	return &formatted
 }
 
 // formatOptionalTimestamp renders a nullable timestamp as RFC3339 or JSON null.

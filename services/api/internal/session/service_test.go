@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -154,6 +155,25 @@ type fakeMedia struct {
 	// token is what SignToken returns; it is deliberately identifiable so a test can
 	// assert it never reaches a log line.
 	token string
+
+	// enforcement is the §26 half of the fake. It mirrors the contract of the real
+	// client (revoke, report what was revoked, never fail the caller) without mirroring
+	// its bookkeeping: the idempotency of the real reconciler is tested in
+	// internal/media, where a fake RoomService can count RPCs.
+	enforcementCalls []enforcementCall
+	enforcementErr   error
+	// revoked is what a pass reports as actually revoked. Tests that care about the log
+	// line script it; by default the fake reports nothing.
+	revoked []media.PeerSubscriptionRevocation
+}
+
+// enforcementCall is one EnforceNoPeerSubscriptions invocation, recorded so a test can
+// assert WHICH students were reconciled and WHAT was whitelisted.
+type enforcementCall struct {
+	room     string
+	students []string
+	observed map[string]media.ParticipantTracks
+	allowed  []string
 }
 
 func newFakeMedia() *fakeMedia {
@@ -178,6 +198,22 @@ func (m *fakeMedia) RemoveParticipant(_ context.Context, roomName, identity stri
 	return m.removeErr
 }
 
+func (m *fakeMedia) EnforceNoPeerSubscriptions(
+	_ context.Context,
+	roomName string,
+	students []string,
+	observed map[string]media.ParticipantTracks,
+	allowedTrackOwners []string,
+) ([]media.PeerSubscriptionRevocation, error) {
+	m.enforcementCalls = append(m.enforcementCalls, enforcementCall{
+		room: roomName, students: students, observed: observed, allowed: allowedTrackOwners,
+	})
+	if m.enforcementErr != nil {
+		return nil, m.enforcementErr
+	}
+	return m.revoked, nil
+}
+
 func (m *fakeMedia) SignToken(req media.TokenRequest) (string, error) {
 	m.tokenRequests = append(m.tokenRequests, req)
 	if m.signErr != nil {
@@ -190,10 +226,21 @@ func (m *fakeMedia) SignToken(req media.TokenRequest) (string, error) {
 // Fake session repository
 // ---------------------------------------------------------------------------
 
+// rosterMember is one authorized student of a classroom, as the roster read returns it.
+type rosterMember struct {
+	studentID   uuid.UUID
+	account     string
+	displayName string
+}
+
 type fakeRepo struct {
 	sessions map[uuid.UUID]*StudentSession
 	names    map[uuid.UUID]string
-	clock    time.Time
+	// roster is keyed by classroom id. The members are stored in insertion order and
+	// SORTED by the read, mirroring the production ORDER BY u.account: the fake must sort
+	// too, or the stability of §29's tile order would be untested.
+	roster map[uuid.UUID][]rosterMember
+	clock  time.Time
 
 	createErr  error
 	leaveErr   error
@@ -213,8 +260,18 @@ func newFakeRepo() *fakeRepo {
 	return &fakeRepo{
 		sessions: map[uuid.UUID]*StudentSession{},
 		names:    map[uuid.UUID]string{},
+		roster:   map[uuid.UUID][]rosterMember{},
 		clock:    time.Date(2026, 3, 4, 19, 0, 0, 0, time.UTC),
 	}
+}
+
+// authorize puts a student on a classroom's roster. The account is what the wall orders
+// by, which is why every test that cares about tile order has to set it.
+func (f *fakeRepo) authorize(classroomID, studentID uuid.UUID, account, displayName string) {
+	f.roster[classroomID] = append(f.roster[classroomID], rosterMember{
+		studentID: studentID, account: account, displayName: displayName,
+	})
+	f.names[studentID] = displayName
 }
 
 func (f *fakeRepo) tick() time.Time {
@@ -226,14 +283,13 @@ func (f *fakeRepo) tick() time.Time {
 func (f *fakeRepo) seed(runID, studentID uuid.UUID, status Status, displayName string) *StudentSession {
 	id := uuid.New()
 	session := &StudentSession{
-		ID:                 id,
-		ClassroomRunID:     runID,
-		StudentID:          studentID,
-		LiveKitIdentity:    id.String(),
-		Status:             status,
-		CreatedAt:          f.tick(),
-		UpdatedAt:          f.tick(),
-		StudentDisplayName: displayName,
+		ID:              id,
+		ClassroomRunID:  runID,
+		StudentID:       studentID,
+		LiveKitIdentity: id.String(),
+		Status:          status,
+		CreatedAt:       f.tick(),
+		UpdatedAt:       f.tick(),
 	}
 	f.sessions[id] = session
 	f.names[studentID] = displayName
@@ -291,20 +347,60 @@ func (f *fakeRepo) Leave(_ context.Context, sessionID, studentID uuid.UUID) (*St
 	return &copied, nil
 }
 
-func (f *fakeRepo) ListByRun(_ context.Context, runID uuid.UUID) ([]StudentSession, error) {
+// ListRosterByRun mirrors the production read: every authorized student, ordered by
+// account, LEFT JOINed onto the one session that answers "what are they doing in this
+// run?" — an active session if there is one, otherwise the newest.
+func (f *fakeRepo) ListRosterByRun(_ context.Context, classroomID, runID uuid.UUID) ([]RosterEntry, error) {
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
-	out := make([]StudentSession, 0, 4)
-	for _, session := range f.sessions {
-		if session.ClassroomRunID != runID {
-			continue
+	members := append([]rosterMember{}, f.roster[classroomID]...)
+	sort.Slice(members, func(i, j int) bool {
+		if members[i].account != members[j].account {
+			return members[i].account < members[j].account
 		}
-		copied := *session
-		copied.StudentDisplayName = f.names[session.StudentID]
-		out = append(out, copied)
+		return members[i].studentID.String() < members[j].studentID.String()
+	})
+
+	out := make([]RosterEntry, 0, len(members))
+	for _, member := range members {
+		entry := RosterEntry{StudentID: member.studentID, DisplayName: member.displayName}
+		if session := f.sessionFor(runID, member.studentID); session != nil {
+			entry.Session = session
+		}
+		out = append(out, entry)
 	}
 	return out, nil
+}
+
+// sessionFor is the LATERAL subquery of the production read, in Go.
+func (f *fakeRepo) sessionFor(runID, studentID uuid.UUID) *StudentSession {
+	var best *StudentSession
+	for _, session := range f.sessions {
+		if session.ClassroomRunID != runID || session.StudentID != studentID {
+			continue
+		}
+		if best == nil {
+			best = session
+			continue
+		}
+		switch {
+		case session.Status.Active() != best.Status.Active():
+			// An active session beats a terminal one: a student who left and came back
+			// must be shown as present, not as LEFT.
+			if session.Status.Active() {
+				best = session
+			}
+		case session.CreatedAt.After(best.CreatedAt),
+			session.CreatedAt.Equal(best.CreatedAt) && session.ID.String() > best.ID.String():
+			best = session
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	copied := *best
+	return &copied
 }
 
 func (f *fakeRepo) ApplyObservation(_ context.Context, change ObservationChange) (*StudentSession, error) {
@@ -329,10 +425,6 @@ func (f *fakeRepo) ApplyObservation(_ context.Context, change ObservationChange)
 	}
 	session.UpdatedAt = now
 	copied := *session
-	// The production statement RETURNs the student_sessions row, which has no display
-	// name — that comes from the monitoring JOIN. Mirroring that here is what makes the
-	// service's "keep the name from the read" handling testable.
-	copied.StudentDisplayName = ""
 	return &copied, nil
 }
 
@@ -382,7 +474,50 @@ func newHarness(t *testing.T) *harness {
 	h.classroomID = uuid.New()
 	h.runID = uuid.New()
 	directory.seedOpen(h.classroomID, h.teacherID, h.runID, h.studentID)
+	// The roster is one table in production (classroom_students) and two fakes here: the
+	// classroom directory is what the JOIN path authorizes against, the session
+	// repository is what the monitoring wall lists. Seeding both is what keeps "may this
+	// student enter?" and "does the wall show them?" from drifting apart in the tests.
+	h.addStudent(h.studentID, "S10086", "学生 A")
 	return h
+}
+
+// addStudent authorizes one more student for the harness classroom.
+func (h *harness) addStudent(studentID uuid.UUID, account, displayName string) {
+	h.directory.rosters[h.classroomID][studentID] = true
+	h.repo.authorize(h.classroomID, studentID, account, displayName)
+}
+
+// statusOf dereferences a tile's session status, failing the test when the tile has no
+// session at all: the two cases are asserted separately on purpose, because "no session"
+// and "a session in some state" are different product answers (§29).
+func statusOf(t *testing.T, student MonitorStudent) Status {
+	t.Helper()
+	if student.Status == nil {
+		t.Fatalf("tile %s has no sessionStatus, want one", student.StudentID)
+	}
+	return *student.Status
+}
+
+// sessionIDOf dereferences a tile's session id.
+func sessionIDOf(t *testing.T, student MonitorStudent) uuid.UUID {
+	t.Helper()
+	if student.SessionID == nil {
+		t.Fatalf("tile %s has no sessionId, want one", student.StudentID)
+	}
+	return *student.SessionID
+}
+
+// tileOf finds the tile of one student.
+func tileOf(t *testing.T, view *MonitorView, studentID uuid.UUID) MonitorStudent {
+	t.Helper()
+	for _, student := range view.Students {
+		if student.StudentID == studentID {
+			return student
+		}
+	}
+	t.Fatalf("no tile for student %s in %+v", studentID, view.Students)
+	return MonitorStudent{}
 }
 
 // run is the room of the seeded run.
@@ -884,8 +1019,11 @@ func TestMonitorTransitions(t *testing.T) {
 			if len(view.Students) != 1 {
 				t.Fatalf("students = %d, want 1", len(view.Students))
 			}
-			if view.Students[0].Status != tc.want {
-				t.Errorf("status = %s, want %s", view.Students[0].Status, tc.want)
+			if got := statusOf(t, view.Students[0]); got != tc.want {
+				t.Errorf("status = %s, want %s", got, tc.want)
+			}
+			if view.Students[0].SessionID == nil {
+				t.Error("sessionId = null, want the session the transition belongs to")
 			}
 			// A tile that just transitioned must still render the person: the display
 			// name comes from the monitoring JOIN, not from the row the write returned.
@@ -959,7 +1097,7 @@ func TestMonitorReportsTheObservedMedia(t *testing.T) {
 	if student.DisplayName != "学生 A" {
 		t.Errorf("displayName = %q, want the joined account name", student.DisplayName)
 	}
-	if student.SessionID != session.ID || student.StudentID != session.StudentID {
+	if sessionIDOf(t, student) != session.ID || student.StudentID != session.StudentID {
 		t.Errorf("identifiers = %s/%s, want %s/%s", student.SessionID, student.StudentID, session.ID, session.StudentID)
 	}
 	if student.LastEventAt == nil {
@@ -978,7 +1116,7 @@ func TestMonitorWithoutAParticipantIsNotOnline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Monitor(): %v", err)
 	}
-	if view.Students[0].Status == StatusOnline {
+	if statusOf(t, view.Students[0]) == StatusOnline {
 		t.Fatalf("status = ONLINE with no participant in the room")
 	}
 	if view.Students[0].ScreenActive {
@@ -996,6 +1134,7 @@ func TestMonitorWithoutAParticipantIsNotOnline(t *testing.T) {
 // a media-plane outage must not be written down as a business fact.
 func TestMonitorMediaFailureAdvancesNothing(t *testing.T) {
 	h := newHarness(t)
+	h.addStudent(h.otherID, "S10087", "学生 B")
 	online := h.repo.seed(h.runID, h.studentID, StatusOnline, "学生 A")
 	connecting := h.repo.seed(h.runID, h.otherID, StatusConnecting, "学生 B")
 	h.media.observeErr = errors.New("livekit: list participants: context deadline exceeded")
@@ -1037,6 +1176,7 @@ func TestMonitorMediaFailureAdvancesNothing(t *testing.T) {
 // final, and a lingering participant must not revive them.
 func TestMonitorTerminalSessionsAreNotAdvanced(t *testing.T) {
 	h := newHarness(t)
+	h.addStudent(h.otherID, "S10087", "学生 B")
 	left := h.repo.seed(h.runID, h.studentID, StatusLeft, "学生 A")
 	closed := h.repo.seed(h.runID, h.otherID, StatusRoomClosed, "学生 B")
 	h.media.observed[left.LiveKitIdentity] = media.ParticipantTracks{ScreenShare: true}
@@ -1051,10 +1191,10 @@ func TestMonitorTerminalSessionsAreNotAdvanced(t *testing.T) {
 	}
 	for _, student := range view.Students {
 		if student.Connection != ConnectionUnknown {
-			t.Errorf("terminal session %s reports connection %s, want UNKNOWN", student.Status, student.Connection)
+			t.Errorf("terminal tile %+v reports connection %s, want UNKNOWN", student.Status, student.Connection)
 		}
 		if student.ScreenActive {
-			t.Errorf("terminal session %s reports an active screen", student.Status)
+			t.Errorf("terminal tile %+v reports an active screen", student.Status)
 		}
 	}
 }
@@ -1072,8 +1212,8 @@ func TestMonitorKeepsTheStoredRowWhenTheObservationIsStale(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Monitor(): %v", err)
 	}
-	if view.Students[0].Status != StatusConnecting {
-		t.Errorf("status = %s, want the stored CONNECTING (the observation was stale)", view.Students[0].Status)
+	if got := statusOf(t, view.Students[0]); got != StatusConnecting {
+		t.Errorf("status = %s, want the stored CONNECTING (the observation was stale)", got)
 	}
 	if !strings.Contains(h.logs.String(), "skipped stale session states") {
 		t.Errorf("the stale observation was not logged:\n%s", h.logs.String())
@@ -1129,5 +1269,271 @@ func TestMonitorDoesNotReachTheMediaPlaneForOtherTeachersClassrooms(t *testing.T
 	}
 	if len(h.media.observeCalls) != 0 {
 		t.Errorf("the media plane was queried for a non-owner: %v", h.media.observeCalls)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Monitor: the whole roster (§29/§73)
+// ---------------------------------------------------------------------------
+
+// TestMonitorListsAuthorizedStudentsWhoNeverEntered is the Phase 7 contract change: the
+// wall is the ROSTER, so a student who was authorized and never pressed "进入课堂" is a
+// tile — with a null session rather than an invented state — and §29's "18 / 25" has a
+// denominator at all.
+func TestMonitorListsAuthorizedStudentsWhoNeverEntered(t *testing.T) {
+	h := newHarness(t)
+	h.addStudent(h.otherID, "S10087", "学生 B")
+	entered := h.repo.seed(h.runID, h.studentID, StatusOnline, "学生 A")
+	h.media.observed[entered.LiveKitIdentity] = media.ParticipantTracks{ScreenShare: true}
+
+	view, err := h.service.Monitor(context.Background(), h.classroomID, h.teacherID)
+	if err != nil {
+		t.Fatalf("Monitor(): %v", err)
+	}
+	if len(view.Students) != 2 {
+		t.Fatalf("students = %d, want the whole roster (2): %+v", len(view.Students), view.Students)
+	}
+
+	// The tile that HAS a session still behaves exactly like Phase 6.
+	joined := tileOf(t, view, h.studentID)
+	if sessionIDOf(t, joined) != entered.ID || statusOf(t, joined) != StatusOnline {
+		t.Errorf("joined tile = %+v, want the ONLINE session", joined)
+	}
+	if !joined.ScreenActive || joined.Connection != ConnectionGood {
+		t.Errorf("joined tile media = %+v, want an observed screen", joined)
+	}
+
+	// The tile that never entered is the null shape of §29, and it is NOT a seventh
+	// status: sessionStatus is null, not "NOT_JOINED".
+	waiting := tileOf(t, view, h.otherID)
+	if waiting.DisplayName != "学生 B" {
+		t.Errorf("displayName = %q, want the roster's name", waiting.DisplayName)
+	}
+	if waiting.SessionID != nil || waiting.Status != nil {
+		t.Errorf("session = %v/%v, want null for a student with no session", waiting.SessionID, waiting.Status)
+	}
+	if waiting.ScreenActive || waiting.CameraActive || waiting.MicrophoneActive {
+		t.Errorf("media = %+v, want all inactive without a session", waiting)
+	}
+	if waiting.Connection != ConnectionUnknown {
+		t.Errorf("connection = %s, want UNKNOWN without a session", waiting.Connection)
+	}
+	if waiting.JoinedAt != nil || waiting.LastEventAt != nil {
+		t.Errorf("timestamps = %v/%v, want null without a session", waiting.JoinedAt, waiting.LastEventAt)
+	}
+}
+
+// TestMonitorOrdersTilesByAccount: §29 is a grid a teacher scans while teaching, so the
+// order must be the roster's and must not depend on who joined first, on map iteration,
+// or on the display name.
+func TestMonitorOrdersTilesByAccount(t *testing.T) {
+	h := newHarness(t)
+	second, third := uuid.New(), uuid.New()
+	// Accounts are deliberately added out of order, and the display names would sort
+	// differently from the accounts.
+	h.addStudent(third, "S10003", "阿一")
+	h.addStudent(h.otherID, "S10001", "最後")
+	h.addStudent(second, "S10002", "中间")
+	// Sessions are created in yet another order.
+	h.repo.seed(h.runID, third, StatusConnecting, "阿一")
+	h.repo.seed(h.runID, h.studentID, StatusConnecting, "学生 A")
+
+	view, err := h.service.Monitor(context.Background(), h.classroomID, h.teacherID)
+	if err != nil {
+		t.Fatalf("Monitor(): %v", err)
+	}
+	want := []uuid.UUID{h.otherID, second, third, h.studentID} // S10001, S10002, S10003, S10086
+	if len(view.Students) != len(want) {
+		t.Fatalf("students = %d, want %d", len(view.Students), len(want))
+	}
+	for i, studentID := range want {
+		if view.Students[i].StudentID != studentID {
+			t.Errorf("tile %d = %s, want %s (sorted by account)", i, view.Students[i].StudentID, studentID)
+		}
+	}
+}
+
+// TestMonitorDoesNotAdvanceAStudentWithoutASession: the state machine only ever runs on
+// a session row. A student who never entered must not acquire CONNECTING (or any other
+// state) because a poll happened to see somebody else in the room.
+func TestMonitorDoesNotAdvanceAStudentWithoutASession(t *testing.T) {
+	h := newHarness(t)
+	h.addStudent(h.otherID, "S10087", "学生 B")
+	entered := h.repo.seed(h.runID, h.studentID, StatusConnecting, "学生 A")
+	h.media.observed[entered.LiveKitIdentity] = media.ParticipantTracks{ScreenShare: true}
+	// Somebody else is in the room and observable; the roster entry without a session has
+	// no identity to match, so nothing may be folded into it.
+	h.media.observed[uuid.New().String()] = media.ParticipantTracks{ScreenShare: true}
+
+	view, err := h.service.Monitor(context.Background(), h.classroomID, h.teacherID)
+	if err != nil {
+		t.Fatalf("Monitor(): %v", err)
+	}
+	waiting := tileOf(t, view, h.otherID)
+	if waiting.SessionID != nil || waiting.Status != nil {
+		t.Errorf("a student with no session was given one: %+v", waiting)
+	}
+	for _, change := range h.repo.observations {
+		if change.SessionID == uuid.Nil {
+			t.Errorf("an observation was persisted for a session that does not exist: %+v", change)
+		}
+	}
+}
+
+// TestMonitorKeepsNullSessionsDuringAMediaOutage: an unobserved room changes nothing for
+// a student who has no session — there is no stale state to report, so the tile keeps its
+// nulls instead of inventing a DISCONNECTED.
+func TestMonitorKeepsNullSessionsDuringAMediaOutage(t *testing.T) {
+	h := newHarness(t)
+	h.addStudent(h.otherID, "S10087", "学生 B")
+	h.media.observeErr = errors.New("livekit: list participants: context deadline exceeded")
+
+	view, err := h.service.Monitor(context.Background(), h.classroomID, h.teacherID)
+	if err != nil {
+		t.Fatalf("Monitor() must not fail when the media plane is down: %v", err)
+	}
+	if view.MediaObserved {
+		t.Error("MediaObserved = true, want false")
+	}
+	waiting := tileOf(t, view, h.otherID)
+	if waiting.SessionID != nil || waiting.Status != nil {
+		t.Errorf("tile = %+v, want nulls during an outage too", waiting)
+	}
+	if waiting.Connection != ConnectionUnknown {
+		t.Errorf("connection = %s, want UNKNOWN", waiting.Connection)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Monitor: §26 media-plane isolation
+// ---------------------------------------------------------------------------
+
+// TestMonitorEnforcesStudentIsolation is the Phase 7 server-side rule: the observation
+// that advances the states is also handed to the media plane to revoke whatever a
+// student might still be subscribed to, with the teacher as the explicit whitelist.
+func TestMonitorEnforcesStudentIsolation(t *testing.T) {
+	h := newHarness(t)
+	h.addStudent(h.otherID, "S10087", "学生 B")
+	first := h.repo.seed(h.runID, h.studentID, StatusConnecting, "学生 A")
+	h.repo.seed(h.runID, h.otherID, StatusConnecting, "学生 B")
+
+	teacherIdentity := uuid.New().String()
+	h.media.observed[first.LiveKitIdentity] = media.ParticipantTracks{
+		Tracks: []media.ObservedTrack{{Sid: "TR_A", Source: media.PublishScreenShare}},
+	}
+	h.media.observed[teacherIdentity] = media.ParticipantTracks{
+		Tracks: []media.ObservedTrack{{Sid: "TR_T", Source: media.PublishMicrophone}},
+	}
+	// The media plane reports what it actually revoked, which the service turns into the
+	// Warn lines operations greps for.
+	h.media.revoked = []media.PeerSubscriptionRevocation{{
+		ObserverIdentity: first.LiveKitIdentity, TrackOwnerIdentity: teacherIdentity, TrackSid: "TR_T",
+	}}
+
+	if _, err := h.service.Monitor(context.Background(), h.classroomID, h.teacherID); err != nil {
+		t.Fatalf("Monitor(): %v", err)
+	}
+
+	if len(h.media.enforcementCalls) != 1 {
+		t.Fatalf("enforcement calls = %d, want exactly one per observation", len(h.media.enforcementCalls))
+	}
+	call := h.media.enforcementCalls[0]
+	if call.room != h.run().LiveKitRoomName {
+		t.Errorf("room = %q, want the run's room", call.room)
+	}
+	if len(call.students) != 2 || call.students[0] != first.LiveKitIdentity {
+		t.Errorf("students = %v, want the run's student identities", call.students)
+	}
+	if len(call.allowed) != 1 || call.allowed[0] != teacherIdentity {
+		t.Errorf("allowed = %v, want only the non-student identity", call.allowed)
+	}
+	if len(call.observed) != 2 {
+		t.Errorf("observed = %v, want the SAME observation the states were advanced from", call.observed)
+	}
+
+	logs := h.logs.String()
+	for _, want := range []string{
+		"action=peer_subscription_revoked",
+		"room=" + h.run().LiveKitRoomName,
+		"observer_identity=" + first.LiveKitIdentity,
+		"subscribed_track_owner=" + teacherIdentity,
+		"track_sid=TR_T",
+	} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("the revocation log line is missing %q:\n%s", want, logs)
+		}
+	}
+}
+
+// TestMonitorEnforcementDoesNotTouchTerminalOrAbsentStudents pins what the reconciliation
+// asks LiveKit for: a session that is over has already been disconnected, and a student
+// who never entered has no identity at all.
+func TestMonitorEnforcementDoesNotTouchTerminalOrAbsentStudents(t *testing.T) {
+	h := newHarness(t)
+	h.addStudent(h.otherID, "S10087", "学生 B")
+	left := h.repo.seed(h.runID, h.studentID, StatusLeft, "学生 A")
+	teacherIdentity := uuid.New().String()
+	// The LEFT student's participant is still lingering in the room (the removal is best
+	// effort, §50), and the teacher is connected.
+	h.media.observed[left.LiveKitIdentity] = media.ParticipantTracks{
+		Tracks: []media.ObservedTrack{{Sid: "TR_A", Source: media.PublishScreenShare}},
+	}
+	h.media.observed[teacherIdentity] = media.ParticipantTracks{}
+
+	if _, err := h.service.Monitor(context.Background(), h.classroomID, h.teacherID); err != nil {
+		t.Fatalf("Monitor(): %v", err)
+	}
+	if len(h.media.enforcementCalls) != 1 {
+		t.Fatalf("enforcement calls = %d, want one", len(h.media.enforcementCalls))
+	}
+	call := h.media.enforcementCalls[0]
+	if len(call.students) != 0 {
+		t.Errorf("students = %v, want none (a LEFT session is not reconciled and a student without a session has no identity)", call.students)
+	}
+	// The LEFT student still counts as a STUDENT for the whitelist: their lingering
+	// participant must not be mistaken for the teacher, or a classmate would keep
+	// receiving whatever they left behind.
+	if len(call.allowed) != 1 || call.allowed[0] != teacherIdentity {
+		t.Errorf("allowed = %v, want only the teacher's identity", call.allowed)
+	}
+}
+
+// TestMonitorSkipsEnforcementWhenTheRoomCannotBeObserved: §26 enforcement acts on an
+// observation, and an outage produces none. Asking LiveKit to revoke "something" without
+// an observation would be guessing.
+func TestMonitorSkipsEnforcementWhenTheRoomCannotBeObserved(t *testing.T) {
+	h := newHarness(t)
+	h.repo.seed(h.runID, h.studentID, StatusConnecting, "学生 A")
+	h.media.observeErr = errors.New("livekit: list participants: context deadline exceeded")
+
+	if _, err := h.service.Monitor(context.Background(), h.classroomID, h.teacherID); err != nil {
+		t.Fatalf("Monitor(): %v", err)
+	}
+	if len(h.media.enforcementCalls) != 0 {
+		t.Errorf("enforcement ran without an observation: %+v", h.media.enforcementCalls)
+	}
+}
+
+// TestMonitorEnforcementFailureIsOnlyAWarn is the §33 discipline applied to §26: the
+// teacher's wall must be served even when the media plane refuses to revoke a
+// subscription.
+func TestMonitorEnforcementFailureIsOnlyAWarn(t *testing.T) {
+	h := newHarness(t)
+	session := h.repo.seed(h.runID, h.studentID, StatusConnecting, "学生 A")
+	h.media.observed[session.LiveKitIdentity] = media.ParticipantTracks{ScreenShare: true}
+	h.media.enforcementErr = errors.New("livekit: revoke peer subscriptions for x: unavailable")
+
+	view, err := h.service.Monitor(context.Background(), h.classroomID, h.teacherID)
+	if err != nil {
+		t.Fatalf("Monitor() must survive a failed revocation: %v", err)
+	}
+	if !view.MediaObserved || len(view.Students) != 1 {
+		t.Fatalf("view = %+v, want a normal wall", view)
+	}
+	if got := statusOf(t, view.Students[0]); got != StatusOnline {
+		t.Errorf("status = %s, want ONLINE: the state machine is independent of the revocation", got)
+	}
+	if !strings.Contains(h.logs.String(), "action=peer_subscription_revocation_failed") {
+		t.Errorf("the failed revocation was not logged:\n%s", h.logs.String())
 	}
 }

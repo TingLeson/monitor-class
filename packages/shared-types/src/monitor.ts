@@ -34,16 +34,27 @@ export interface TrackActiveState {
  * 对应的 participant。除此之外前端**不得**用 LiveKit 的身份做业务判断——
  * "participant 还在房间里"不等于"这个学生在上课"。
  *
- * `sessionId` 允许为 null：课堂名单里的学生可能**从未加入**过本节课，那时后端
- * 没有任何 StudentSession 可下发，这类行在监督墙上就是"未连接"卡片，也没有
- * 任何媒体可订阅。写成必填只会逼前端在运行期靠 `undefined` 猜。
+ * **Phase 7 起这个 DTO 覆盖课堂名单上的全部被授权学生**，不再只有"已经进入课堂的"：
+ * 于是必须能表达"这个学生本次 Run 还没进来"。表达方式只有一种——
+ * `sessionId` 与 `sessionStatus` 同时为 null：
+ *
+ * - 没有 StudentSession 就**没有状态可下发**，所以 `sessionStatus` 允许为 null。
+ *   这里刻意**不新增第 7 个枚举值**：`STUDENT_SESSION_STATUSES` 是数据库
+ *   `student_sessions.status` 的落库值（§12），"没进过课堂"是"没有这一行"，
+ *   不是"这一行的值是 X"。造一个 `NOT_JOINED` 状态会让"库里那条记录到底存了什么"
+ *   变得没有答案，也会让前端的 `isStudentSessionStatus` 守卫开始接受一个后端永不下发的值。
+ * - 两者必须**同时**为 null（不变量）。只有其中一个为 null 的行是契约被破坏，
+ *   界面按"未进入"处理即可，绝不能拿它去订阅媒体——没有 identity 就没有可订的轨道。
  */
 export interface MonitorStudent {
   studentId: Uuid
   displayName: string
-  /** LiveKit identity（= student_session UUID，§44）；从未加入过本节课时为 null。 */
+  /** LiveKit identity（= student_session UUID，§44）；本次 Run 未进入时为 null。 */
   sessionId: Uuid | null
-  sessionStatus: StudentSessionStatus
+  /**
+   * 本次 Run 的会话状态；`sessionId === null` 时为 null（未进入课堂，没有第 7 个状态）。
+   */
+  sessionStatus: StudentSessionStatus | null
   screen: TrackActiveState
   camera: TrackActiveState
   microphone: TrackActiveState
@@ -65,6 +76,43 @@ export type TeacherMonitorStudent = MonitorStudent
 export interface MonitorResponse {
   students: MonitorStudent[]
 }
+
+/**
+ * 监督卡片的**派生状态**（§29 / §30）——六个值，与 §12 的持久化状态一一对应，
+ * 另外把"没有会话"这一种情况也收进来。
+ *
+ * WHY 需要一个独立于 DTO 的类型：
+ * - DTO 里的 `sessionStatus` 为空、`screen.active` 为假这些**字段组合**才是老师看到的
+ *   "状态"，而字段组合有 2 × N 种，界面不该在模板里散落判断（§51 的合成只做一次）；
+ * - 派生状态是**纯函数**的结果，因此可以在单元测试里逐条钉死——把 `ONLINE` 但屏幕没在
+ *   发布的组合显示成"正常"，是监督系统里最严重的谎报；
+ * - 它是展示层词表，**不是**契约：后端永远不下发 `MonitorTileState`。
+ *
+ * 映射（唯一的实现见 apps/teacher-web/src/lib/monitor-status.ts）：
+ *
+ * | sessionStatus | screen.active | MonitorTileState |
+ * | --- | --- | --- |
+ * | null（未进入） | — | NOT_JOINED |
+ * | CONNECTING | — | CONNECTING |
+ * | ONLINE | true | NORMAL |
+ * | ONLINE | false | SCREEN_LOST |
+ * | SCREEN_LOST | — | SCREEN_LOST |
+ * | DISCONNECTED | — | DISCONNECTED |
+ * | LEFT / ROOM_CLOSED | — | LEFT |
+ *
+ * 注意 `LEFT` 把 `ROOM_CLOSED` 也收进来：对老师来说"学生自己走了"与"课堂被关掉了"
+ * 是同一件事——这个人已经不在这节课里了（区分二者没有可采取的动作差异）。
+ */
+export const MONITOR_TILE_STATES = [
+  'NOT_JOINED',
+  'CONNECTING',
+  'NORMAL',
+  'SCREEN_LOST',
+  'DISCONNECTED',
+  'LEFT',
+] as const
+
+export type MonitorTileState = (typeof MONITOR_TILE_STATES)[number]
 
 export function isConnectionQuality(value: unknown): value is ConnectionQuality {
   return typeof value === 'string' && (CONNECTION_QUALITIES as readonly string[]).includes(value)

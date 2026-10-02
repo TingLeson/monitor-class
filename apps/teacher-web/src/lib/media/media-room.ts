@@ -43,15 +43,35 @@ export interface MediaRemoteParticipant {
 }
 
 /**
+ * 订阅画质档位（§52 的"网格低 / Focus 高"）。
+ *
+ * WHY 不直接用 LiveKit 的 `VideoQuality` 枚举：这一层是**端口**，测试里的替身
+ * 不该为了一个参数把整个 `livekit-client` 拉进 happy-dom（SDK 在 import 期就会
+ * 触碰浏览器 API）。真实枚举 → SDK 调用的映射只发生在 `livekit-room.ts` 一处，
+ * 由 `livekit-room.spec.ts` 逐字钉住。
+ *
+ * 只有两档，因为老师端只有两种观看场景：网格里的小卡片，和 Focus 里的大画面。
+ * 中间档位没有对应的界面，暴露它只会让人以为存在一套"按需调节"的产品能力。
+ */
+export type ScreenQuality = 'low' | 'high'
+
+/**
  * 一次已建立的屏幕订阅。
  *
  * `attach` 把画面挂到具体的 `<video>` 上并返回 detach：把"哪个元素"这件事留给
- * 组件（同一个订阅在 Phase 7 可能同时挂在卡片与 Focus View 上），
+ * 组件（同一个订阅会随 Focus 切换在卡片与 Focus 画面之间搬家），
  * 媒体层只负责"这条轨道可以播了"。
  */
 export interface ScreenSubscription {
   identity: string
   attach(element: HTMLVideoElement): () => void
+  /**
+   * 切换这条订阅的画质档位（§30：Focus 优先较高画质，退出 Focus 降回）。
+   *
+   * 幂等：重复切成同一档必须是空操作，否则每 10 秒一轮的轮询都会给 SFU
+   * 发一次"我要高画质"的信令。
+   */
+  setQuality(quality: ScreenQuality): void
 }
 
 /**
@@ -68,8 +88,14 @@ export interface MonitorRoom {
   disconnect(): Promise<void>
   /** 当前远端参与者（媒体事实，不是业务状态）。 */
   participants(): MediaRemoteParticipant[]
-  /** 订阅某参与者的屏幕轨道；没有屏幕发布时返回 null（调用方据此显示"等待共享"）。 */
-  subscribeScreen(identity: string): Promise<ScreenSubscription | null>
+  /**
+   * 订阅某参与者的屏幕轨道；没有屏幕发布时返回 null（调用方据此显示"等待共享"）。
+   *
+   * `quality` 是**订阅时**就要定下的档位（§52）：等轨道推下来再降档，第一秒
+   * 仍然是按高画质下发的。默认 `low`——网格是常态，Focus 是例外，
+   * 默认值必须站在"省带宽"的那一侧。
+   */
+  subscribeScreen(identity: string, quality?: ScreenQuality): Promise<ScreenSubscription | null>
   /** 取消订阅（同时停止下行，§52 的"取消不可见 Track 的订阅"）。 */
   unsubscribeScreen(identity: string): Promise<void>
   /** 有人加入/离开，或发布了新的屏幕轨道：业务状态仍以 monitor DTO 为准。 */
