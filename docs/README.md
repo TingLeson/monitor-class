@@ -12,14 +12,14 @@
 | [architecture/overview.md](architecture/overview.md) | 系统架构、控制面/媒体面分离、领域模型、进入课堂主流程、技术选型取舍、安全与威胁模型 | Phase 0 |
 | [development/setup.md](development/setup.md) | 本地环境搭建、命令、环境变量、迁移用法、故障排查 | Phase 0 |
 | [development/workflow.md](development/workflow.md) | Phase 路线图、每个 Phase 的固定动作、Definition of Done、代码规范 | Phase 0 |
-| [database/schema.md](database/schema.md) | 完整目标 schema、约束与不变量、索引与查询、迁移策略 | Phase 0（表结构随 Phase 落地） |
+| [database/schema.md](database/schema.md) | 完整目标 schema、约束与不变量、索引与查询、迁移策略 | Phase 0 起（表随 Phase 落地） |
+| [auth/authentication.md](auth/authentication.md) | 三种登录方式、Argon2id 密码存储、opaque session 与 Cookie 策略、CSRF、限流、破窗工具 | Phase 1 |
+| [auth/rbac.md](auth/rbac.md) | 角色矩阵、请求授权链、入口隔离、401/403 语义、资源级授权规矩、反模式清单 | Phase 1 |
 
 ## 计划中的文档（按 Phase 产出）
 
 | 文档 | 内容 | Phase |
 | --- | --- | --- |
-| `auth/authentication.md` | 三种登录方式、opaque session token、Cookie 策略、为什么学生无密码 | 1 |
-| `auth/rbac.md` | 角色矩阵、路由 → 角色映射、Ownership 校验、前端守卫只是 UX | 1 |
 | `database/state-machines.md` | Classroom / StudentSession 状态迁移表：允许的边、触发者、副作用 | 3 |
 | `architecture/control-plane.md` | 控制面职责边界、事务与并发（`FOR UPDATE`）、错误码契约 | 3 |
 | `frontend/student.md` | 学生端页面、PreJoin、隐私告知、状态指示器（不显示自身预览的原因） | 4 |

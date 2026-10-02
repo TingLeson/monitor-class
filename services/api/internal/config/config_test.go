@@ -24,6 +24,9 @@ func clearEnv(t *testing.T) {
 		"REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB",
 		"LIVEKIT_URL", "LIVEKIT_API_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET",
 		"SESSION_COOKIE_NAME", "SESSION_TTL", "SESSION_COOKIE_SECURE",
+		"SESSION_IDLE_TOUCH_INTERVAL", "PASSWORD_MIN_LENGTH",
+		"RATE_LIMIT_LOGIN_PER_MINUTE", "RATE_LIMIT_LOGIN_PER_ACCOUNT_PER_10MIN",
+		"RATE_LIMIT_API_PER_MINUTE", "TRUSTED_PROXIES",
 	}
 	for _, key := range keys {
 		t.Setenv(key, "")
@@ -416,4 +419,187 @@ func TestLoadEnvOverridesDefaults(t *testing.T) {
 	if cfg.StartupRequireDependencies {
 		t.Error("STARTUP_REQUIRE_DEPENDENCIES=false was ignored")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 additions: session idle touch, password policy, rate limits and the
+// proxy trust list.
+// ---------------------------------------------------------------------------
+
+func TestLoadPhase1Defaults(t *testing.T) {
+	clearEnv(t)
+	setMinimalValidEnv(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+
+	if cfg.SessionIdleTouchInterval != 5*time.Minute {
+		t.Errorf("SessionIdleTouchInterval = %v, want 5m", cfg.SessionIdleTouchInterval)
+	}
+	if cfg.PasswordMinLength != 12 {
+		t.Errorf("PasswordMinLength = %d, want 12", cfg.PasswordMinLength)
+	}
+	if cfg.RateLimitLoginPerMinute != 10 {
+		t.Errorf("RateLimitLoginPerMinute = %d, want 10", cfg.RateLimitLoginPerMinute)
+	}
+	if cfg.RateLimitLoginPerAccountPer10Min != 5 {
+		t.Errorf("RateLimitLoginPerAccountPer10Min = %d, want 5", cfg.RateLimitLoginPerAccountPer10Min)
+	}
+	if cfg.RateLimitAPIPerMinute != 300 {
+		t.Errorf("RateLimitAPIPerMinute = %d, want 300", cfg.RateLimitAPIPerMinute)
+	}
+	// The safe default is "trust no proxy header": a deployment behind a proxy
+	// must opt in explicitly, and a deployment that is not must never believe a
+	// client-supplied address.
+	if len(cfg.TrustedProxies) != 0 {
+		t.Errorf("TrustedProxies = %v, want empty by default", cfg.TrustedProxies)
+	}
+	if got := cfg.TrustedProxyCIDRs(); got != nil {
+		t.Errorf("TrustedProxyCIDRs() = %v, want nil when nothing is trusted", got)
+	}
+}
+
+func TestSessionCookieNameIsPerEntryPoint(t *testing.T) {
+	clearEnv(t)
+	setMinimalValidEnv(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	// Cookies are scoped by host, not port: distinct names are what let a browser
+	// hold the student, teacher and admin sessions at the same time.
+	for role, want := range map[string]string{
+		"STUDENT": "classwatch_session_student",
+		"TEACHER": "classwatch_session_teacher",
+		"ADMIN":   "classwatch_session_admin",
+	} {
+		if got := cfg.SessionCookieNameFor(role); got != want {
+			t.Errorf("SessionCookieNameFor(%q) = %q, want %q", role, got, want)
+		}
+	}
+}
+
+func TestLoadPhase1NumericSettings(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     string
+		value   string
+		wantErr bool
+	}{
+		{"password minimum accepted", "PASSWORD_MIN_LENGTH", "16", false},
+		{"password minimum below the floor", "PASSWORD_MIN_LENGTH", "4", true},
+		{"password minimum above the ceiling", "PASSWORD_MIN_LENGTH", "500", true},
+		{"password minimum not a number", "PASSWORD_MIN_LENGTH", "twelve", true},
+		{"login limit accepted", "RATE_LIMIT_LOGIN_PER_MINUTE", "20", false},
+		{"login limit zero", "RATE_LIMIT_LOGIN_PER_MINUTE", "0", true},
+		{"login limit negative", "RATE_LIMIT_LOGIN_PER_MINUTE", "-5", true},
+		{"per-account limit zero", "RATE_LIMIT_LOGIN_PER_ACCOUNT_PER_10MIN", "0", true},
+		{"api limit zero", "RATE_LIMIT_API_PER_MINUTE", "0", true},
+		{"api limit not a number", "RATE_LIMIT_API_PER_MINUTE", "many", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			setMinimalValidEnv(t)
+			t.Setenv(tc.key, tc.value)
+
+			_, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("Load() succeeded for %s=%s, want error", tc.key, tc.value)
+				}
+				if !strings.Contains(err.Error(), tc.key) {
+					t.Errorf("error = %q, want it to name %s", err, tc.key)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() returned error: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadSessionIdleTouchInterval(t *testing.T) {
+	t.Run("must not exceed the TTL", func(t *testing.T) {
+		clearEnv(t)
+		setMinimalValidEnv(t)
+		t.Setenv("SESSION_TTL", "10m")
+		t.Setenv("SESSION_IDLE_TOUCH_INTERVAL", "1h")
+
+		_, err := Load()
+		if err == nil {
+			t.Fatal("Load() accepted an idle touch interval longer than the session TTL")
+		}
+		if !strings.Contains(err.Error(), "SESSION_IDLE_TOUCH_INTERVAL") {
+			t.Errorf("error = %q, want it to name SESSION_IDLE_TOUCH_INTERVAL", err)
+		}
+	})
+
+	t.Run("parsed when valid", func(t *testing.T) {
+		clearEnv(t)
+		setMinimalValidEnv(t)
+		t.Setenv("SESSION_IDLE_TOUCH_INTERVAL", "90s")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() returned error: %v", err)
+		}
+		if cfg.SessionIdleTouchInterval != 90*time.Second {
+			t.Errorf("SessionIdleTouchInterval = %v, want 90s", cfg.SessionIdleTouchInterval)
+		}
+	})
+
+	t.Run("rejects a non-positive duration", func(t *testing.T) {
+		clearEnv(t)
+		setMinimalValidEnv(t)
+		t.Setenv("SESSION_IDLE_TOUCH_INTERVAL", "0s")
+
+		if _, err := Load(); err == nil {
+			t.Fatal("Load() accepted SESSION_IDLE_TOUCH_INTERVAL=0s")
+		}
+	})
+}
+
+func TestLoadTrustedProxies(t *testing.T) {
+	t.Run("accepts CIDRs and bare addresses", func(t *testing.T) {
+		clearEnv(t)
+		setMinimalValidEnv(t)
+		t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8, 192.168.0.1 , 2001:db8::/32")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() returned error: %v", err)
+		}
+		if len(cfg.TrustedProxies) != 3 {
+			t.Fatalf("TrustedProxies = %v, want 3 networks", cfg.TrustedProxies)
+		}
+		// A bare address means "exactly this host", not "the whole internet".
+		if got := cfg.TrustedProxies[1].String(); got != "192.168.0.1/32" {
+			t.Errorf("bare address became %q, want 192.168.0.1/32", got)
+		}
+		cidrs := cfg.TrustedProxyCIDRs()
+		if len(cidrs) != 3 || cidrs[0] != "10.0.0.0/8" {
+			t.Errorf("TrustedProxyCIDRs() = %v", cidrs)
+		}
+	})
+
+	t.Run("rejects a typo", func(t *testing.T) {
+		clearEnv(t)
+		setMinimalValidEnv(t)
+		// A silent typo here would disable per-client rate limiting, so it must be
+		// a boot failure rather than a warning.
+		t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8,not-an-ip")
+
+		_, err := Load()
+		if err == nil {
+			t.Fatal("Load() accepted an invalid TRUSTED_PROXIES entry")
+		}
+		if !strings.Contains(err.Error(), "TRUSTED_PROXIES") {
+			t.Errorf("error = %q, want it to name TRUSTED_PROXIES", err)
+		}
+	})
 }

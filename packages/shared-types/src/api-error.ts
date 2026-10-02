@@ -15,6 +15,32 @@ export const BACKEND_API_ERROR_CODES = [
   'AUTH_REQUIRED',
   'ACCOUNT_DISABLED',
   'ROLE_FORBIDDEN',
+  /**
+   * 账号或密码错误（Phase 1 新增，HTTP 401）。
+   *
+   * WHY 必须与"账号不存在"共用同一个码：后端刻意不区分二者（§63 Security
+   * Checklist 的反账号枚举要求），否则登录接口就成了账号枚举器。因此前端
+   * **不得**据此推断账号是否存在，也不得提示"该账号未注册"。
+   * 学生端没有密码，理论上收不到这个码；一旦收到说明入口或账号角色不对，
+   * 仍按同一句通用文案处理，不泄漏账号状态。
+   */
+  'INVALID_CREDENTIALS',
+  /**
+   * 触发 IP / API 限流（Phase 1 新增，HTTP 429）。
+   *
+   * 来源是 §2.2 明确要求的 Rate Limit：学生账号无密码，限流是唯一的暴力枚举
+   * 缓解手段。前端只能提示"稍后再试"，**禁止自动重试**——自动重试会让限流
+   * 窗口一直无法关闭，把一次临时限流拖成持续封禁。
+   */
+  'RATE_LIMITED',
+  /**
+   * CSRF 校验失败（Phase 1 新增，HTTP 403）。
+   *
+   * 语义是"会话 Cookie 在，但 X-CSRF-Token 头缺失或不匹配"（§63 CSRF protection）。
+   * 这**不是**未登录，因此不能当成 AUTH_REQUIRED 去清本地会话：典型成因是页面
+   * 长时间停留后 CSRF Cookie 过期，刷新页面即可恢复。
+   */
+  'CSRF_INVALID',
   'CLASSROOM_NOT_FOUND',
   'CLASSROOM_NOT_OWNER',
   'CLASSROOM_CLOSED',
@@ -65,6 +91,11 @@ export const API_ERROR_MESSAGES: Record<ApiErrorCode, string> = {
   AUTH_REQUIRED: '登录状态已失效，请重新登录。',
   ACCOUNT_DISABLED: '账号已被停用，请联系管理员。',
   ROLE_FORBIDDEN: '当前账号无权执行该操作。',
+  // 刻意不提"密码错误"还是"账号不存在"：后端不区分，前端也不能替它区分。
+  INVALID_CREDENTIALS: '账号或密码不正确。',
+  // 不写具体等待秒数：后端未在契约里下发 retryAfter，编一个数字等于撒谎。
+  RATE_LIMITED: '尝试过于频繁，请稍后再试。',
+  CSRF_INVALID: '页面已过期，请刷新页面后重试。',
 
   CLASSROOM_NOT_FOUND: '课堂不存在或已被删除。',
   CLASSROOM_NOT_OWNER: '只有课堂的创建老师可以执行该操作。',
@@ -92,6 +123,21 @@ export const API_ERROR_MESSAGES: Record<ApiErrorCode, string> = {
 
 export function isApiErrorCode(value: unknown): value is ApiErrorCode {
   return typeof value === 'string' && (API_ERROR_CODES as readonly string[]).includes(value)
+}
+
+/**
+ * 按错误码取"可以直接展示给用户"的中文文案（§58）。
+ *
+ * WHY 放在共享包而不是各 app 的 LoginView 里：三个入口的登录失败文案必须完全一致
+ * （同一个 INVALID_CREDENTIALS 在教师端说"密码错误"、在管理端说"账号不存在"，
+ * 就等于用两个入口的差异把账号存在性泄漏出去）。调用方只允许在"本地校验失败"
+ * 这类与后端无关的场景下传自己的兜底文案。
+ */
+export function apiErrorMessage(code: ApiErrorCode, fallback?: string): string {
+  const message = API_ERROR_MESSAGES[code]
+  if (message) return message
+  // 类型上不可达；保留兜底是为了运行时后端新增错误码降级后的防御性分支。
+  return fallback ?? API_ERROR_MESSAGES.INTERNAL
 }
 
 export function isFrontendLocalErrorCode(value: unknown): value is FrontendLocalErrorCode {

@@ -81,6 +81,8 @@ jobs:
           APP_ENV: test
           DATABASE_URL: postgres://classwatch:classwatch_dev_password@localhost:5432/classwatch_test?sslmode=disable
           TEST_DATABASE_URL: postgres://classwatch:classwatch_dev_password@localhost:5432/classwatch_test?sslmode=disable
+          # 限流测试需要真实 Redis；未设置时相关用例会 Skip，CI 中必须设置以免假绿。
+          TEST_REDIS_ADDR: localhost:6379
           REDIS_ADDR: localhost:6379
           LIVEKIT_API_KEY: devkey
           LIVEKIT_API_SECRET: classwatch_dev_livekit_secret_32b

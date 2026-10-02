@@ -1,6 +1,8 @@
-import { describe, expect, it } from 'vitest'
+import { API_ERROR_MESSAGES } from '@classwatch/shared-types'
+import { beforeEach, describe, expect, it } from 'vitest'
 import { ApiError, isApiError } from '../api-error'
 import { CSRF_HEADER, REQUEST_ID_HEADER, createApiClient } from '../client'
+import { createCsrfTokenProvider, readCookie } from '../csrf'
 
 const BASE_URL = 'https://api.example.com/api/v1'
 
@@ -188,6 +190,54 @@ describe('createApiClient', () => {
     expect(headersOf(calls[1]!)[CSRF_HEADER]).toBe('csrf-token-1')
   })
 
+  it('POST/PUT/PATCH/DELETE 一律带 CSRF 头，GET 一律不带', async () => {
+    const { calls, fetchImpl } = createFetchStub(() => new Response(null, { status: 204 }))
+    const client = createApiClient({
+      baseUrl: BASE_URL,
+      fetchImpl,
+      csrfToken: () => 'csrf-token-1',
+    })
+
+    await client.get('/x')
+    await client.post('/x')
+    await client.patch('/x', { name: 'n' })
+    await client.request('PUT', '/x', { body: { name: 'n' } })
+    await client.del('/x')
+
+    // 索引 0 是 GET；1..4 是所有非安全方法（§63：写请求必须带 CSRF token）。
+    expect(headersOf(calls[0]!)[CSRF_HEADER]).toBeUndefined()
+    for (const call of calls.slice(1)) {
+      expect(headersOf(call)[CSRF_HEADER]).toBe('csrf-token-1')
+      // credentials 必须保持 include：CSRF 是补充，不是会话载体的替代。
+      expect(call.init.credentials).toBe('include')
+    }
+  })
+
+  it('CSRF cookie 缺失（provider 返回 null）时不发送该头，绝不发空字符串', async () => {
+    const { calls, fetchImpl } = createFetchStub(() => new Response(null, { status: 204 }))
+    const client = createApiClient({ baseUrl: BASE_URL, fetchImpl, csrfToken: () => null })
+
+    await client.post('/student/auth/login', { account: 'S10086' })
+
+    // 缺头会让后端返回 CSRF_INVALID（403）；空字符串会让服务端无法区分
+    // "没带 token"和"带了空 token"，排障时两种情况的结论完全不同。
+    expect(CSRF_HEADER in headersOf(calls[0]!)).toBe(false)
+  })
+
+  it('CSRF 头每个写请求都重新读取 provider（登录后才下发的 cookie 必须能生效）', async () => {
+    const { calls, fetchImpl } = createFetchStub(() => jsonResponse({ user: { id: 'u1' } }))
+    let token: string | null = null
+    const client = createApiClient({ baseUrl: BASE_URL, fetchImpl, csrfToken: () => token })
+
+    await client.post('/student/auth/login', { account: 'S10086' })
+    // 模拟后端在登录响应里 Set-Cookie 下发 CSRF cookie。
+    token = 'csrf-after-login'
+    await client.post('/student/classrooms/c1/join')
+
+    expect(headersOf(calls[0]!)[CSRF_HEADER]).toBeUndefined()
+    expect(headersOf(calls[1]!)[CSRF_HEADER]).toBe('csrf-after-login')
+  })
+
   it('调用方可以覆盖 baseUrl 之外的同源路径与自定义 request id', async () => {
     const { calls, fetchImpl } = createFetchStub(() => jsonResponse({ ok: true }))
     const client = createApiClient({ baseUrl: '', fetchImpl })
@@ -196,5 +246,75 @@ describe('createApiClient', () => {
 
     expect(calls[0]?.url).toBe('/healthz')
     expect(headersOf(calls[0]!)[REQUEST_ID_HEADER]).toBe('trace-42')
+  })
+
+  it.each([
+    ['INVALID_CREDENTIALS', 401],
+    ['RATE_LIMITED', 429],
+    ['CSRF_INVALID', 403],
+    ['ACCOUNT_DISABLED', 403],
+  ] as const)('解析 Phase 1 新增错误码 %s（HTTP %i）', async (code, status) => {
+    const { fetchImpl } = createFetchStub(() => errorResponse({ code, message: '' }, status))
+    const client = createApiClient({ baseUrl: BASE_URL, fetchImpl })
+
+    const error = (await client.post('/teacher/auth/login').catch((e: unknown) => e)) as ApiError
+
+    expect(error.code).toBe(code)
+    expect(error.status).toBe(status)
+    // 后端 message 为空时回落到 shared-types 的中文文案，绝不会是空提示。
+    expect(error.message).toBe(API_ERROR_MESSAGES[code])
+    expect(error.message.length).toBeGreaterThan(0)
+  })
+})
+
+describe('createCsrfTokenProvider', () => {
+  const COOKIE_NAME = 'classwatch_session_student_csrf'
+
+  beforeEach(() => {
+    // happy-dom 的 document.cookie 在同一个测试文件内是共享的，显式清空避免串味。
+    for (const name of [COOKIE_NAME, 'classwatch_session_teacher_csrf', 'other', 'a', 'aa']) {
+      document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/`
+    }
+  })
+
+  it('按名字读取 CSRF cookie 的值', () => {
+    document.cookie = `${COOKIE_NAME}=token-abc; path=/`
+    const provider = createCsrfTokenProvider({ cookieName: COOKIE_NAME })
+
+    expect(provider()).toBe('token-abc')
+  })
+
+  it('cookie 不存在时返回 null（而不是抛错或空串）', () => {
+    const provider = createCsrfTokenProvider({ cookieName: COOKIE_NAME })
+
+    expect(provider()).toBeNull()
+  })
+
+  it('不会被名字互为前缀的其它 cookie 误命中', () => {
+    document.cookie = 'a=wrong; path=/'
+    document.cookie = 'aa=x; path=/'
+
+    expect(createCsrfTokenProvider({ cookieName: 'a' })()).toBe('wrong')
+    expect(createCsrfTokenProvider({ cookieName: 'aa' })()).toBe('x')
+    expect(createCsrfTokenProvider({ cookieName: 'aaa' })()).toBeNull()
+  })
+
+  it('每次都重新读取 document.cookie，不在创建时缓存', () => {
+    const provider = createCsrfTokenProvider({ cookieName: COOKIE_NAME })
+    expect(provider()).toBeNull()
+
+    document.cookie = `${COOKIE_NAME}=late-token; path=/`
+
+    expect(provider()).toBe('late-token')
+  })
+
+  it('HttpOnly 的会话 cookie 与 CSRF cookie 互不影响：provider 只认自己那一个名字', () => {
+    // 模拟后端登录后同时下发会话 cookie（HttpOnly，JS 读不到）与 CSRF cookie。
+    document.cookie = `${COOKIE_NAME}=csrf-value; path=/`
+
+    const provider = createCsrfTokenProvider({ cookieName: COOKIE_NAME })
+
+    expect(provider()).toBe('csrf-value')
+    expect(readCookie('classwatch_session_student')).toBeNull()
   })
 })

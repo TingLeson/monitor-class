@@ -1,7 +1,8 @@
 # 数据库设计（PostgreSQL）
 
-> **状态**：本文档描述 V1 的**完整目标 schema**。Phase 0 只落地了扩展与迁移机制，
-> 业务表从 Phase 1 开始按 Phase 逐张创建（见 §6）。
+> **状态**：本文档描述 V1 的**完整目标 schema**，并按 Phase 逐步落地。
+> 截至 Phase 1，已创建 `users`、`sessions` 两张表（见 §6）；
+> 课堂相关四张表在 Phase 3 创建。
 >
 > PostgreSQL 是 ClassWatch 的唯一 Source of Truth。LiveKit Room 的有无**不代表**任何业务状态。
 
@@ -61,7 +62,12 @@ erDiagram
     CLASSROOM_RUNS ||--o{ STUDENT_SESSIONS : contains
     USERS ||--o{ STUDENT_SESSIONS : attends
     STUDENT_SESSIONS ||--o{ SESSION_EVENTS : emits
+    USERS ||--o{ SESSIONS : "authenticates (login session)"
 ```
+
+> 注意区分两张"session"表：
+> `sessions` 是**登录会话**（Phase 1，一个浏览器一次登录一行，与课堂无关）；
+> `student_sessions` 是**课堂会话**（Phase 3/8，一个学生一次 `ClassroomRun` 一行）。
 
 ---
 
@@ -261,6 +267,43 @@ CREATE INDEX session_events_type_time_idx ON session_events (type, created_at DE
 
 ---
 
+### 4.7 `sessions`（登录会话，Phase 1）
+
+```sql
+CREATE TABLE sessions (
+    id           uuid        PRIMARY KEY,          -- 由应用生成：INSERT 失败也要能记进日志
+    user_id      uuid        NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    token_hash   bytea       NOT NULL UNIQUE,      -- sha256(原始 token)，原始值只在客户端 Cookie 里
+    csrf_token   text        NOT NULL,             -- 双提交 CSRF 的服务端副本
+    issued_at    timestamptz NOT NULL DEFAULT now(),
+    expires_at   timestamptz NOT NULL,             -- 固定 TTL，不滑动续期
+    revoked_at   timestamptz NULL,                 -- 软撤销：行保留作为审计记录
+    last_seen_at timestamptz NOT NULL DEFAULT now(),
+    user_agent   text        NULL,
+    ip           inet        NULL,
+
+    CONSTRAINT sessions_expires_after_issued CHECK (expires_at > issued_at)
+);
+
+CREATE INDEX sessions_user_idx    ON sessions (user_id) WHERE revoked_at IS NULL;
+CREATE INDEX sessions_expires_idx ON sessions (expires_at);
+```
+
+设计说明：
+
+- **只存 `sha256(token)`**：原始 token 只存在于用户的 HttpOnly Cookie 中。
+  因此数据库被拖库、备份泄漏、只读副本泄漏都**无法**重放成一次登录。
+  这里用 SHA-256 而不是 Argon2 是正确的：输入是 256 位 CSPRNG 随机数，不存在被猜解的问题。
+- **软撤销（`revoked_at`）而不是删除**：登出、停用账号、重置密码都只是打时间戳，
+  行本身保留下来作为"谁在什么时候登录过"的审计痕迹。
+- **授权不读会话里的任何声明**：每次请求都用 `sessions ⋈ users` 现取 `role` 与 `status`，
+  所以管理员改角色或停用账号会在**下一个请求**生效（§37）。
+- **固定的 `expires_at`**：不做滑动续期。监督系统里"永不掉线"不是目标；
+  固定的会话寿命让"14:05 时谁还可能在线"这种问题有确定答案。
+- **没有后台清理任务**：过期行在下次登录时机会式清理，`sessions_expires_idx` 让这件事很便宜。
+
+---
+
 ## 5. 关键查询与索引对应关系
 
 | 场景 | 查询 | 依赖索引 |
@@ -268,6 +311,7 @@ CREATE INDEX session_events_type_time_idx ON session_events (type, created_at DE
 | 学生「我的课堂」 | `classroom_students` JOIN `classrooms` WHERE `student_id = $1` | `classroom_students_student_idx` |
 | 老师「我的课堂」 | `classrooms` WHERE `owner_teacher_id = $1` | `classrooms_owner_idx` |
 | 老师监督墙 | `student_sessions` WHERE `classroom_run_id = $1` + JOIN `users` | `student_sessions_run_idx` |
+| 每个请求的会话校验 | `sessions` JOIN `users` WHERE `token_hash = $1` AND `revoked_at IS NULL` AND `expires_at > now()` | `sessions_token_hash_key`（唯一索引） |
 | 开启课堂（加锁） | `SELECT ... FROM classrooms WHERE id = $1 FOR UPDATE` | 主键 |
 | 事件回放 | `session_events` WHERE `session_id = $1` ORDER BY `created_at` | `session_events_session_idx` |
 
@@ -277,37 +321,54 @@ CREATE INDEX session_events_type_time_idx ON session_events (type, created_at DE
 
 ---
 
-## 6. Phase 0 的实际落地内容
+## 6. 迁移历史与当前落地内容
 
-```sql
--- services/api/migrations/0001_bootstrap.sql
-CREATE EXTENSION IF NOT EXISTS pgcrypto;  -- gen_random_uuid()
-CREATE EXTENSION IF NOT EXISTS citext;    -- account 大小写不敏感唯一
+```text
+services/api/migrations/
+├── 0001_bootstrap.sql   扩展：pgcrypto（gen_random_uuid）、citext（account 大小写不敏感）
+├── 0002_users.sql       users（含角色-密码约束、账号格式约束）
+└── 0003_sessions.sql    sessions（服务端只存 token 的 SHA-256）
 ```
 
-Phase 0 **故意不创建任何业务表**：
+编号与任务书 §60 示例（`0001_users.sql` …）的对应关系：本项目把"扩展与迁移机制"独立成
+`0001_bootstrap.sql`，因此业务表从 `0002` 开始编号。**迁移文件一旦合并就不再修改**，
+只追加新文件。
+
+### 6.1 Phase 0 为什么没有业务表
 
 1. 表结构必须跟随它所属 Phase 的领域设计一起评审（用户表属于 Phase 1/2，课堂属于 Phase 3）。
 2. 迁移一旦合并就不可修改，提前建表只会制造需要靠新迁移来纠正的返工。
-3. 迁移执行器（`pg_advisory_lock` + `schema_migrations` + 单事务/文件）在 Phase 0 已可用，
+3. 迁移执行器（`pg_advisory_lock` + `schema_migrations` + 单文件单事务）在 Phase 0 已经可用，
    后续 Phase 只需新增 SQL 文件。
 
-当前数据库中的内容：
+### 6.2 Phase 1 新增的两张表
+
+| 表 | 关键约束 / 索引 | 说明 |
+| --- | --- | --- |
+| `users` | `users_password_by_role`（STUDENT 必须无密码、ADMIN/TEACHER 必须有）、`users_account_format`、`account` citext 唯一、`users_role_status_idx` | 见 §4.1；`updated_at` 由**应用层显式更新**而不是触发器 —— 写入路径只有后端，显式 SQL 更可审计、迁移里更少"魔法" |
+| `sessions` | `token_hash` 唯一、`expires_at > issued_at`、`sessions_user_idx (user_id) WHERE revoked_at IS NULL`、`sessions_expires_idx` | 只存 `sha256(token)`，原始 token 只存在于用户的 Cookie 里；授权判定每次 `sessions ⋈ users` 现取角色与状态，因此**停用账号或改角色立即生效** |
+
+会话 Cookie 的名称由 `SESSION_COOKIE_NAME` 作为前缀按入口派生
+（`classwatch_session_student` / `_teacher` / `_admin`），原因见
+[auth/authentication.md](../auth/authentication.md) §3.1。
+
+### 6.3 验证方式
+
+```bash
+make up                 # 启动 postgres 等容器（migrate 服务会自动应用迁移）
+make migrate-up         # 手动应用迁移（可重复执行，幂等）
+make migrate-status     # 查看已应用版本
+make db-shell           # 进入 psql 自行检查 \dt
+```
+
+当前数据库中的对象：
 
 | 对象 | 说明 |
 | --- | --- |
 | `schema_migrations` | 迁移执行器自动创建，记录已应用的版本 |
 | 扩展 `pgcrypto` / `citext` | `0001_bootstrap.sql` |
-| 业务表 | **无**（Phase 1 起逐张创建） |
-
-验证方式：
-
-```bash
-make up                 # 启动 postgres 等容器
-make migrate-up         # 应用迁移（可重复执行，幂等）
-make migrate-status     # 查看已应用版本
-make db-shell           # 进入 psql 自行检查 \dt
-```
+| `users` / `sessions` | Phase 1；课堂相关四张表在 Phase 3 |
+| `session_events` | Phase 8（Webhook 与运行时状态就绪之后才有意义） |
 
 ---
 

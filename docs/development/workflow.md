@@ -10,7 +10,7 @@
 | Phase | 分支 | 目标 | 状态 |
 | --- | --- | --- | --- |
 | 0 | `phase/00-bootstrap` | 工程骨架：monorepo、容器、迁移机制、CI、文档 | ✅ 已完成 |
-| 1 | `phase/01-auth` | 三种登录、Session、RBAC、停用账号 | ⏳ 待人工确认后开始 |
+| 1 | `phase/01-auth` | 三种登录、Session、RBAC、停用账号 | ✅ 已完成 |
 | 2 | `phase/02-admin-users` | 管理员用户管理（创建老师/学生、启停用、重置密码） | ⏳ |
 | 3 | `phase/03-classrooms` | Classroom 领域、授权学生、OPEN/CLOSED、ClassroomRun | ⏳ |
 | 4 | `phase/04-student-portal` | 学生课堂门户（进入按钮 → PreJoin） | ⏳ |

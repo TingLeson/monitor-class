@@ -47,7 +47,13 @@ func RequestIDMiddleware(logger *slog.Logger) gin.HandlerFunc {
 // It runs after the handler so status and duration are known. Health probes are
 // demoted to Debug (see logging.LevelFromRequest): an orchestrator probing every
 // few seconds would otherwise bury every real request.
-func AccessLogMiddleware(logger *slog.Logger) gin.HandlerFunc {
+//
+// The client address comes from the injected resolver, never from gin's
+// c.ClientIP() default and never straight from X-Forwarded-For: an access log
+// whose remote_ip is client-controlled is worse than no field at all, because an
+// investigation would trust it. Using the same resolver as the rate limiters also
+// guarantees the log and the limiter agree about who a request was.
+func AccessLogMiddleware(logger *slog.Logger, resolver *ClientIPResolver) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 		c.Next()
@@ -59,8 +65,15 @@ func AccessLogMiddleware(logger *slog.Logger) gin.HandlerFunc {
 			"path", path,
 			"status", status,
 			"duration_ms", logging.DurationMillis(time.Since(start)),
-			"remote_ip", c.ClientIP(),
+			"remote_ip", resolver.ClientIP(c.Request),
 			"response_bytes", c.Writer.Size(),
+		}
+		// Identity is read from the context AFTER the handler ran, so an
+		// authenticated request is attributable to a person (§59) without the
+		// middleware having to mutate the request logger — doing that would
+		// duplicate user_id on every line the service itself logs.
+		if principal, ok := PrincipalFrom(c); ok {
+			attrs = append(attrs, logging.FieldUserID, principal.UserID.String(), logging.FieldRole, string(principal.Role))
 		}
 		if len(c.Errors) > 0 {
 			// gin.Errors holds handler-level annotations; the full cause is logged

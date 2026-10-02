@@ -24,7 +24,8 @@ ENV_FILE := .env
 export
 
 .PHONY: help init env install up down restart ps logs dev dev-api dev-web doctor \
-        migrate-up migrate-status db-shell redis-cli \
+        migrate-up migrate-status create-admin create-user reset-password list-users \
+        db-shell sql redis-cli \
         build build-api build-web image \
         test test-api test-web test-integration \
         lint lint-api lint-web fmt fmt-api fmt-web \
@@ -101,6 +102,32 @@ migrate-up: env ## 执行数据库 migration（versioned SQL，幂等）
 migrate-status: env ## 查看已应用的 migration
 	$(COMPOSE) run --rm migrate status
 
+create-admin: env ## 交互式创建初始管理员（密码不回显、不进 shell 历史）
+	@read -r -p "account: " account; \
+	 read -r -p "display name: " name; \
+	 read -r -s -p "password: " password; echo; \
+	 printf '%s' "$$password" | $(COMPOSE) run --rm -T adminctl \
+		create-user --account "$$account" --display-name "$$name" --role ADMIN --password-stdin
+
+create-user: env ## 创建用户：make create-user ROLE=TEACHER|STUDENT（交互式，STUDENT 无需密码）
+	@read -r -p "account: " account; \
+	 read -r -p "display name: " name; \
+	 if [ "$(ROLE)" = "STUDENT" ]; then \
+		$(COMPOSE) run --rm -T adminctl create-user --account "$$account" --display-name "$$name" --role STUDENT; \
+	 else \
+		read -r -s -p "password: " password; echo; \
+		printf '%s' "$$password" | $(COMPOSE) run --rm -T adminctl \
+			create-user --account "$$account" --display-name "$$name" --role "$${ROLE:-TEACHER}" --password-stdin; \
+	 fi
+
+reset-password: env ## 重置密码：make reset-password ACCOUNT=teacher001
+	@read -r -s -p "new password: " password; echo; \
+	 printf '%s' "$$password" | $(COMPOSE) run --rm -T adminctl \
+		reset-password --account "$(ACCOUNT)" --password-stdin
+
+list-users: env ## 列出账号
+	$(COMPOSE) run --rm -T adminctl list-users $(if $(ROLE),--role $(ROLE),)
+
 db-shell: ## 进入 postgres psql
 	$(COMPOSE) exec postgres psql -U $(POSTGRES_USER) -d $(POSTGRES_DB)
 
@@ -135,7 +162,10 @@ test-integration: env ## 运行需要真实 PostgreSQL 的集成测试
 		"SELECT 1 FROM pg_database WHERE datname = 'classwatch_test'" | grep -q 1 \
 		|| $(COMPOSE) exec -T postgres createdb -U $(POSTGRES_USER) classwatch_test
 	@# DSN 在这里显式拼装：集成测试必须打真实的 compose PostgreSQL，而不是某个本地残留实例。
-	cd $(API_DIR) && TEST_DATABASE_URL="postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/classwatch_test?sslmode=disable" go test ./internal/infrastructure/... -v
+	@# Phase 1 起集成测试分布在 user / auth / httpapi / ratelimit / cmd 等多个包，因此跑全量。
+	cd $(API_DIR) && TEST_DATABASE_URL="postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/classwatch_test?sslmode=disable" \
+		TEST_REDIS_ADDR="localhost:$(REDIS_PORT)" \
+		go test ./... -count=1
 
 test-web: ## 运行前端单元测试
 	pnpm test

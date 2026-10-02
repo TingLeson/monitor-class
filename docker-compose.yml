@@ -42,6 +42,14 @@ x-api-environment: &api-environment
   DB_AUTO_MIGRATE: 'false'
 
 x-api-image: &api-image
+  # 三个服务（api / migrate / adminctl）共用**同一个镜像标签**。
+  #
+  # WHY 必须显式指定 image：compose 默认按服务名生成镜像名（classwatch-api、
+  # classwatch-migrate、classwatch-adminctl）。那样一来 `docker compose build api`
+  # 只更新 api 的镜像，migrate/adminctl 仍然是上一次构建的旧二进制——表现为
+  # 「迁移状态里出现 unknown migration」「新建账号用的还是旧校验逻辑」这类极难定位的问题。
+  # 共用标签后，一次构建三者同时生效，它们也天然保持版本一致。
+  image: classwatch-api:${APP_VERSION:-dev}
   build:
     context: ./services/api
     dockerfile: Dockerfile
@@ -116,6 +124,22 @@ services:
     restart: 'no'
     entrypoint: ['/app/migrate']
     command: ['up']
+    env_file:
+      - .env
+    environment:
+      <<: *api-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # 破窗工具（§4：第一个管理员由初始化命令创建）：
+  #   密码只从 stdin 传入，避免出现在 shell history、ps 与 compose 配置里。
+  # 放进 tools profile，因此 `docker compose up` 不会启动它。
+  adminctl:
+    <<: *api-image
+    profiles: ['tools']
+    restart: 'no'
+    entrypoint: ['/app/adminctl']
     env_file:
       - .env
     environment:

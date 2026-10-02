@@ -1,5 +1,6 @@
 import { API_ERROR_MESSAGES, isApiErrorCode, isApiErrorResponse } from '@classwatch/shared-types'
 import { ApiError } from './api-error'
+import { SAFE_METHODS } from './csrf'
 
 export type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE'
 
@@ -31,11 +32,15 @@ export interface ApiClientOptions {
   fetchImpl?: typeof fetch
   defaultHeaders?: Record<string, string>
   /**
-   * CSRF token 钩子（Phase 11，§63 CSRF protection）。
+   * CSRF token 钩子（§63 CSRF protection）。
    *
    * 后端用 HttpOnly Cookie 承载会话，浏览器会自动带上 Cookie，因此"写"请求
-   * （POST/PATCH/PUT/DELETE）必须额外带一个前端可读的 CSRF token。
-   * Phase 0 不实现具体机制，只预留注入点，避免 Phase 11 改动调用方代码。
+   * （POST/PUT/PATCH/DELETE）必须额外带一个前端可读的 CSRF token 放进
+   * `X-CSRF-Token` 头。三个 app 用 `createCsrfTokenProvider({ cookieName })`
+   * 构造本函数，cookie 名按入口区分（见 csrf.ts 的说明）。
+   *
+   * 返回 null/undefined 时**不发送**该头：缺头让后端返回 CSRF_INVALID（403），
+   * 比发一个空字符串更容易在服务端日志里与"没带 token"区分开。
    */
   csrfToken?: () => string | null | undefined
   /** 生成 request id；默认使用 crypto.randomUUID()。 */
@@ -159,9 +164,13 @@ export function createApiClient(options: ApiClientOptions): ApiClient {
       headers['Content-Type'] = JSON_CONTENT_TYPE
     }
 
-    // CSRF 只对"写"请求有意义；GET 必须保持无副作用。
-    if (method !== 'GET') {
+    // CSRF 只对"写"请求有意义：GET 必须保持无副作用，也不该带 token
+    // （带了反而会进浏览器缓存键与后端访问日志）。
+    if (!SAFE_METHODS.has(method)) {
+      // 每个写请求都重新取一次：登录前的实例读不到登录后才下发的 CSRF Cookie。
       const csrfToken = options.csrfToken?.()
+      // 空字符串等同"没有 token"：宁可让后端明确回 CSRF_INVALID，也不要发一个
+      // 会让"cookie 缺失"和"cookie 为空"在服务端日志里无法区分的头。
       if (csrfToken) {
         headers[CSRF_HEADER] = csrfToken
       }

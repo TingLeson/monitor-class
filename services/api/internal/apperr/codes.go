@@ -24,6 +24,24 @@ const (
 	CodeAuthRequired    Code = "AUTH_REQUIRED"    // no valid session
 	CodeAccountDisabled Code = "ACCOUNT_DISABLED" // session valid, account switched off
 	CodeRoleForbidden   Code = "ROLE_FORBIDDEN"   // wrong role for this endpoint
+	// CodeInvalidCredentials is returned for BOTH "no such account" and "wrong
+	// password" on a password login, with the same code and the same message.
+	// WHY: telling them apart turns the login form into an account oracle —
+	// an attacker learns which accounts exist (and therefore which ones are worth
+	// targeting) before ever guessing a password. The information is deliberately
+	// collapsed for the client and kept, with full detail, in the server log.
+	CodeInvalidCredentials Code = "INVALID_CREDENTIALS"
+
+	// CodeRateLimited is returned when a client exceeds a rate limit. §2.2 makes
+	// rate limiting mandatory because a student account is "know the account and
+	// you are in"; the limit is what turns unlimited guessing into an impractical
+	// number of attempts.
+	CodeRateLimited Code = "RATE_LIMITED"
+
+	// CodeCSRFInvalid is returned when an authenticated unsafe request does not
+	// carry the session's CSRF token. 403 — the caller is authenticated, the
+	// request is simply not allowed (§63).
+	CodeCSRFInvalid Code = "CSRF_INVALID"
 
 	// Classroom domain.
 	CodeClassroomNotFound      Code = "CLASSROOM_NOT_FOUND"
@@ -55,6 +73,15 @@ var defaultMessages = map[Code]string{
 	CodeAuthRequired:    "Authentication is required.",
 	CodeAccountDisabled: "This account is disabled.",
 	CodeRoleForbidden:   "Your role is not allowed to perform this action.",
+
+	// One sentence for "unknown account" and "wrong password" alike: any
+	// difference in wording would leak exactly what CodeInvalidCredentials is
+	// designed to hide.
+	CodeInvalidCredentials: "The account or password is incorrect.",
+	CodeRateLimited:        "Too many requests. Please try again later.",
+	// Deliberately actionable but non-technical: the frontend can offer "reload
+	// the page" without explaining CSRF to a student.
+	CodeCSRFInvalid: "Your session could not be verified for this action. Please reload the page and try again.",
 
 	CodeClassroomNotFound:      "Classroom not found.",
 	CodeClassroomNotOwner:      "You are not the owner of this classroom.",

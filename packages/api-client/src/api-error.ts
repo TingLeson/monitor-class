@@ -53,6 +53,26 @@ export class ApiError extends Error {
       this.code === 'ROLE_FORBIDDEN'
     )
   }
+
+  /**
+   * "这个入口当前没有可用会话"，也就是可以按未登录处理。
+   *
+   * WHY 单独一个 getter，而不是让三个 app 各自写 code 判断：
+   * 1. 白名单必须一致。401 AUTH_REQUIRED（无会话/过期/已撤销）、
+   *    403 ACCOUNT_DISABLED（账号被停用）、403 ROLE_FORBIDDEN（拿着别的入口的
+   *    会话访问本入口，§67 要求跨入口拒绝）三种情况对"取当前用户"这个语义而言
+   *    都等于"没有本入口的登录态"；
+   * 2. **NETWORK_ERROR 绝不能算进来**：请求根本没到服务器，把它当成未登录会让
+   *    一次网络抖动变成"用户被登出"；
+   * 3. CSRF_INVALID 也绝不能算进来：会话还在，只是 token 过期，刷新即可恢复。
+   *
+   * 命名强调 "session"（会话）而不是 "auth"：业务接口上的 403 ROLE_FORBIDDEN
+   * 表示"账号正常但无权做这件事"，那种情况**不允许**把用户踢回登录页
+   * （见 docs/auth/rbac.md §4）。
+   */
+  get isSessionAbsent(): boolean {
+    return this.isAuthError
+  }
 }
 
 export function isApiError(value: unknown): value is ApiError {

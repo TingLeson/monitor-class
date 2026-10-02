@@ -1,11 +1,13 @@
 #
 # ClassWatch Control Plane API image.
 #
-# Two binaries are produced from this one module: the API server and the
-# migration runner. Shipping them in the same image guarantees the migrations a
+# Three binaries are produced from this one module: the API server, the migration
+# runner and adminctl. Shipping them in the same image guarantees the migrations a
 # deploy applies are exactly the ones compiled into the API that follows —
 # version skew between "the schema tool" and "the server" is a classic source of
-# half-applied releases.
+# half-applied releases — and guarantees adminctl writes accounts with exactly the
+# hashing and validation rules the API will verify them with. adminctl carries no
+# migration logic of its own: migrations belong to /app/migrate.
 #
 # Build context is services/api, so:  docker build -t classwatch-api:phase0 services/api
 #
@@ -44,7 +46,8 @@ RUN go build -ldflags="-s -w \
       -X github.com/classwatch/classwatch/services/api/internal/httpapi.Version=${VERSION} \
       -X github.com/classwatch/classwatch/services/api/internal/httpapi.Commit=${COMMIT}" \
       -o /out/api ./cmd/api \
- && go build -ldflags="-s -w" -o /out/migrate ./cmd/migrate
+ && go build -ldflags="-s -w" -o /out/migrate ./cmd/migrate \
+ && go build -ldflags="-s -w" -o /out/adminctl ./cmd/adminctl
 
 # ---------------------------------------------------------------------------
 # Runtime stage
@@ -62,6 +65,7 @@ WORKDIR /app
 
 COPY --from=build /out/api /app/api
 COPY --from=build /out/migrate /app/migrate
+COPY --from=build /out/adminctl /app/adminctl
 
 # Never run as root: the API talks to two data stores and terminates untrusted
 # input, so a container escape should not start from uid 0.

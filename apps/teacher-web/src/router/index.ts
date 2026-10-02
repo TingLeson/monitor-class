@@ -1,10 +1,14 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
+import { useSessionStore } from '../stores/session'
 import ClassroomDetailView from '../views/ClassroomDetailView.vue'
 import ClassroomMonitorView from '../views/ClassroomMonitorView.vue'
 import ClassroomNewView from '../views/ClassroomNewView.vue'
 import ClassroomsView from '../views/ClassroomsView.vue'
 import DashboardView from '../views/DashboardView.vue'
 import LoginView from '../views/LoginView.vue'
+import { createAuthGuard, type AuthGuardConfig } from './guard'
+// 引入 meta 的类型增强（requiresAuth / title 必填），见 route-meta.ts 的说明。
+import './route-meta'
 
 /**
  * 教师端路由表（§55「页面规划 · Teacher」）。
@@ -21,13 +25,28 @@ export const routes: RouteRecordRaw[] = [
   { path: '/', redirect: '/teacher/login' },
 
   // Phase 1：密码登录（§39）。
-  { path: '/teacher/login', name: 'teacher-login', component: LoginView },
+  {
+    path: '/teacher/login',
+    name: 'teacher-login',
+    component: LoginView,
+    meta: { requiresAuth: false, title: '教师登录' },
+  },
 
   // Phase 3：工作台概览（开启/关闭课堂的入口）。
-  { path: '/teacher/dashboard', name: 'teacher-dashboard', component: DashboardView },
+  {
+    path: '/teacher/dashboard',
+    name: 'teacher-dashboard',
+    component: DashboardView,
+    meta: { requiresAuth: true, title: '工作台' },
+  },
 
   // Phase 3：课堂列表。
-  { path: '/teacher/classrooms', name: 'teacher-classrooms', component: ClassroomsView },
+  {
+    path: '/teacher/classrooms',
+    name: 'teacher-classrooms',
+    component: ClassroomsView,
+    meta: { requiresAuth: true, title: '我的课堂' },
+  },
 
   // Phase 3：新建课堂。
   // WHY 必须排在 '/teacher/classrooms/:id' 之前：静态段虽然优先级更高，
@@ -36,6 +55,7 @@ export const routes: RouteRecordRaw[] = [
     path: '/teacher/classrooms/new',
     name: 'teacher-classroom-new',
     component: ClassroomNewView,
+    meta: { requiresAuth: true, title: '新建课堂' },
   },
 
   // Phase 3：课堂详情（改名、授权学生名单、开启/关闭）。
@@ -43,6 +63,7 @@ export const routes: RouteRecordRaw[] = [
     path: '/teacher/classrooms/:id',
     name: 'teacher-classroom-detail',
     component: ClassroomDetailView,
+    meta: { requiresAuth: true, title: '课堂详情' },
   },
 
   // Phase 7：老师监督台（学生桌面网格，§29）。
@@ -50,36 +71,43 @@ export const routes: RouteRecordRaw[] = [
     path: '/teacher/classrooms/:id/monitor',
     name: 'teacher-classroom-monitor',
     component: ClassroomMonitorView,
+    meta: { requiresAuth: true, title: '课堂监督台' },
   },
 ]
+
+/** 本 app 的守卫配置；三个 app 只有这张表不同，守卫逻辑由 guard.ts 统一实现。 */
+export const authGuardConfig: AuthGuardConfig = {
+  // GET /auth/me 走的就是本入口的会话，因此 role 理论上必然匹配。保留这项校验，
+  // 是为了让"会话串了入口"或"后端角色判定回归"立刻表现为"回登录页 + 明确提示"，
+  // 而不是渲染出一个所有请求都 403 的空数据界面。
+  role: 'TEACHER',
+  loginRouteName: 'teacher-login',
+  loginPath: '/teacher/login',
+  homeRouteName: 'teacher-dashboard',
+  roleMismatchNotice: '当前账号不是教师账号，已退出登录。请使用教师账号登录。',
+}
 
 export const router = createRouter({
   history: createWebHistory(),
   routes,
-  // 页面间跳转回到顶部：长列表（课堂、监督网格）进出时不保留旧滚动位置。
+  // 页面间跳转回到顶部：长列表进出时不保留旧滚动位置。
   scrollBehavior: () => ({ top: 0 }),
 })
 
-// ===========================================================================
-// Phase 1 的导航守卫插入点：就在本注释下方（router 创建之后）。
-//
-// 守卫顺序固定为「加载会话 → 校验角色 → 重定向」，三步缺一不可：
-//
-// 1) 加载会话：await useSessionStore().loadSession()（Phase 1 实现），
-//    即 GET /api/v1/teacher/auth/me；HttpOnly Cookie 由浏览器自动携带（§41）。
-//    WHY 必须先加载：刷新页面时 pinia 是空的，若直接判断 isAuthenticated，
-//    已登录老师会立刻被踢回登录页。
-//
-// 2) 校验角色：user.role 必须是 'TEACHER'。
-//    WHY 不跳转到学生端/管理端：三个入口物理分离（§5），跨 app 跳转会让会话与
-//    CORS allowlist 混乱；正确做法是清空本地会话并停留在本 app 的登录页。
-//
-// 3) 重定向：未登录 → /teacher/login；已登录访问 /teacher/login → /teacher/dashboard。
-//
-// WHY 前端守卫**不是**授权边界（§37 / §63）：
-// 守卫只能少发一次注定 403 的请求，属于 UX 优化。前端代码完全在用户控制之下
-// （DevTools、改包、直接 curl 接口都能绕过），所以后端仍必须对每个请求独立执行
-// Session Middleware → Load User → ACTIVE → RBAC → Resource Ownership；
-// 尤其是课堂的 open / close / monitor，必须校验 owner_teacher_id（§48/§49），
-// 绝不能因为"前端只显示了自己的课堂"就跳过 ownership 检查。
-// ===========================================================================
+/**
+ * 装上 Phase 1 守卫：加载会话 → 校验角色 → 重定向。
+ *
+ * 这里传的是"取会话 store 的函数"而不是 store 实例：本模块在 main.ts 里被 import
+ * 时 pinia 还没安装，而守卫真正执行是在首次导航（那时 pinia 已就绪）。
+ *
+ * 守卫**不**阻拦"会话未确认（网络失败）"的导航，见 guard.ts 末尾的说明；
+ * 真正的授权边界始终在后端（§37 / §63）。
+ */
+router.beforeEach(createAuthGuard(authGuardConfig, () => useSessionStore()))
+
+// 浏览器标签页标题跟着路由走：老师常常同时开着教师端与学生端联调，
+// 三个入口必须在标签栏上就能区分。
+router.afterEach((to) => {
+  const title = to.meta.title
+  if (title) document.title = `${title} · ClassWatch 教师端`
+})

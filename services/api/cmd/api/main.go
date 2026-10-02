@@ -23,6 +23,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/classwatch/classwatch/services/api/internal/auth"
+	"github.com/classwatch/classwatch/services/api/internal/auth/sessionstore"
 	"github.com/classwatch/classwatch/services/api/internal/config"
 	"github.com/classwatch/classwatch/services/api/internal/httpapi"
 	"github.com/classwatch/classwatch/services/api/internal/infrastructure/logging"
@@ -30,6 +32,8 @@ import (
 	"github.com/classwatch/classwatch/services/api/internal/infrastructure/postgres"
 	"github.com/classwatch/classwatch/services/api/internal/infrastructure/redis"
 	"github.com/classwatch/classwatch/services/api/internal/media"
+	"github.com/classwatch/classwatch/services/api/internal/ratelimit"
+	"github.com/classwatch/classwatch/services/api/internal/user"
 )
 
 // shutdownTimeout bounds graceful shutdown. Ten seconds is enough for in-flight
@@ -94,9 +98,11 @@ func run() error {
 	}
 
 	router := httpapi.NewRouter(httpapi.Deps{
-		Logger: logger,
-		Config: cfg,
-		Ready:  deps.readiness(),
+		Logger:  logger,
+		Config:  cfg,
+		Ready:   deps.readiness(),
+		Auth:    deps.authService(logger, cfg),
+		Limiter: deps.rateLimiter(logger),
 	})
 
 	server := &http.Server{
@@ -178,6 +184,49 @@ func (d *dependencies) close() {
 	if d.postgres != nil {
 		d.postgres.Close()
 	}
+}
+
+// authService builds the authentication service, or returns nil when PostgreSQL
+// is not connected.
+//
+// nil is not a fallback to "no authentication": httpapi.NewRouter simply does not
+// register the auth routes, so an API without a database answers 404 there
+// instead of accepting logins it could never verify. That is the honest behaviour
+// for the degraded mode STARTUP_REQUIRE_DEPENDENCIES=false enables.
+func (d *dependencies) authService(logger *slog.Logger, cfg *config.Config) httpapi.AuthService {
+	if d.postgres == nil {
+		logger.Warn("postgres is not connected; authentication routes are disabled",
+			"hint", "STARTUP_REQUIRE_DEPENDENCIES=false must only be used for local work")
+		return nil
+	}
+	pool := d.postgres.Pool()
+	return auth.NewService(
+		user.NewPostgres(pool),
+		sessionstore.New(pool),
+		auth.Config{
+			SessionTTL:        cfg.SessionTTL,
+			IdleTouchInterval: cfg.SessionIdleTouchInterval,
+			PasswordPolicy:    auth.NewPasswordPolicy(cfg.PasswordMinLength),
+		},
+	)
+}
+
+// rateLimiter builds the rate limiter: Redis when it is available, degrading to
+// per-process memory when it is not.
+//
+// WHY the fallback instead of failing: an unreachable Redis must not remove the
+// only protection a password-less student login has, and it must not turn a
+// cache outage into a login outage either. The fallback keeps both properties
+// (see internal/ratelimit/fallback.go); the log line is what makes the degraded
+// state visible.
+func (d *dependencies) rateLimiter(logger *slog.Logger) ratelimit.Limiter {
+	memory := ratelimit.NewMemory()
+	if d.redis == nil || d.redis.Client() == nil {
+		logger.Warn("redis is not connected; rate limiting runs in-memory only",
+			"consequence", "limits are per API process, not cluster-wide")
+		return memory
+	}
+	return ratelimit.NewFallback(ratelimit.NewRedis(d.redis.Client()), memory, logger)
 }
 
 // connectDependencies brings up PostgreSQL, Redis and the LiveKit client.

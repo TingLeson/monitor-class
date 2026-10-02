@@ -112,6 +112,12 @@ make migrate-status  # 已应用的迁移
 make db-shell        # psql
 make sql Q="select 1"
 
+# 账号（破窗工具，Phase 1 起）
+make create-admin    # 交互式创建初始管理员（密码不回显、不进 shell 历史）
+make create-user ROLE=TEACHER   # 创建老师 / 学生（make create-user ROLE=STUDENT）
+make reset-password ACCOUNT=teacher001
+make list-users      # 列出账号（可加 ROLE=STUDENT 过滤）
+
 # 质量
 make lint            # gofmt + go vet + ESLint + Prettier 检查
 make fmt             # 自动格式化 Go 与前端
@@ -119,6 +125,41 @@ make test            # Go 单测 + 前端单测
 make test-integration# 需要真实 PostgreSQL 的集成测试（复用 compose 里的实例）
 make ci              # 与 CI 等价的完整检查
 ```
+
+### 4.1 第一次使用：创建管理员与测试账号
+
+```bash
+make up                # 容器起来后 migrate 已自动应用迁移
+make create-admin      # 交互式输入 account / display name / password
+make create-user ROLE=TEACHER   # 造一个老师账号便于本地联调
+make create-user ROLE=STUDENT   # 学生账号不需要密码（业务规则，不是遗漏）
+make list-users
+```
+
+密码**只能**从标准输入传入：不支持命令行明文密码参数，避免它进入 shell history、`ps` 输出与 CI 日志。
+`adminctl` 运行在 `tools` profile 里，因此不会随 `make up` 启动。
+
+登录方式（Phase 1 起）：
+
+| 入口 | 登录凭据 | 相关文档 |
+| --- | --- | --- |
+| 学生端 `/student/login` | 仅账号（无密码、无注册，任务书 §2.2） | [authentication.md](../auth/authentication.md) |
+| 老师端 `/teacher/login` | 账号 + 密码（Argon2id） | 同上 |
+| 管理端 `/admin/login` | 账号 + 密码 | 同上 |
+
+当前这台开发机的本地库里已经存在下列**演示账号**（只存在于本地 Docker 数据卷中，
+执行 `make nuke` 会一并清空）：
+
+| 账号 | 密码 | 角色 | 显示名 |
+| --- | --- | --- | --- |
+| `admin` | `classwatch-admin-2026` | ADMIN | 系统管理员 |
+| `teacher001` | `classwatch-teacher-2026` | TEACHER | 李老师 |
+| `S10086` | 无（学生免密） | STUDENT | 张三 |
+| `S10087` | 无 | STUDENT | 李四 |
+| `S10088` | 无 | STUDENT | 王五 |
+
+> 这些是**本地开发占位凭据**，仅用于在这台机器上点开三个入口看效果。
+> 任何共享或生产环境都必须用 `make create-admin` 重新创建自己的账号与强密码。
 
 单独操作某个前端/包：
 

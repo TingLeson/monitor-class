@@ -370,17 +370,14 @@ classwatch/
 
 ## 10. Phase 0 的完成边界（现状）
 
-| 已完成 | 未完成（明确属于后续 Phase） |
-| --- | --- |
-| monorepo（3 前端 + 3 共享包 + Go API） | 登录 / Session / RBAC（Phase 1） |
-| `docker compose` 一键起 postgres/redis/livekit/api | 用户管理（Phase 2） |
-| `/healthz`、`/readyz`、`/api/v1/meta` | Classroom 领域与状态机（Phase 3） |
-| versioned migration 执行器（`0001_bootstrap.sql` 仅建扩展） | 学生课堂门户（Phase 4） |
-| 结构化日志、统一错误码、优雅关闭、CORS allowlist | 屏幕共享 Gate（Phase 5）与 LiveKit 接入（Phase 6 起） |
-| Lint / Format / Test / CI | 多学生监督墙、事件、摄像头、私密语音、生产加固、压测（Phase 7-12） |
-| 三个 SPA 的 §55 全部路由骨架 | 一切业务页面逻辑 |
+| Phase | 已完成 | 未完成（明确属于后续 Phase） |
+| --- | --- | --- |
+| 0 | monorepo（3 前端 + 3 共享包 + Go API）、`docker compose` 一键起 postgres/redis/livekit/api、`/healthz` `/readyz` `/api/v1/meta`、versioned migration 执行器、结构化日志、统一错误码、优雅关闭、CORS allowlist、Lint/Format/Test/CI、三个 SPA 的 §55 全部路由骨架 | —— |
+| 1 | 三种登录（学生免密 / 老师与管理员密码）、Argon2id、opaque session（服务端只存 hash）、按入口隔离的 Cookie 与 CSRF 防护、角色中间件与跨入口拒绝、停用账号立即失效、登录限流、`adminctl` 破窗工具、三个前端的登录页/会话/路由守卫 | 用户管理（Phase 2） |
+| 2–12 | —— | Classroom 领域与状态机（3）、学生课堂门户（4）、屏幕共享 Gate（5）、LiveKit 接入（6 起）、多学生监督墙（7）、事件与 WebSocket（8）、摄像头（9）、私密语音（10）、生产加固（11）、压测（12） |
 
-Phase 0 的验收标准只有一条：**`make dev` 能启动基础环境**（任务书 §66）。
+验收标准：Phase 0 是 **`make dev` 能启动基础环境**（任务书 §66）；
+Phase 1 是**三种角色都能登录、跨入口与停用账号都被服务端正确拒绝**（§67）。
 
 ---
 
@@ -388,6 +385,8 @@ Phase 0 的验收标准只有一条：**`make dev` 能启动基础环境**（任
 
 | 文档 | 内容 |
 | --- | --- |
+| [docs/auth/authentication.md](../auth/authentication.md) | 登录方式、密码存储、会话与 Cookie、CSRF、限流 |
+| [docs/auth/rbac.md](../auth/rbac.md) | 角色矩阵、请求授权链、401/403 语义、反模式清单 |
 | [docs/development/setup.md](../development/setup.md) | 本地环境搭建、命令、故障排查 |
 | [docs/development/workflow.md](../development/workflow.md) | 每个 Phase 的固定工作流程与 DoD |
 | [docs/database/schema.md](../database/schema.md) | 完整数据库设计、约束、迁移策略 |

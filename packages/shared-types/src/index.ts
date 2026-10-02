@@ -14,6 +14,16 @@ export type { IsoDateTime, Uuid } from './common'
 export { ROLES, USER_STATUSES, isRole, isUserStatus } from './user'
 export type { Role, User, UserStatus } from './user'
 
+export { SESSION_STATUSES, isAuthUser } from './auth'
+export type {
+  AuthMeResponse,
+  AuthUser,
+  LoginResponse,
+  PasswordLoginRequest,
+  SessionStatus,
+  StudentLoginRequest,
+} from './auth'
+
 export { CLASSROOM_STATUSES, isClassroomStatus } from './classroom'
 export type { Classroom, ClassroomRun, ClassroomStatus, ClassroomStudent } from './classroom'
 
@@ -41,6 +51,7 @@ export {
   BACKEND_API_ERROR_CODES,
   FRONTEND_LOCAL_ERROR_CODES,
   TRANSPORT_ERROR_CODES,
+  apiErrorMessage,
   isApiErrorCode,
   isFrontendLocalErrorCode,
 } from './api-error'

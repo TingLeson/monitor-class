@@ -97,10 +97,17 @@ func From(err error) *Error {
 // code describes the exact rule that was violated. Clients must branch on Code.
 func HTTPStatus(code Code) int {
 	switch code {
-	case CodeAuthRequired:
-		return http.StatusUnauthorized // 401 — a session could fix this
-	case CodeAccountDisabled, CodeRoleForbidden, CodeClassroomNotOwner:
+	case CodeAuthRequired, CodeInvalidCredentials:
+		// 401 — a different credential could fix this. Note that
+		// INVALID_CREDENTIALS covers "no such account" as well; the status must
+		// not differ between the two cases either.
+		return http.StatusUnauthorized
+	case CodeAccountDisabled, CodeRoleForbidden, CodeCSRFInvalid, CodeClassroomNotOwner:
 		return http.StatusForbidden // 403 — authenticated but not permitted
+	case CodeRateLimited:
+		// 429 with a Retry-After header set by the middleware; the code alone
+		// tells the frontend to back off instead of retrying in a loop.
+		return http.StatusTooManyRequests
 	case CodeClassroomNotFound, CodeSessionNotFound:
 		// 404 rather than 403 for "exists but is not yours" only where the
 		// resource id is already unguessable (UUID) and the caller has a

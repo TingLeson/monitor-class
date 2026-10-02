@@ -3,7 +3,9 @@ import { describe, expect, it } from 'vitest'
 import AppButton from '../components/AppButton.vue'
 import AppCard from '../components/AppCard.vue'
 import AppShell from '../components/AppShell.vue'
+import AppTextField from '../components/AppTextField.vue'
 import PhasePlaceholder from '../components/PhasePlaceholder.vue'
+import ProtectedRouteGate from '../components/ProtectedRouteGate.vue'
 import StatusDot from '../components/StatusDot.vue'
 
 describe('AppShell', () => {
@@ -16,6 +18,77 @@ describe('AppShell', () => {
     expect(wrapper.text()).toContain('ClassWatch')
     expect(wrapper.text()).toContain('学生端')
     expect(wrapper.find('main').html()).toContain('content')
+  })
+
+  it('没有 userName 时不渲染账号区（登录页不该出现"退出登录"）', () => {
+    const wrapper = mount(AppShell, { props: { subtitle: '学生端' } })
+
+    expect(wrapper.find('[data-testid="shell-account"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('退出登录')
+  })
+
+  it('传入 userName 时显示当前用户，并在点击时 emit logout（组件自身不认识 store/路由）', async () => {
+    const wrapper = mount(AppShell, { props: { userName: '张三' } })
+
+    expect(wrapper.find('[data-testid="shell-user-name"]').text()).toBe('张三')
+
+    await wrapper.find('[data-testid="shell-logout"]').trigger('click')
+
+    expect(wrapper.emitted('logout')).toHaveLength(1)
+  })
+
+  it('logoutPending 时禁用退出按钮，避免重复撤销会话', () => {
+    const wrapper = mount(AppShell, { props: { userName: '张三', logoutPending: true } })
+
+    expect(wrapper.find('[data-testid="shell-logout"]').attributes('disabled')).toBeDefined()
+  })
+})
+
+describe('AppTextField', () => {
+  it('label 通过 for/id 关联到输入框（点标签能聚焦，读屏能报出字段名）', () => {
+    const wrapper = mount(AppTextField, { props: { label: '账号', modelValue: '' } })
+
+    const label = wrapper.find('label')
+    const input = wrapper.find('input')
+    expect(label.attributes('for')).toBe(input.attributes('id'))
+  })
+
+  it('输入时 emit update:modelValue，回车时 emit enter', async () => {
+    const wrapper = mount(AppTextField, { props: { label: '账号', modelValue: '' } })
+
+    await wrapper.find('input').setValue('S10086')
+    await wrapper.find('input').trigger('keyup.enter')
+
+    expect(wrapper.emitted('update:modelValue')?.[0]).toEqual(['S10086'])
+    expect(wrapper.emitted('enter')).toHaveLength(1)
+  })
+
+  it('error 优先于 hint，并用 aria-invalid / aria-describedby 表达错误状态', () => {
+    const wrapper = mount(AppTextField, {
+      props: { label: '账号', modelValue: '', error: '请输入账号', hint: '提示' },
+    })
+
+    const input = wrapper.find('input')
+    expect(wrapper.text()).toContain('请输入账号')
+    expect(wrapper.text()).not.toContain('提示')
+    expect(input.attributes('aria-invalid')).toBe('true')
+    expect(input.attributes('aria-describedby')).toBeTruthy()
+  })
+
+  it('两个实例的 id 不相同（同一页面出现两个字段时 label 不会指错）', () => {
+    const first = mount(AppTextField, { props: { label: '账号', modelValue: '' } })
+    const second = mount(AppTextField, { props: { label: '密码', modelValue: '' } })
+
+    expect(first.find('input').attributes('id')).not.toBe(second.find('input').attributes('id'))
+  })
+})
+
+describe('ProtectedRouteGate', () => {
+  it('默认提示"正在确认登录状态"，并可通过 hint 说明原因', () => {
+    const wrapper = mount(ProtectedRouteGate, { props: { hint: '请检查网络连接。' } })
+
+    expect(wrapper.find('[role="status"]').text()).toContain('正在确认登录状态')
+    expect(wrapper.text()).toContain('请检查网络连接。')
   })
 })
 

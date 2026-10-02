@@ -11,7 +11,9 @@
 export { default as AppButton } from './components/AppButton.vue'
 export { default as AppCard } from './components/AppCard.vue'
 export { default as AppShell } from './components/AppShell.vue'
+export { default as AppTextField } from './components/AppTextField.vue'
 export { default as PhasePlaceholder } from './components/PhasePlaceholder.vue'
+export { default as ProtectedRouteGate } from './components/ProtectedRouteGate.vue'
 export { default as StatusDot } from './components/StatusDot.vue'
 
 export type { ButtonSize, ButtonVariant } from './components/AppButton.vue'

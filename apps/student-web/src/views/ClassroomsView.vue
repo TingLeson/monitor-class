@@ -1,12 +1,54 @@
 <script setup lang="ts">
-import { PhasePlaceholder } from '@classwatch/ui'
+import { useSessionStore } from '../stores/session'
+import { AppCard, PhasePlaceholder } from '@classwatch/ui'
 import { useRoute } from 'vue-router'
 
 const route = useRoute()
+const session = useSessionStore()
+
+/**
+ * 当前登录用户区块（Phase 1）。
+ *
+ * WHY 放在这里：刷新页面后仍能看到自己的名字，是"会话真的生效了"最直接的证据。
+ * 它显示的**只有后端返回的字段**——前端不缓存身份，也不据此做任何权限判断
+ * （授权边界在后端，§37）。
+ */
+function formatLastLogin(value: string | null | undefined): string {
+  if (!value) return '本次是首次登录'
+  // 保留字符串形态、只在展示层格式化（见 shared-types 的 IsoDateTime 说明）。
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.getTime()) ? '—' : parsed.toLocaleString()
+}
 </script>
 
 <template>
-  <div class="mx-auto max-w-3xl">
+  <div class="mx-auto flex max-w-3xl flex-col gap-6">
+    <AppCard data-testid="current-user-card">
+      <div class="space-y-1">
+        <p class="text-xs uppercase tracking-wide text-ink-muted">当前登录用户</p>
+        <p
+          v-if="session.user"
+          class="text-xl font-semibold tracking-tight"
+          data-testid="current-user-name"
+        >
+          {{ session.user.displayName }}
+        </p>
+        <p
+          v-else
+          class="text-xl font-semibold tracking-tight text-ink-muted"
+          data-testid="current-user-unknown"
+        >
+          尚未确认
+        </p>
+        <p v-if="session.user" class="text-sm text-ink-muted">
+          账号 {{ session.user.account }} · 上次登录 {{ formatLastLogin(session.user.lastLoginAt) }}
+        </p>
+        <p v-else class="text-sm text-ink-muted">
+          暂时无法连接服务器确认会话；功能恢复后会自动重新确认，不需要手动刷新。
+        </p>
+      </div>
+    </AppCard>
+
     <PhasePlaceholder
       :path="route.path"
       title="我的课堂"
