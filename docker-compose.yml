@@ -1,0 +1,156 @@
+# ============================================================================
+# ClassWatch 本地开发环境
+#
+#   make init     生成 .env（从 .env.example）
+#   make up       启动 postgres / redis / livekit / migrate / api
+#   make dev      启动上述容器，并在宿主前台运行三个前端 dev server
+#   make down     停止全部容器（保留数据卷）
+#
+# 设计说明：
+# 1) 控制面（api + postgres）是 Source of Truth；LiveKit 只是媒体面。
+#    因此 api 依赖 postgres/redis 健康后才启动，而 livekit 只需已启动。
+# 2) 所有密钥来自 .env（gitignored），compose 文件里不写死任何密钥。
+# 3) 前端不容器化：Phase 0~10 开发期用宿主的 `pnpm dev`（任务书 §61）。
+# 4) 迁移是一个**一次性服务**（migrate），不是藏在 API 启动流程里的副作用：
+#    api 等它成功退出后才启动，避免出现「服务起来了、schema 还是旧的」。
+# ============================================================================
+name: classwatch
+
+# 容器内共用的一套环境变量：api 与 migrate 必须看到完全一致的连接信息，
+# 否则「迁移连的是 A 库、服务连的是 B 库」这类事故迟早会发生。
+x-api-environment: &api-environment
+  APP_ENV: ${APP_ENV:-development}
+  API_ADDR: ':8080'
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  # 容器内用服务名互访，不能用 localhost。
+  DATABASE_URL: postgres://${POSTGRES_USER:-classwatch}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置：请先执行 make init}@postgres:5432/${POSTGRES_DB:-classwatch}?sslmode=disable
+  REDIS_ADDR: redis:6379
+  REDIS_DB: ${REDIS_DB:-0}
+  # 服务端调用 LiveKit 用容器内地址；下发给浏览器的地址必须是宿主可达地址。
+  LIVEKIT_API_URL: http://livekit:7880
+  LIVEKIT_URL: ${LIVEKIT_URL:-ws://localhost:7880}
+  LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?LIVEKIT_API_KEY 未设置：请先执行 make init}
+  LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?LIVEKIT_API_SECRET 未设置：请先执行 make init}
+  CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:5174,http://localhost:5175}
+  SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME:-classwatch_session}
+  SESSION_TTL: ${SESSION_TTL:-24h}
+  SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+  # PostgreSQL 是唯一 Source of Truth：依赖连不上时默认拒绝启动，
+  # 而不是带病运行、对外报告健康。
+  STARTUP_REQUIRE_DEPENDENCIES: ${STARTUP_REQUIRE_DEPENDENCIES:-true}
+  # 迁移由 migrate 服务显式执行；API 启动时不再自动迁移。
+  DB_AUTO_MIGRATE: 'false'
+
+x-api-image: &api-image
+  build:
+    context: ./services/api
+    dockerfile: Dockerfile
+    args:
+      VERSION: ${APP_VERSION:-0.1.0}
+      COMMIT: ${APP_COMMIT:-unknown}
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-classwatch}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置：请先执行 make init}
+      POSTGRES_DB: ${POSTGRES_DB:-classwatch}
+      # 固定 UTF8：学生的 display_name 是中文，编码必须在建库时就确定。
+      POSTGRES_INITDB_ARGS: '--encoding=UTF8'
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      # postgres:18 起 PGDATA 位于 /var/lib/postgresql/<major>/docker，
+      # 因此挂载父目录才能跨大版本安全保留数据。
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    # appendonly 保证本地重启后 session/限流数据不丢，行为更接近生产。
+    command: ['redis-server', '--appendonly', 'yes']
+    ports:
+      - '${REDIS_PORT:-6380}:6379'
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  livekit:
+    # 固定到具体补丁版本：LiveKit 的媒体行为会随小版本变化，dev/prod 必须一致。
+    image: livekit/livekit-server:v1.13.6
+    restart: unless-stopped
+    command: ['--config', '/etc/livekit.yaml']
+    environment:
+      # key/secret 只从 .env 注入，绝不写进仓库里的 yaml。
+      LIVEKIT_KEYS: '${LIVEKIT_API_KEY:?LIVEKIT_API_KEY 未设置：请先执行 make init}: ${LIVEKIT_API_SECRET:?LIVEKIT_API_SECRET 未设置：请先执行 make init}'
+    volumes:
+      - ./deploy/livekit/livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - '7880:7880' # HTTP API + WebSocket 信令
+      - '7881:7881' # RTC over TCP（受限网络下的兜底）
+      - '50000-50100:50000-50100/udp' # RTC over UDP
+    healthcheck:
+      # livekit-server 在 / 上返回 200 OK，用它判断信令端口已经可用。
+      test: ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:7880/ || exit 1']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # 一次性任务：应用 versioned SQL migration 后退出（退出码 0 = 成功）。
+  # 独立成服务而不是塞进 API 启动流程，是为了让「发布动作」在编排层可见、可重跑。
+  migrate:
+    <<: *api-image
+    restart: 'no'
+    entrypoint: ['/app/migrate']
+    command: ['up']
+    env_file:
+      - .env
+    environment:
+      <<: *api-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *api-image
+    restart: unless-stopped
+    # .env 提供密钥与默认值；environment 覆盖容器网络内的连接地址。
+    env_file:
+      - .env
+    environment:
+      <<: *api-environment
+    ports:
+      - '${API_PORT:-8090}:8080'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+      # schema 必须先就位，服务才允许开始接收请求。
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  pgdata:
+  redisdata:

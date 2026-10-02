@@ -1,0 +1,42 @@
+# ============================================================================
+# LiveKit 本地开发配置（单节点 SFU）
+#
+# 这个文件只描述「非机密」的媒体面参数。API key / secret 通过环境变量
+# LIVEKIT_KEYS 注入（见 docker-compose.yml），因此本文件可以安全提交到仓库。
+#
+# 关键设计（任务书 §8 / §33 / §44）：
+#   room.auto_create = false
+#     Room 必须由后端在 Classroom OPEN 的同一个事务语义下显式创建，
+#     名字是 opaque 的 lk_<classroom_run_uuid>。
+#     这样才能保证「LiveKit Room 存在」永远不会被误当成「Classroom 已开启」，
+#     也避免任何人拿着任意名字自助开房。
+# ============================================================================
+
+port: 7880
+
+rtc:
+  # 受限网络（校园网/企业防火墙）下 UDP 可能被封，保留 TCP 兜底端口。
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 50100
+  # 本地单机开发：容器只在一台机器上，不需要 STUN 探测公网地址。
+  # 生产环境（Phase 11）会改成 true 并配置 TURN/TLS 与固定 node_ip。
+  use_external_ip: false
+
+room:
+  auto_create: false
+  # 老师关闭课堂后，Room 由后端显式 Terminate；这里的超时只是兜底，
+  # 防止异常退出时留下永久房间。
+  empty_timeout: 300
+  departure_timeout: 20
+
+logging:
+  level: info
+  json: true
+
+# 开发期不启用 TURN：先让本机/同网段跑通，Phase 11 再做跨网络与 TURN/TLS。
+turn:
+  enabled: false
+
+# keys 故意留空：由 LIVEKIT_KEYS 环境变量提供，仓库中不出现任何密钥。
+keys: {}

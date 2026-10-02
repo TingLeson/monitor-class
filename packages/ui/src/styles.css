@@ -1,0 +1,75 @@
+/**
+ * ClassWatch 共享主题（Tailwind v4，CSS-first 配置）。
+ *
+ * WHY 不生成 tailwind.config.js：v4 的设计就是把主题放在 CSS 里（@theme），
+ * 多一份 JS 配置会造成"两个真相"，而且 3 个 app + 1 个组件库之间无法共享 token。
+ * 三个 app 的 src/style.css 只做一件事：@import '@classwatch/ui/styles.css'。
+ */
+
+@import 'tailwindcss';
+
+/**
+ * 组件库自身的 class 必须显式登记来源。
+ *
+ * 原因：pnpm 把 @classwatch/ui 放在 node_modules 的符号链接里，而 Tailwind v4 的
+ * 自动内容探测只覆盖"当前项目"（也就是各个 app 的目录），不会进入依赖包。
+ * 少了这一行，AppButton / StatusDot 等组件用到的工具类不会被生成，
+ * 生产构建会出现"本地 dev 看着正常、build 后样式丢失"的假象。
+ * 路径相对于本文件：src/ 下的全部组件。
+ */
+@source './';
+
+@theme {
+  /**
+   * 状态色（§35：清晰状态颜色）。语义与 §7 / §12 的状态枚举对齐：
+   * - open      → 课堂 OPEN / 会话 ONLINE，正常运行
+   * - closed    → 课堂 CLOSED、会话已归档，中性灰
+   * - danger    → 屏幕中断（SCREEN_LOST）、连接断开
+   * - warning   → 需要老师关注（网络差、摄像头/麦克风异常）
+   * - neutral   → 状态未知（尚未收到任何事件）
+   */
+  --color-status-open: #16a34a;
+  --color-status-closed: #94a3b8;
+  --color-status-danger: #dc2626;
+  --color-status-warning: #d97706;
+  --color-status-neutral: #cbd5e1;
+
+  /* 中性面色：大量留白依赖层次分明的"白 + 极浅灰 + 细边框"。 */
+  --color-surface: #ffffff;
+  --color-surface-muted: #f8fafc;
+  --color-border-subtle: #e2e8f0;
+  --color-ink: #0f172a;
+  --color-ink-muted: #64748b;
+
+  /* 字体：中文优先落到系统字体，避免为骨架引入 Web Font 拖慢首屏。 */
+  --font-sans:
+    'Inter', system-ui, -apple-system, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei',
+    sans-serif;
+
+  /* 圆角令牌：卡片比控件更圆，形成"容器 > 控件"的视觉层级。 */
+  --radius-card: 0.875rem;
+  --radius-control: 0.5rem;
+
+  /* 间距令牌：页面级留白（px-page / py-section），让三个 app 的版心一致。 */
+  --spacing-page: 1.5rem;
+  --spacing-section: 2.5rem;
+
+  /* 阴影只用于卡片，避免 Dashboard 变成"到处发光"的模板感。 */
+  --shadow-card: 0 1px 2px 0 rgb(15 23 42 / 0.04), 0 1px 3px 0 rgb(15 23 42 / 0.06);
+}
+
+/* 骨架阶段的全局基线：统一字体与浅灰底，禁止浏览器默认蓝链接破坏低噪声风格。 */
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--color-surface-muted);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+}

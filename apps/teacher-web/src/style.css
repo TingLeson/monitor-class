@@ -1,0 +1,8 @@
+/**
+ * 教师端样式入口。
+ *
+ * 只做一件事：加载 @classwatch/ui 暴露的共享主题（Tailwind v4 的 @theme 令牌 +
+ * 组件库 @source 扫描范围）。三个 app 共用同一份主题，禁止在这里重定义 token，
+ * 否则三个入口的视觉会各自漂移。
+ */
+@import '@classwatch/ui/styles.css';

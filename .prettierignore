@@ -1,0 +1,21 @@
+# 人工维护的任务书正文。格式化会重排全文、淹没真实改动，pnpm format 必须跳过它。
+开发任务书.md
+
+# 文档由作者手写（架构图、表格对齐是刻意的），不接受无人值守重排。
+docs/**
+
+# Go 代码由 gofmt 管理；services/** 属于后端负责人的目录，前端工具链不得改写。
+services/**
+services/api/**
+
+# CI 工作流与本地编排文件由运维/后端维护，避免 prettier 重排 YAML 造成无意义 diff。
+.github/**
+docker-compose.yml
+Makefile
+
+# 依赖与产物
+node_modules
+dist
+coverage
+pnpm-lock.yaml
+*.tsbuildinfo

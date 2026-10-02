@@ -1,0 +1,26 @@
+# pnpm workspace 定义。
+# 三个 Web 入口（student/teacher/admin）与共享包必须位于同一 workspace，
+# 这样才能通过 workspace:* 协议共享 packages/*，而不需要发版或复制代码。
+packages:
+  - 'apps/*'
+  - 'packages/*'
+
+# pnpm 11 默认拒绝安装"发布未满最小年龄"的版本（供应链投毒防护）。
+# 我们为了让前后端工具链保持一致，选了当时的最新稳定版，其中三个发布时间不足 24 小时，
+# 因此在首次安装时必须显式豁免，否则 `pnpm install` 会以
+# ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION 直接失败。
+#
+# 这是一段**有到期日的临时配置**：等这三个版本发布满最小年龄后即可删除本段
+# （删除后请重跑 `pnpm install` 与 `pnpm ci` 验证）。
+# 版本本身已被 pnpm-lock.yaml + package.json 精确锁定，不存在漂移风险。
+minimumReleaseAgeExclude:
+  - '@types/node@26.6.4'
+  - '@vue/language-core@3.3.12'
+  - vue-tsc@3.3.12
+
+# pnpm 出于安全默认禁止依赖执行安装期脚本。
+# 以下依赖需要构建原生产物（esbuild / Tailwind oxide）或运行时胶水代码（vue-demi）。
+onlyBuiltDependencies:
+  - esbuild
+  - '@tailwindcss/oxide'
+  - vue-demi

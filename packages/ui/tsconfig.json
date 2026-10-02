@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // 组件库需要 DOM 类型（模板/事件）与 node 类型（vitest.config.ts 由 Node 执行）。
+    // .vue 只有 vue-tsc 能检查，所以 typecheck 脚本用 vue-tsc 而不是 tsc：
+    // 用 tsc 会静默跳过全部 SFC，等于没检查 §83 要求的 DoD。
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    "jsx": "preserve",
+    "jsxImportSource": "vue"
+  },
+  "include": ["src/**/*.ts", "src/**/*.vue", "vitest.config.ts"]
+}

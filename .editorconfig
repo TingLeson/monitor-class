@@ -1,0 +1,24 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[*.go]
+# Go 社区标准：tab 缩进。
+indent_style = tab
+
+[*.sql]
+indent_size = 2
+
+[Makefile]
+# Makefile 的缩进必须是 tab，否则 make 直接报错。
+indent_style = tab
+
+[*.md]
+# Markdown 里的行尾空格有时是有意义的（换行、表格对齐）。
+trim_trailing_whitespace = false

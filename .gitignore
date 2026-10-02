@@ -1,0 +1,38 @@
+# ---------- Node / pnpm ----------
+node_modules/
+.pnpm-store/
+.vite/
+coverage/
+*.tsbuildinfo
+
+# ---------- 构建产物 ----------
+dist/
+build/
+bin/
+tmp/
+
+# ---------- 环境变量与密钥 ----------
+# .env 保存本地开发密钥，永不入库；.env.example 是可以提交的模板。
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# ---------- Go ----------
+services/api/bin/
+services/api/tmp/
+*.test
+*.out
+coverage.out
+
+# ---------- 编辑器 / 操作系统 ----------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+!.vscode/extensions.json
+*.swp
+
+# ---------- 日志 ----------
+*.log
+logs/

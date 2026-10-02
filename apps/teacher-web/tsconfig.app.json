@@ -1,0 +1,9 @@
+{
+  "extends": ["@vue/tsconfig/tsconfig.dom.json", "../../tsconfig.base.json"],
+  "compilerOptions": {
+    // composite + noEmit：允许 `vue-tsc --build` 增量检查 .vue 文件而不产出 JS。
+    "composite": true,
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo"
+  },
+  "include": ["env.d.ts", "src/**/*.ts", "src/**/*.vue"]
+}

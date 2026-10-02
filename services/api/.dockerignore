@@ -1,0 +1,31 @@
+# Keep the build context small and reproducible.
+#
+# A smaller context is not just faster: anything copied into the image is a place
+# a stray .env or a developer's local secret file could end up baked into a layer
+# where it is readable forever.
+
+# Build artifacts: always regenerated, never a source of truth.
+bin/
+tmp/
+*.test
+*.out
+coverage.*
+
+# Local configuration. .env holds real credentials locally and must never enter an
+# image layer.
+.env
+.env.*
+!.env.example
+
+# Version control and editor noise: not needed by `go build`, and .git can be
+# surprisingly large.
+.git
+.gitignore
+.github
+.vscode
+.idea
+.DS_Store
+
+# Documentation and CI files do not affect the binaries.
+*.md
+Makefile

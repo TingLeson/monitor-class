@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // lib 需要 DOM：客户端使用 fetch / RequestInit / Response / AbortSignal 等浏览器 API。
+    // types 需要 node：vitest.config.ts 由 Node 执行。
+    "lib": ["ES2022", "DOM"],
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts", "vitest.config.ts"]
+}

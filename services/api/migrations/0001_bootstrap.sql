@@ -1,0 +1,48 @@
+-- 0001_bootstrap.sql
+--
+-- Phase 0 creates no business tables on purpose.
+--
+-- WHY: the schema is the most expensive thing to change later, and it must follow
+-- the phase plan rather than anticipate it (§60). Phase 0 only proves that the
+-- migration pipeline itself works end to end: versioned, ordered, recorded in
+-- schema_migrations, applied exactly once. Every later phase adds its own
+-- numbered file:
+--
+--   0002_users.sql               (Phase 1: accounts, roles, password hashes)
+--   0003_classrooms.sql          (Phase 3: classrooms + teacher ownership)
+--   0004_classroom_students.sql  (Phase 3: assignment of students to classrooms)
+--   0005_classroom_runs.sql      (Phase 3: one OPEN period == one LiveKit room)
+--   0006_student_sessions.sql    (Phase 6: per-student join sessions)
+--   0007_session_events.sql      (Phase 6+: append-only audit/event log)
+--
+-- Creating an empty 0002 with guessed columns would be worse than creating
+-- nothing: an unused table accumulates assumptions that later have to be
+-- migrated away, and half-guessed columns invite half-guessed code.
+--
+-- What Phase 0 *does* need from the database are the two extensions below. They
+-- are installed here, once, so that every later table can rely on them without
+-- each migration having to remember (and without failing midway through a
+-- migration that assumed a missing extension).
+
+-- pgcrypto provides gen_random_uuid().
+--
+-- WHY UUID primary keys everywhere: identifiers are exposed to browsers (URLs,
+-- WebSocket messages, LiveKit room names). Sequential integers leak how many
+-- classrooms exist, invite guessing which id belongs to someone else, and make it
+-- easy to build an authorization check around "id < something". Random UUIDs make
+-- identifiers unguessable, which is a defence in depth on top of the real
+-- server-side authorization that every phase must still implement (§37/§63).
+--
+-- gen_random_uuid() has been in core PostgreSQL since 13, but installing pgcrypto
+-- keeps this migration correct on any supported server version and documents the
+-- intent explicitly.
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- citext provides case-insensitive text.
+--
+-- WHY it is needed in Phase 1: account login identifiers must be unique and
+-- case-insensitive, so "ZhangSan" and "zhangsan" cannot become two accounts —
+-- exactly the ambiguity an impersonation attempt relies on. Enforcing this in the
+-- database (a unique citext column) rather than in application code means no
+-- future code path, batch import or manual fix can bypass it.
+CREATE EXTENSION IF NOT EXISTS "citext";

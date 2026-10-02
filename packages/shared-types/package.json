@@ -1,0 +1,25 @@
+{
+  "name": "@classwatch/shared-types",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ClassWatch 全前端共享的类型契约：领域模型、状态枚举、API DTO、错误码（纯 TS 源码包，无构建步骤，exports/types 直接指向 src/index.ts）",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

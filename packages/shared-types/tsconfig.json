@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // 纯类型/常量包：只加载 ES 标准库，不引入任何 @types，防止 DOM/Node 全局泄漏进来。
+    "lib": ["ES2022"],
+    "types": []
+  },
+  "include": ["src/**/*.ts"]
+}
