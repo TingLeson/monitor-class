@@ -24,6 +24,24 @@ export type {
   StudentLoginRequest,
 } from './auth'
 
+export {
+  ADMIN_CREATABLE_ROLES,
+  ADMIN_USER_PAGE_SIZE_DEFAULT,
+  ADMIN_USER_PAGE_SIZE_MAX,
+  PASSWORD_MIN_LENGTH,
+} from './admin-user'
+export type {
+  AdminCreatableRole,
+  AdminUser,
+  AdminUserListQuery,
+  AdminUserListResponse,
+  CreateUserRequest,
+  ResetTeacherPasswordRequest,
+  ResetTeacherPasswordResponse,
+  UpdateDisplayNameRequest,
+  UpdateUserStatusRequest,
+} from './admin-user'
+
 export { CLASSROOM_STATUSES, isClassroomStatus } from './classroom'
 export type { Classroom, ClassroomRun, ClassroomStatus, ClassroomStudent } from './classroom'
 

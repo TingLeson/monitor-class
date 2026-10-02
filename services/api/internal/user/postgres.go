@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -178,6 +179,238 @@ func roleFilterValue(role *Role) any {
 		return nil
 	}
 	return string(*role)
+}
+
+// statusFilterValue is roleFilterValue for the status filter.
+func statusFilterValue(status *Status) any {
+	if status == nil {
+		return nil
+	}
+	return string(*status)
+}
+
+// listFilterClause builds the WHERE clause shared by the COUNT and the page query.
+//
+// WHY one builder for both: the total and the page must be computed from exactly
+// the same predicate. Two hand-maintained copies of a five-condition filter is
+// how "the list shows 12 rows but the counter says 11" bugs are born.
+//
+// The search term is bound as a parameter — never concatenated into the statement
+// (§63) — and matched with ILIKE because it is a substring filter, not an
+// equality test; the wildcards are added to the parameter, so a `%` typed by the
+// admin is matched literally as part of their input rather than being interpreted
+// as "match everything".
+func listFilterClause(filter ListFilter) (string, []any) {
+	clause := `
+		 WHERE ($1::text IS NULL OR role = $1)
+		   AND ($2::text IS NULL OR status = $2)
+		   AND ($3::text = '' OR account ILIKE $4 OR display_name ILIKE $4)`
+	pattern := "%" + strings.TrimSpace(filter.Query) + "%"
+	return clause, []any{
+		roleFilterValue(filter.Role),
+		statusFilterValue(filter.Status),
+		strings.TrimSpace(filter.Query),
+		pattern,
+	}
+}
+
+// ListPage returns one page of accounts plus the total the filter matched.
+//
+// The ORDER BY is `created_at DESC, id DESC` and the second key is not
+// decoration. created_at defaults to now(), which in PostgreSQL is the
+// TRANSACTION timestamp: every account created by one seeding transaction (or by
+// two requests that commit in the same microsecond) shares a timestamp exactly.
+// Ordering by created_at alone leaves those ties in an arbitrary, plan-dependent
+// order that can differ between the COUNT query, page 1 and page 2 — so an admin
+// paging through the list sees a row twice and never sees another. The primary
+// key breaks every tie deterministically.
+func (p *Postgres) ListPage(ctx context.Context, filter ListFilter) (*ListResult, error) {
+	if p == nil || p.pool == nil {
+		return nil, errors.New("user: repository is not connected")
+	}
+	if filter.Limit <= 0 {
+		// Refusing beats defaulting: a caller that forgot the page size would
+		// otherwise get the whole table, and the mistake would only show up as
+		// latency on a database nobody is watching.
+		return nil, errors.New("user: ListPage requires a positive limit")
+	}
+	if filter.Offset < 0 {
+		return nil, errors.New("user: ListPage requires a non-negative offset")
+	}
+
+	clause, args := listFilterClause(filter)
+
+	// Two statements, one predicate: the count answers "how many pages are
+	// there?", the page answers "what is on this one?". They are deliberately not
+	// wrapped in a transaction: a row created between them changes the total by
+	// one, which is a cosmetic rounding difference, while holding a transaction
+	// open across two full scans would be a real cost on every admin page load.
+	total := 0
+	if err := p.pool.QueryRow(ctx, `SELECT count(*) FROM users`+clause, args...).Scan(&total); err != nil {
+		return nil, err
+	}
+
+	pageArgs := append(append([]any{}, args...), filter.Limit, filter.Offset)
+	query := `SELECT ` + userColumns + ` FROM users` + clause +
+		` ORDER BY created_at DESC, id DESC LIMIT $5 OFFSET $6`
+
+	rows, err := p.pool.Query(ctx, query, pageArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	// Non-nil empty slice: an admin looking at an empty filter result must get
+	// `"users": []`, not `"users": null`, or every frontend needs a null check
+	// before it can call .map().
+	out := make([]User, 0, min(filter.Limit, 64))
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return &ListResult{Users: out, Total: total}, nil
+}
+
+// UpdateDisplayName rewrites the display name.
+//
+// The name is validated by the caller (ValidateDisplayName) so the operator gets
+// a readable message; the users_display_name_not_blank constraint remains the
+// last line of defence. updated_at is bumped explicitly because the table has no
+// trigger by design (see migrations/0002), and a display-name change that leaves
+// updated_at untouched would make the admin list's "last modified" column lie.
+func (p *Postgres) UpdateDisplayName(ctx context.Context, id uuid.UUID, displayName string) error {
+	if p == nil || p.pool == nil {
+		return errors.New("user: repository is not connected")
+	}
+	tag, err := p.pool.Exec(ctx,
+		`UPDATE users SET display_name = $2, updated_at = now() WHERE id = $1`, id, displayName)
+	if err != nil {
+		return translateWriteError(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetStatus switches an account between ACTIVE and DISABLED.
+//
+// Setting the status the row already has is a successful write (idempotent): the
+// caller's intent — "this account must be ACTIVE/DISABLED" — is already true, so
+// answering ErrNotFound or a conflict would only make the admin UI special-case a
+// no-op.
+//
+// The third condition is the important one. It refuses the ACTIVE→DISABLED
+// transition of the LAST active admin *inside the statement*, where the check and
+// the write are one atomic operation:
+//
+//	WHERE id = $1
+//	  AND (status <> 'DISABLED' OR ...)          -- only guard the real transition
+//	  AND (role <> 'ADMIN' OR EXISTS (           -- an active admin must remain
+//	        SELECT 1 FROM users
+//	         WHERE role = 'ADMIN' AND status = 'ACTIVE' AND id <> $1))
+//
+// WHY in SQL and not only in the service: two admins clicking "disable" on each
+// other at the same moment both pass a read-then-write check in Go (each sees the
+// other as active), and both updates then succeed — leaving a deployment with no
+// administrator at all and no way back in except the adminctl break-glass CLI.
+// PostgreSQL evaluates this condition under the row locks it takes for the
+// UPDATE, so the second statement sees the first one's effect and matches no row.
+// The service performs the same check first purely to produce a readable message
+// on the common, non-racing path.
+func (p *Postgres) SetStatus(ctx context.Context, id uuid.UUID, status Status) error {
+	if p == nil || p.pool == nil {
+		return errors.New("user: repository is not connected")
+	}
+	// The decision is computed ONCE, in a CTE, and the write then executes it.
+	//
+	// WHY a CTE instead of conditions inline in SET: the "may this account be
+	// disabled?" answer is needed twice — once to decide the new status, once to
+	// decide whether updated_at is touched — and duplicating that predicate is how
+	// the two halves of one rule drift apart. Reading it from the row's OLD values
+	// (which is what a CTE attached to the same statement sees) is also what makes
+	// a DISABLED→DISABLED write distinguishable from an ACTIVE→DISABLED one, which
+	// the WHERE clause cannot do: WHERE sees the new row version, where
+	// `status <> 'DISABLED'` is true for both.
+	//
+	// The guard is evaluated by the statement itself, under the row locks the UPDATE
+	// takes, so two administrators disabling each other concurrently cannot both
+	// pass: the second statement re-reads the row, finds no other ACTIVE ADMIN and
+	// refuses. That is the whole reason the rule is here and not only in the
+	// service, where the classic read-then-write race would leave the deployment
+	// with no administrator at all.
+	const query = `
+		WITH target AS (
+		    SELECT id, status, role,
+		           (role = 'ADMIN'
+		            AND status = 'ACTIVE'
+		            AND NOT EXISTS (SELECT 1 FROM users other
+		                             WHERE other.role = 'ADMIN'
+		                               AND other.status = 'ACTIVE'
+		                               AND other.id <> users.id)) AS is_last_admin
+		      FROM users
+		     WHERE id = $1
+		)
+		UPDATE users u
+		   SET status = CASE
+		                  WHEN $2 = 'DISABLED' AND t.is_last_admin THEN t.status
+		                  ELSE $2
+		                END,
+		       updated_at = CASE
+		                      WHEN t.status IS DISTINCT FROM (
+		                             CASE
+		                               WHEN $2 = 'DISABLED' AND t.is_last_admin THEN t.status
+		                               ELSE $2
+		                             END)
+		                      THEN now()
+		                      ELSE u.updated_at
+		                    END
+		  FROM target t
+		 WHERE u.id = t.id
+		RETURNING u.status`
+
+	var resulting string
+	err := p.pool.QueryRow(ctx, query, id, string(status)).Scan(&resulting)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// With the guard expressed as a value and not as a filter, the only way
+			// to match no row is that the account does not exist.
+			return ErrNotFound
+		}
+		return translateWriteError(err)
+	}
+	// The row exists but still carries its previous status: the guard refused the
+	// ACTIVE→DISABLED transition of the last administrator. Reporting the rule
+	// rather than the row is what keeps a concurrent double-disable from looking
+	// like a success.
+	if Status(resulting) != status && status == StatusDisabled {
+		return ErrLastAdmin
+	}
+	return nil
+}
+
+// CountActiveAdmins counts the ADMIN accounts that can still log in.
+//
+// It is the read side of the "never disable the last administrator" rule: the
+// service asks before writing so the admin gets "this is the last active
+// administrator" instead of a rejection it cannot explain.
+func (p *Postgres) CountActiveAdmins(ctx context.Context) (int, error) {
+	if p == nil || p.pool == nil {
+		return 0, errors.New("user: repository is not connected")
+	}
+	var count int
+	err := p.pool.QueryRow(ctx,
+		`SELECT count(*) FROM users WHERE role = 'ADMIN' AND status = 'ACTIVE'`).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 // scanUser reads one row of userColumns.

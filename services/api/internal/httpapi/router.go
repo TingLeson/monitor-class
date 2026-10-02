@@ -36,6 +36,11 @@ type Deps struct {
 	// and for tests that do not care about authentication, and no request can
 	// reach a handler with a nil service behind it.
 	Auth AuthService
+	// Admin is the account-administration service (§4/§68). Like Auth, a nil
+	// value means the admin routes are simply not registered: an API with no
+	// database answers 404 there instead of serving a management surface it
+	// cannot back with data.
+	Admin AdminService
 	// Limiter protects /api/v1 and, more strictly, the login endpoints. A nil
 	// value installs no rate limiting at all, which is only appropriate in tests:
 	// §2.2/§63 make it mandatory in every real deployment, and main always wires
@@ -133,6 +138,7 @@ func NewRouter(deps Deps) *gin.Engine {
 	}
 
 	registerAuthRoutes(v1, deps, resolver, entries)
+	registerAdminRoutes(v1, deps, entries)
 
 	// Unknown routes and methods must go through the same error envelope as a
 	// handler failure. gin's defaults are bare text ("404 page not found"), which
@@ -192,8 +198,64 @@ func registerAuthRoutes(v1 *gin.RouterGroup, deps Deps, resolver *ClientIPResolv
 	}
 }
 
-// noRouteHandler renders 404/405 in the standard envelope.
+// registerAdminRoutes mounts /api/v1/admin/** — the account administration
+// surface of §4/§42/§68.
 //
+// Every route in this group goes through the SAME three layers, and the structure
+// is what guarantees it rather than a reviewer remembering:
+//
+//   - RequireSession(admin entry): the caller holds a live session presented
+//     through the ADMIN cookie, resolved against the database on every request.
+//   - RequireRole(ADMIN): that session's account really has the ADMIN role. The
+//     check is an equality test against the row, never against the cookie, so a
+//     teacher or student session cannot satisfy it (§37).
+//   - CSRFProtection on every route that can change state. Reads are exempt
+//     because a GET from another origin is not a state change; the exempt set is
+//     exactly the two read routes and nothing else.
+//
+// The nesting matters: writes are mounted on an inner group that has no read
+// routes in it, so adding a write endpoint to the wrong group is the only way to
+// lose the CSRF check — and there is no wrong group to add it to.
+func registerAdminRoutes(v1 *gin.RouterGroup, deps Deps, entries []AuthEntry) {
+	adminEntry, ok := entryForRole(entries, user.RoleAdmin)
+	if !ok || deps.Admin == nil || deps.Auth == nil {
+		// No admin entry (no configuration) or no admin service (no database):
+		// the routes are not registered, so the endpoints answer 404 rather than
+		// existing without an authorization chain in front of them.
+		return
+	}
+
+	mw := newAuthMiddleware(deps.Auth, entries, deps.Config)
+	handlers := newAdminHandlers(deps.Admin)
+
+	group := v1.Group("/admin")
+	group.Use(
+		mw.RequireSession(adminEntry),
+		mw.RequireRole(adminEntry),
+	)
+
+	group.GET("/users", handlers.listUsers())
+	group.GET("/users/:id", handlers.getUser())
+
+	writes := group.Group("")
+	writes.Use(mw.CSRFProtection(adminEntry))
+	writes.POST("/users", handlers.createUser())
+	writes.PATCH("/users/:id", handlers.updateUser())
+	writes.PATCH("/users/:id/status", handlers.setStatus())
+	writes.POST("/teachers/:id/reset-password", handlers.resetTeacherPassword())
+}
+
+// entryForRole finds the entry point of one role.
+func entryForRole(entries []AuthEntry, role user.Role) (AuthEntry, bool) {
+	for _, entry := range entries {
+		if entry.Role == role {
+			return entry, true
+		}
+	}
+	return AuthEntry{}, false
+}
+
+// noRouteHandler renders 404/405 in the standard envelope.
 // The code is INVALID_REQUEST in both cases: from the client's point of view the
 // request targets something this API does not serve, and one code keeps the
 // frontend's error handler small. The HTTP status still separates "wrong path"

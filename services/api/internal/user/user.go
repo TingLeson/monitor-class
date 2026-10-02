@@ -130,6 +130,13 @@ var (
 	// client — a raw "duplicate key value violates unique constraint
 	// users_account_key" is both unhelpful and an information leak.
 	ErrAccountTaken = errors.New("user: account already exists")
+
+	// ErrLastAdmin means the requested transition would leave the deployment with
+	// no active ADMIN, i.e. nobody able to manage accounts any more. It is
+	// returned by SetStatus, which enforces the rule inside the statement: a
+	// read-then-write check in the service alone would let two concurrent
+	// "disable the other admin" requests both pass.
+	ErrLastAdmin = errors.New("user: refusing to disable the last active admin")
 )
 
 // accountPattern mirrors the users_account_format CHECK constraint exactly.
@@ -180,6 +187,40 @@ type CreateParams struct {
 	CreatedBy    *uuid.UUID
 }
 
+// ListFilter is the query of the admin account list (§68).
+//
+// Nil pointers mean "no filter on this field"; there is deliberately no "empty
+// string means no filter" convention, because `q=""` from a frontend search box
+// and "the client sent no q at all" must not be able to diverge in behaviour.
+type ListFilter struct {
+	// Role, when set, keeps only that role. ADMIN is included: an admin must be
+	// able to see the other admins in order to answer "who else can do this?".
+	Role *Role
+	// Status, when set, keeps only ACTIVE or DISABLED accounts.
+	Status *Status
+	// Query, when non-empty, is matched case-insensitively against the account
+	// AND the display name. Both are included because an admin looking for a
+	// person may know either one — and the account is the only identifier that is
+	// guaranteed unique.
+	Query string
+	// Limit is the page size. Must be > 0: a repository that silently defaults to
+	// "everything" turns a paging bug into a full-table load.
+	Limit int
+	// Offset skips that many rows of the filtered, stably ordered result.
+	Offset int
+}
+
+// ListResult is one page of accounts plus the total number of rows the filter
+// matched.
+//
+// WHY Total is part of the same call: the admin list renders "1-50 of 123". A
+// separate COUNT endpoint would let the two numbers come from different moments,
+// which shows up as a page counter that never settles.
+type ListResult struct {
+	Users []User
+	Total int
+}
+
 // Repository is the persistence contract for accounts.
 //
 // It is an interface so the auth service and the HTTP middleware can be unit
@@ -190,7 +231,8 @@ type Repository interface {
 	FindByAccount(ctx context.Context, account string) (*User, error)
 	// FindByID looks an account up by primary key.
 	FindByID(ctx context.Context, id uuid.UUID) (*User, error)
-	// Create inserts an account and returns the stored row.
+	// Create inserts an account and returns the stored row. A duplicate account
+	// (in any letter case — the column is citext) surfaces as ErrAccountTaken.
 	Create(ctx context.Context, params CreateParams) (*User, error)
 	// TouchLastLogin records a successful login. Best effort by contract: a
 	// failure here must never fail the login itself.
@@ -200,4 +242,19 @@ type Repository interface {
 	SetPasswordHash(ctx context.Context, id uuid.UUID, hash string) error
 	// List returns accounts, optionally filtered by role, newest first.
 	List(ctx context.Context, role *Role) ([]User, error)
+	// ListPage returns one page of accounts plus the filtered total, ordered by
+	// created_at DESC, id DESC. The order is stable, which is what makes paging
+	// through the admin list unable to repeat or skip a row.
+	ListPage(ctx context.Context, filter ListFilter) (*ListResult, error)
+	// UpdateDisplayName rewrites the display name and bumps updated_at.
+	UpdateDisplayName(ctx context.Context, id uuid.UUID, displayName string) error
+	// SetStatus switches an account between ACTIVE and DISABLED.
+	//
+	// The ACTIVE→DISABLED transition refuses to remove the last active ADMIN and
+	// returns ErrLastAdmin: that check is repeated inside the statement so two
+	// concurrent "disable the other admin" requests cannot both pass a
+	// read-then-write check and leave the deployment with no administrator.
+	SetStatus(ctx context.Context, id uuid.UUID, status Status) error
+	// CountActiveAdmins reports how many ADMIN accounts can still log in.
+	CountActiveAdmins(ctx context.Context) (int, error)
 }

@@ -8,13 +8,23 @@
  * 由 app 的 src/style.css 引入，组件自身不 import CSS，避免重复注入主题。
  */
 
+export { default as AppAlert } from './components/AppAlert.vue'
+export { default as AppBadge } from './components/AppBadge.vue'
 export { default as AppButton } from './components/AppButton.vue'
 export { default as AppCard } from './components/AppCard.vue'
+export { default as AppEmptyState } from './components/AppEmptyState.vue'
+export { default as AppModal } from './components/AppModal.vue'
+export { default as AppPagination } from './components/AppPagination.vue'
+export { default as AppSelect } from './components/AppSelect.vue'
 export { default as AppShell } from './components/AppShell.vue'
+export { default as AppTable } from './components/AppTable.vue'
 export { default as AppTextField } from './components/AppTextField.vue'
 export { default as PhasePlaceholder } from './components/PhasePlaceholder.vue'
 export { default as ProtectedRouteGate } from './components/ProtectedRouteGate.vue'
 export { default as StatusDot } from './components/StatusDot.vue'
 
+export type { AlertTone } from './components/AppAlert.vue'
+export type { BadgeTone } from './components/AppBadge.vue'
 export type { ButtonSize, ButtonVariant } from './components/AppButton.vue'
+export type { SelectOption } from './components/AppSelect.vue'
 export type { StatusTone } from './components/StatusDot.vue'

@@ -141,6 +141,34 @@ func Hash(password string) (string, error) {
 	return encodePHC(salt, key, argon2MemoryKiB, argon2Time, argon2Threads), nil
 }
 
+// NewGeneratedPassword mints a password the server hands to a human once.
+//
+// WHY the server generates instead of an administrator inventing one: a password
+// an admin chooses for somebody else is exactly where the weak patterns live
+// (the school name, the term, a number), and it gets transmitted over whatever
+// channel the admin picks. A value from crypto/rand has no pattern to guess, and
+// because nobody has to remember it, there is no cost to making it long.
+//
+// The output is base64url without padding — alphanumeric plus `-`/`_` — so it
+// can be pasted into a shell, a JSON body or a chat client without escaping
+// surprises, and it is valid under the strictest policy this system can be
+// configured with (see PasswordPolicy.Validate; `size` bytes encode to more
+// characters than MaxPasswordLength only if a caller asks for something absurd,
+// which is the caller's problem to check).
+//
+// The returned value is the ONLY copy: it is never stored, never logged (§59)
+// and cannot be re-derived from the hash. Callers must hand it to the user once.
+func NewGeneratedPassword(size int) (string, error) {
+	if size <= 0 {
+		return "", errors.New("auth: generated password size must be positive")
+	}
+	buf := make([]byte, size)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("auth: generate password: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
 // Verify checks a password against a stored PHC string.
 //
 // Return contract:

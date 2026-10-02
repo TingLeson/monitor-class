@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/classwatch/classwatch/services/api/internal/admin"
 	"github.com/classwatch/classwatch/services/api/internal/auth"
 	"github.com/classwatch/classwatch/services/api/internal/auth/sessionstore"
 	"github.com/classwatch/classwatch/services/api/internal/config"
@@ -97,11 +98,16 @@ func run() error {
 		}
 	}
 
+	// Authentication and administration share one user repository and one
+	// session store: they are two views of the same accounts, and giving each its
+	// own would let them disagree about what a user row says.
+	users := deps.userRepository(logger)
 	router := httpapi.NewRouter(httpapi.Deps{
 		Logger:  logger,
 		Config:  cfg,
 		Ready:   deps.readiness(),
-		Auth:    deps.authService(logger, cfg),
+		Auth:    deps.authService(logger, cfg, users),
+		Admin:   deps.adminService(logger, cfg, users),
 		Limiter: deps.rateLimiter(logger),
 	})
 
@@ -186,6 +192,16 @@ func (d *dependencies) close() {
 	}
 }
 
+// userRepository builds the account repository, or returns nil when PostgreSQL is
+// not connected. A nil repository is what makes both the auth and the admin
+// routes disappear from the router (see the two services below).
+func (d *dependencies) userRepository(logger *slog.Logger) user.Repository {
+	if d.postgres == nil {
+		return nil
+	}
+	return user.NewPostgres(d.postgres.Pool())
+}
+
 // authService builds the authentication service, or returns nil when PostgreSQL
 // is not connected.
 //
@@ -193,21 +209,41 @@ func (d *dependencies) close() {
 // register the auth routes, so an API without a database answers 404 there
 // instead of accepting logins it could never verify. That is the honest behaviour
 // for the degraded mode STARTUP_REQUIRE_DEPENDENCIES=false enables.
-func (d *dependencies) authService(logger *slog.Logger, cfg *config.Config) httpapi.AuthService {
-	if d.postgres == nil {
+func (d *dependencies) authService(logger *slog.Logger, cfg *config.Config, users user.Repository) httpapi.AuthService {
+	if users == nil {
 		logger.Warn("postgres is not connected; authentication routes are disabled",
 			"hint", "STARTUP_REQUIRE_DEPENDENCIES=false must only be used for local work")
 		return nil
 	}
-	pool := d.postgres.Pool()
 	return auth.NewService(
-		user.NewPostgres(pool),
-		sessionstore.New(pool),
+		users,
+		sessionstore.New(d.postgres.Pool()),
 		auth.Config{
 			SessionTTL:        cfg.SessionTTL,
 			IdleTouchInterval: cfg.SessionIdleTouchInterval,
 			PasswordPolicy:    auth.NewPasswordPolicy(cfg.PasswordMinLength),
 		},
+	)
+}
+
+// adminService builds the account-administration service (§4/§68).
+//
+// It shares the repository with authentication on purpose: "an account is
+// ACTIVE" must mean the same thing to the login path and to the admin list, and
+// two repositories would make that a coincidence rather than a property.
+//
+// The password policy is the same object the login flow uses, so the API cannot
+// accept a password the CLI would reject.
+func (d *dependencies) adminService(logger *slog.Logger, cfg *config.Config, users user.Repository) httpapi.AdminService {
+	if users == nil {
+		logger.Warn("postgres is not connected; admin user-management routes are disabled",
+			"hint", "STARTUP_REQUIRE_DEPENDENCIES=false must only be used for local work")
+		return nil
+	}
+	return admin.NewService(
+		users,
+		sessionstore.New(d.postgres.Pool()),
+		auth.NewPasswordPolicy(cfg.PasswordMinLength),
 	)
 }
 

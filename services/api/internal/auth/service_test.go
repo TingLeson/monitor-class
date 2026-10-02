@@ -107,6 +107,27 @@ func (f *fakeUserRepo) List(_ context.Context, _ *user.Role) ([]user.User, error
 	return out, nil
 }
 
+// The four methods below complete user.Repository for Phase 2's admin API. The
+// auth service never calls them; they exist so this fake keeps satisfying the
+// interface — and they fail loudly rather than returning a zero value, so a
+// future auth code path that started using one would be caught here instead of
+// silently reading "no users, no admins".
+func (f *fakeUserRepo) ListPage(context.Context, user.ListFilter) (*user.ListResult, error) {
+	panic("fakeUserRepo.ListPage: the auth service must not page accounts")
+}
+
+func (f *fakeUserRepo) UpdateDisplayName(context.Context, uuid.UUID, string) error {
+	panic("fakeUserRepo.UpdateDisplayName: the auth service must not rename accounts")
+}
+
+func (f *fakeUserRepo) SetStatus(context.Context, uuid.UUID, user.Status) error {
+	panic("fakeUserRepo.SetStatus: the auth service must not change account status")
+}
+
+func (f *fakeUserRepo) CountActiveAdmins(context.Context) (int, error) {
+	panic("fakeUserRepo.CountActiveAdmins: the auth service must not count admins")
+}
+
 type touchCall struct {
 	id  uuid.UUID
 	now time.Time

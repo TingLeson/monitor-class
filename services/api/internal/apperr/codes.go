@@ -55,6 +55,29 @@ const (
 	CodeSessionAlreadyActive Code = "SESSION_ALREADY_ACTIVE"
 	CodeSessionNotFound      Code = "SESSION_NOT_FOUND"
 
+	// Admin user management (§4/§68).
+	//
+	// CodeUserNotFound and CodeAccountAlreadyExists are separate from
+	// CodeInvalidRequest because the admin UI has a concrete thing to do with
+	// each: "this account disappeared, refresh the list" versus "pick another
+	// account name" pinned to the account input. Collapsing them into one generic
+	// 400 would make the frontend re-implement the distinction by parsing prose.
+	CodeUserNotFound            Code = "USER_NOT_FOUND"
+	CodeAccountAlreadyExists    Code = "ACCOUNT_ALREADY_EXISTS"
+	CodePasswordPolicyViolation Code = "PASSWORD_POLICY_VIOLATION"
+
+	// CodeCannotDisableSelf and CodeLastAdminProtected both answer "why was this
+	// refused?" for a request that is perfectly well formed.
+	//
+	// WHY they are not CodeInvalidRequest: the admin UI has to *explain* the
+	// refusal ("you cannot disable the account you are logged in with" versus
+	// "at least one administrator must stay active"), and the only alternative
+	// would be to render a backend English sentence inside a Chinese interface or
+	// to hard-code the guess in the frontend. Codes are the contract clients
+	// branch on (§58) — rules users must understand deserve their own code.
+	CodeCannotDisableSelf  Code = "CANNOT_DISABLE_SELF"
+	CodeLastAdminProtected Code = "LAST_ADMIN_PROTECTED"
+
 	// Media plane.
 	CodeMediaTokenFailed Code = "MEDIA_TOKEN_FAILED"
 
@@ -92,6 +115,15 @@ var defaultMessages = map[Code]string{
 
 	CodeSessionAlreadyActive: "An active session already exists for this account.",
 	CodeSessionNotFound:      "Session not found.",
+
+	// Admin user management. The messages stay generic on purpose: the service
+	// attaches a specific, non-sensitive sentence where one exists (a password
+	// rule, "you cannot disable your own account"), and these are the fallbacks.
+	CodeUserNotFound:            "Account not found.",
+	CodeAccountAlreadyExists:    "This account name is already taken.",
+	CodePasswordPolicyViolation: "The password does not meet the password policy.",
+	CodeCannotDisableSelf:       "You cannot disable the account you are signed in with.",
+	CodeLastAdminProtected:      "At least one administrator must stay active.",
 
 	CodeMediaTokenFailed: "Unable to join the media room. Please try again.",
 

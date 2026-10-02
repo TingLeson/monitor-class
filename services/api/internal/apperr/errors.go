@@ -108,15 +108,29 @@ func HTTPStatus(code Code) int {
 		// 429 with a Retry-After header set by the middleware; the code alone
 		// tells the frontend to back off instead of retrying in a loop.
 		return http.StatusTooManyRequests
-	case CodeClassroomNotFound, CodeSessionNotFound:
+	case CodeClassroomNotFound, CodeSessionNotFound, CodeUserNotFound:
 		// 404 rather than 403 for "exists but is not yours" only where the
 		// resource id is already unguessable (UUID) and the caller has a
 		// legitimate reason to distinguish "typo" from "denied".
 		return http.StatusNotFound
+	case CodeAccountAlreadyExists:
+		// 409 — the request was well formed and would have succeeded against a
+		// different account name; the conflict is with existing state.
+		return http.StatusConflict
 	case CodeClassroomClosed, CodeClassroomAlreadyOpen, CodeClassroomAlreadyClosed,
 		CodeStudentNotAssigned, CodeSessionAlreadyActive:
 		return http.StatusConflict // 409 — the request was valid for another state
-	case CodeInvalidRequest:
+	case CodeCannotDisableSelf, CodeLastAdminProtected:
+		// 409 and not 400: the body was well formed and the action is legal in
+		// general — it conflicts with the *system's* current state (which account
+		// is calling, how many administrators remain). Retrying the identical
+		// request cannot succeed until that state changes.
+		return http.StatusConflict
+	case CodeInvalidRequest, CodePasswordPolicyViolation:
+		// PASSWORD_POLICY_VIOLATION is a 400 and not a 409: nothing conflicts with
+		// existing state, the submitted value itself is unusable. The distinct
+		// code exists so the frontend can attach the message to the password
+		// field instead of showing a generic banner.
 		return http.StatusBadRequest
 	case CodeMediaTokenFailed:
 		// 502 because the failure is in the media plane, not in the request: the

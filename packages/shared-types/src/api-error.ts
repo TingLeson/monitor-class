@@ -41,6 +41,41 @@ export const BACKEND_API_ERROR_CODES = [
    * 长时间停留后 CSRF Cookie 过期，刷新页面即可恢复。
    */
   'CSRF_INVALID',
+  /**
+   * 管理端用户管理（Phase 2 新增，§4 / §68）。
+   *
+   * WHY 三个码必须独立存在，而不是塌缩成一个通用 400：管理端对每个码都有具体的
+   * 下一步动作——`USER_NOT_FOUND` → "这个账号已经不在了，刷新列表"；
+   * `ACCOUNT_ALREADY_EXISTS` → 挂到账号输入框，让管理员换一个账号名；
+   * `PASSWORD_POLICY_VIOLATION` → 挂到密码输入框并说明规则。
+   * 合成一个码就等于让前端去解析后端的中文散文，契约立刻退化。
+   *
+   * 注意 `PASSWORD_POLICY_VIOLATION` 是 400 而不是 409：它描述的是"这份输入不满足
+   * 密码策略"，与资源冲突无关——密码本身永远不会成为冲突对象。
+   */
+  'USER_NOT_FOUND',
+  'ACCOUNT_ALREADY_EXISTS',
+  'PASSWORD_POLICY_VIOLATION',
+  /**
+   * 管理员想停用自己当前登录的账号（409）。
+   *
+   * WHY 不能沿用 INVALID_REQUEST：管理界面必须把"为什么被拒绝"讲清楚——
+   * 「不能停用你正在使用的账号」和「系统必须保留至少一个管理员」是完全不同的两件事，
+   * 而 INVALID_REQUEST 同时覆盖了账号格式、未知字段等一堆原因。契约规定客户端按
+   * `code` 分支（§58），所以需要用户理解的产品规则就该有自己的码。
+   */
+  'CANNOT_DISABLE_SELF',
+  /** 该操作会让系统不再有任何启用状态的管理员（409）。 */
+  'LAST_ADMIN_PROTECTED',
+  /**
+   * 请求体不合法（Phase 2 登记）。
+   *
+   * 后端从 Phase 1 起就在用它：登录请求体格式错误，以及"PATCH 只允许 displayName
+   * 却传了 role"、"不能停用自己 / 不能停用最后一个管理员"这类被拒绝的操作都返回它。
+   * 此前 shared-types 没有登记这个码，前端会把后端明确的一次 400 降级成 INTERNAL
+   * （"服务器内部错误"）——明明是用户可修正的输入问题，却报成了服务故障。
+   */
+  'INVALID_REQUEST',
   'CLASSROOM_NOT_FOUND',
   'CLASSROOM_NOT_OWNER',
   'CLASSROOM_CLOSED',
@@ -96,6 +131,18 @@ export const API_ERROR_MESSAGES: Record<ApiErrorCode, string> = {
   // 不写具体等待秒数：后端未在契约里下发 retryAfter，编一个数字等于撒谎。
   RATE_LIMITED: '尝试过于频繁，请稍后再试。',
   CSRF_INVALID: '页面已过期，请刷新页面后重试。',
+
+  // 账号/显示名冲突只可能是"换一个名字"，不需要管理员做别的判断。
+  ACCOUNT_ALREADY_EXISTS: '该账号已存在，请换一个账号名。',
+  // 账号可能刚被另一个管理员处理掉：文案要引导刷新，而不是让用户反复点同一个按钮。
+  USER_NOT_FOUND: '账号不存在或已被删除，请刷新列表后重试。',
+  // 具体规则由后端 message 说明（长度 / 不得与账号相同），这里只做兜底。
+  PASSWORD_POLICY_VIOLATION: '密码不符合安全要求，请使用至少 12 位且不同于账号的密码。',
+  CANNOT_DISABLE_SELF: '不能停用你当前登录的账号。如需停用它，请先用另一个管理员账号登录。',
+  LAST_ADMIN_PROTECTED: '系统必须至少保留一个启用状态的管理员，请先创建另一个管理员。',
+  // INVALID_REQUEST 的 message 由后端按场景定制（例如"不能停用自己"），
+  // 前端优先展示后端那句话；这条只是它没给 message 时的兜底。
+  INVALID_REQUEST: '请求未被接受，请检查填写内容后重试。',
 
   CLASSROOM_NOT_FOUND: '课堂不存在或已被删除。',
   CLASSROOM_NOT_OWNER: '只有课堂的创建老师可以执行该操作。',
