@@ -39,15 +39,20 @@ type fakeRepo struct {
 	runs       map[uuid.UUID]*Run
 	grants     map[uuid.UUID][]grant
 	students   map[uuid.UUID]Student
+	// teacherNames stands in for the `JOIN users` the student read performs; see
+	// seed.
+	teacherNames map[uuid.UUID]string
 
-	createErr       error
-	getErr          error
-	updateErr       error
-	listStudentsErr error
-	addErr          error
-	removeErr       error
-	openErr         error
-	closeErr        error
+	createErr         error
+	getErr            error
+	updateErr         error
+	listStudentsErr   error
+	addErr            error
+	removeErr         error
+	openErr           error
+	closeErr          error
+	listForStudentErr error
+	getForStudentErr  error
 
 	lastCreate     CreateParams
 	lastUpdate     UpdateParams
@@ -57,6 +62,11 @@ type fakeRepo struct {
 	lastRemoved    uuid.UUID
 	lastListOwner  uuid.UUID
 	lastStudentIDs []uuid.UUID
+	// lastStudentRead records the student id the two student-facing reads were
+	// called with, so a test can assert the id came from the caller and not from
+	// somewhere else in the classroom row.
+	lastStudentRead   uuid.UUID
+	lastClassroomRead uuid.UUID
 
 	callCount int
 	clock     time.Time
@@ -64,11 +74,12 @@ type fakeRepo struct {
 
 func newFakeRepo() *fakeRepo {
 	return &fakeRepo{
-		classrooms: map[uuid.UUID]*Classroom{},
-		runs:       map[uuid.UUID]*Run{},
-		grants:     map[uuid.UUID][]grant{},
-		students:   map[uuid.UUID]Student{},
-		clock:      time.Date(2026, 3, 4, 19, 0, 0, 0, time.UTC),
+		classrooms:   map[uuid.UUID]*Classroom{},
+		runs:         map[uuid.UUID]*Run{},
+		grants:       map[uuid.UUID][]grant{},
+		students:     map[uuid.UUID]Student{},
+		teacherNames: map[uuid.UUID]string{},
+		clock:        time.Date(2026, 3, 4, 19, 0, 0, 0, time.UTC),
 	}
 }
 
@@ -80,12 +91,22 @@ func (f *fakeRepo) tick() time.Time {
 }
 
 // seed inserts a classroom directly, bypassing the rules (like manual SQL would).
+//
+// It also records a display name for the owner, because the real repository's
+// student read JOINS users for it: without one, every student-view assertion would
+// compare against an empty name and could not tell a correctly joined row from a
+// missing join.
 func (f *fakeRepo) seed(c *Classroom, run *Run, studentIDs ...uuid.UUID) {
 	if c.CreatedAt.IsZero() {
 		c.CreatedAt = f.tick()
 	}
 	c.UpdatedAt = c.CreatedAt
 	f.classrooms[c.ID] = c
+	if c.OwnerTeacherID != uuid.Nil {
+		if _, known := f.teacherNames[c.OwnerTeacherID]; !known {
+			f.teacherNames[c.OwnerTeacherID] = "老师 " + c.OwnerTeacherID.String()[:8]
+		}
+	}
 	if run != nil {
 		f.runs[run.ID] = run
 		c.CurrentRunID = &run.ID
@@ -311,9 +332,88 @@ func (f *fakeRepo) Close(_ context.Context, classroomID, teacherID uuid.UUID) (*
 }
 
 // ---------------------------------------------------------------------------
-// Fake account directory
+// Student-facing reads
 // ---------------------------------------------------------------------------
 
+// ListForStudent mirrors the authorization JOIN of the real repository: only the
+// classrooms this student holds a grant for, ordered the way the SQL orders them
+// (`status DESC, created_at DESC, id DESC`). Mirroring the shape — not just the
+// result — is what makes the service tests below meaningful: if the fake returned
+// every classroom and the service filtered, these tests would still pass while the
+// production query leaked (§14).
+func (f *fakeRepo) ListForStudent(_ context.Context, studentID uuid.UUID) ([]StudentClassroom, error) {
+	f.callCount++
+	f.lastStudentRead = studentID
+	if f.listForStudentErr != nil {
+		return nil, f.listForStudentErr
+	}
+	out := make([]StudentClassroom, 0, 4)
+	for id, grants := range f.grants {
+		if !hasGrant(grants, studentID) {
+			continue
+		}
+		c, ok := f.classrooms[id]
+		if !ok {
+			continue
+		}
+		out = append(out, f.studentView(c))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Status != out[j].Status {
+			return out[i].Status == StatusOpen
+		}
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		}
+		return out[i].ID.String() > out[j].ID.String()
+	})
+	return out, nil
+}
+
+// GetForStudent mirrors the same JOIN with the classroom id added to the predicate.
+func (f *fakeRepo) GetForStudent(_ context.Context, studentID, classroomID uuid.UUID) (*StudentClassroom, error) {
+	f.callCount++
+	f.lastStudentRead = studentID
+	f.lastClassroomRead = classroomID
+	if f.getForStudentErr != nil {
+		return nil, f.getForStudentErr
+	}
+	c, ok := f.classrooms[classroomID]
+	if !ok || !hasGrant(f.grants[classroomID], studentID) {
+		return nil, ErrStudentNotAssigned
+	}
+	view := f.studentView(c)
+	return &view, nil
+}
+
+// studentView projects a classroom the way the SQL projection does.
+func (f *fakeRepo) studentView(c *Classroom) StudentClassroom {
+	view := StudentClassroom{
+		ID:                 c.ID,
+		Name:               c.Name,
+		Description:        c.Description,
+		Status:             c.Status,
+		TeacherDisplayName: f.teacherNames[c.OwnerTeacherID],
+		CreatedAt:          c.CreatedAt,
+	}
+	if c.CurrentRun != nil {
+		view.CurrentRun = &StudentCurrentRun{ID: c.CurrentRun.ID, OpenedAt: c.CurrentRun.OpenedAt}
+	}
+	return view
+}
+
+func hasGrant(grants []grant, studentID uuid.UUID) bool {
+	for _, g := range grants {
+		if g.studentID == studentID {
+			return true
+		}
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// Fake account directory
+// ---------------------------------------------------------------------------
 type fakeDirectory struct {
 	byAccount map[string]*user.User
 	err       error

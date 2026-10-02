@@ -177,6 +177,82 @@ export interface AddClassroomStudentsRequest {
   accounts: string[]
 }
 
+/* -------------------------------------------------------------------------- */
+/* 学生视角（§14 / §15 / §26 / §42 Student；Phase 4）                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 学生视角的授课老师（§14「王老师」）。
+ *
+ * WHY 只有 displayName：卡片要回答的问题是"这是谁的课"，而不是"这位老师的账号是什么"。
+ * 老师账号属于管理端信息，学生没有任何使用它的场景，下发它只是扩大信息暴露面
+ * （§63 最小信息暴露）。前端也**不得**试图用其他字段反推老师身份。
+ */
+export interface StudentClassroomTeacher {
+  displayName: string
+}
+
+/**
+ * 学生视角的当前 Run 摘要（§8）。
+ *
+ * 结构上与老师端的 ClassroomCurrentRun 一致，但仍然是**独立的类型**：两者会
+ * 各自演进（老师端迟早要 "开了多久 / 在线人数"，学生端只需要"本次开始于几点"），
+ * 共用一个类型会让任何一侧的扩展都被迫对另一侧负责。
+ */
+export interface StudentClassroomCurrentRun {
+  id: Uuid
+  openedAt: IsoDateTime
+}
+
+/**
+ * Classroom DTO —— **学生视角**（§14 / §15 / §26 / §42 Student）。
+ *
+ * WHY 必须与老师端的 `Classroom` 分成两个类型，而不是"少几个字段的同一个类型"：
+ * 它们是同一个领域对象面向两类人的两份**不同投影**。老师端的
+ * ownerTeacherId / status 之外的 updatedAt 等字段对学生的界面毫无用途，
+ * 而一旦共用一个类型，某天为了老师端方便加上的字段就会顺手下发给学生——
+ * 那些字段里往往正是 §26 要求隔离的信息。
+ *
+ * **这里刻意没有 `studentCount`、没有任何名单或其他学生字段。**
+ * §26 要求学生之间完全隔离：不展示参与人数、不展示其他学生、不展示其他学生姓名。
+ * 因此学生端界面也不得展示"班级人数"之类的信息——DTO 里根本没有这个字段，
+ * 前端既没有数据可显示，也不允许用别的方式（例如推断/额外请求）补出来。
+ * 在 DTO 层面少一个字段，比事后在每个页面上小心翼翼地藏起来可靠得多：
+ * 没有下发，就不存在"某个页面忘了隐藏"这种回归。
+ */
+export interface StudentClassroom {
+  id: Uuid
+  name: string
+  description: string | null
+  /** §7：只有 OPEN / CLOSED。CLOSED 的课堂**照样下发**（§14），界面显示"未开启"。 */
+  status: ClassroomStatus
+  teacher: StudentClassroomTeacher
+  /** status == CLOSED 时为 null（§7 / §8）。 */
+  currentRun: StudentClassroomCurrentRun | null
+  createdAt: IsoDateTime
+}
+
+/**
+ * GET /student/classrooms（§14）。
+ *
+ * 列表**只包含**该学生被 ClassroomStudent 授权的课堂，授权过滤发生在后端 SQL 的
+ * JOIN 里。任务书 §14 明确禁止"先给全量课堂、再让前端筛选"：那样未授权的数据
+ * 已经进了学生的浏览器，越权已经发生，前端再隐藏也没有意义（§37 授权边界在后端）。
+ */
+export interface StudentClassroomListResponse {
+  classrooms: StudentClassroom[]
+}
+
+/**
+ * GET /student/classrooms/:id（§15 Step 1 / §42 Student）。
+ *
+ * 未授权与不存在都返回 404 `STUDENT_NOT_ASSIGNED`，前端无法区分——这是刻意的：
+ * 否则学生可以通过试探 id 探测某个课堂是否存在（§63 最小信息暴露）。
+ */
+export interface StudentClassroomResponse {
+  classroom: StudentClassroom
+}
+
 /**
  * 批量添加里被拒绝的一项（§11）。
  *

@@ -42,6 +42,17 @@ type fakeClassroom struct {
 	closeResult  *classroom.Classroom
 	closeRun     *classroom.Run
 
+	// The two student-portal reads of §14/§70. The returning student id is recorded
+	// so the transport test can prove the handler passed the SESSION's id and not
+	// something the client supplied.
+	studentListResult   []classroom.StudentClassroom
+	studentGetResult    *classroom.StudentClassroom
+	studentListErr      error
+	studentGetErr       error
+	lastStudentListUser uuid.UUID
+	lastStudentGetUser  uuid.UUID
+	lastStudentGetID    uuid.UUID
+
 	listErr     error
 	createErr   error
 	getErr      error
@@ -160,10 +171,32 @@ func (f *fakeClassroom) Close(_ context.Context, classroomID, teacherID uuid.UUI
 	return f.closeResult, f.closeRun, nil
 }
 
+// ListStudentClassrooms is the student-portal list of §14.
+func (f *fakeClassroom) ListStudentClassrooms(_ context.Context, studentID uuid.UUID) ([]classroom.StudentClassroom, error) {
+	f.calls = append(f.calls, "listStudentClassrooms")
+	f.lastStudentListUser = studentID
+	if f.studentListErr != nil {
+		return nil, f.studentListErr
+	}
+	if f.studentListResult == nil {
+		return []classroom.StudentClassroom{}, nil
+	}
+	return f.studentListResult, nil
+}
+
+// GetStudentClassroom is the student-portal detail read.
+func (f *fakeClassroom) GetStudentClassroom(_ context.Context, studentID, classroomID uuid.UUID) (*classroom.StudentClassroom, error) {
+	f.calls = append(f.calls, "getStudentClassroom")
+	f.lastStudentGetUser, f.lastStudentGetID = studentID, classroomID
+	if f.studentGetErr != nil {
+		return nil, f.studentGetErr
+	}
+	return f.studentGetResult, nil
+}
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
-
 type classroomHarness struct {
 	*routerHarness
 	classrooms *fakeClassroom
@@ -267,8 +300,6 @@ func classroomRoutes() []struct {
 	body   string
 	write  bool
 } {
-	id := uuid.New().String()
-	studentID := uuid.New().String()
 	return []struct {
 		method string
 		path   string
@@ -277,13 +308,13 @@ func classroomRoutes() []struct {
 	}{
 		{http.MethodGet, "/api/v1/teacher/classrooms", "", false},
 		{http.MethodPost, "/api/v1/teacher/classrooms", `{"name":"算法"}`, true},
-		{http.MethodGet, "/api/v1/teacher/classrooms/" + id, "", false},
-		{http.MethodPatch, "/api/v1/teacher/classrooms/" + id, `{"name":"算法"}`, true},
-		{http.MethodGet, "/api/v1/teacher/classrooms/" + id + "/students", "", false},
-		{http.MethodPost, "/api/v1/teacher/classrooms/" + id + "/students", `{"accounts":["s10001"]}`, true},
-		{http.MethodDelete, "/api/v1/teacher/classrooms/" + id + "/students/" + studentID, "", true},
-		{http.MethodPost, "/api/v1/teacher/classrooms/" + id + "/open", "", true},
-		{http.MethodPost, "/api/v1/teacher/classrooms/" + id + "/close", "", true},
+		{http.MethodGet, "/api/v1/teacher/classrooms/" + uuid.New().String(), "", false},
+		{http.MethodPatch, "/api/v1/teacher/classrooms/" + uuid.New().String(), `{"name":"算法"}`, true},
+		{http.MethodGet, "/api/v1/teacher/classrooms/" + uuid.New().String() + "/students", "", false},
+		{http.MethodPost, "/api/v1/teacher/classrooms/" + uuid.New().String() + "/students", `{"accounts":["s10001"]}`, true},
+		{http.MethodDelete, "/api/v1/teacher/classrooms/" + uuid.New().String() + "/students/" + uuid.New().String(), "", true},
+		{http.MethodPost, "/api/v1/teacher/classrooms/" + uuid.New().String() + "/open", "", true},
+		{http.MethodPost, "/api/v1/teacher/classrooms/" + uuid.New().String() + "/close", "", true},
 	}
 }
 

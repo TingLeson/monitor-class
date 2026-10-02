@@ -114,6 +114,56 @@ type Run struct {
 	ClosedAt        *time.Time
 }
 
+// StudentClassroom is one classroom as a STUDENT sees it (§14/§70).
+//
+// WHY this is a type of its own instead of a Classroom with fields blanked out: the
+// student view and the teacher view are not the same resource with different
+// visibility — they are two different questions. The teacher asks "how is my course
+// doing?" and needs the roster size; the student asks "which lesson can I enter
+// now?" and must never be told who else is in the room. A shared type would make
+// every future teacher field an accidental student field, and the leak would be
+// discovered by a student rather than by a test. The DTO in internal/httpapi mirrors
+// this type field for field, so a field that is not here cannot be published there.
+//
+// Two things this type deliberately does NOT carry:
+//
+//   - Any roster information (no StudentCount, no names, no accounts). §26 forbids
+//     one student learning anything about another, and "how many people are in this
+//     lesson?" is exactly such a fact. Omitting the field is the only version of
+//     this rule that cannot regress: there is nothing to forget to filter.
+//   - The owner teacher's id or account. The card shows a teacher's display name and
+//     nothing more, so the id would be an internal identifier published for no
+//     product reason.
+type StudentClassroom struct {
+	ID          uuid.UUID
+	Name        string
+	Description *string
+	// Status is OPEN or CLOSED and is reported, never enforced here: a CLOSED
+	// classroom is still returned (§14 renders it as "暂不可进入") and whether the
+	// student may actually enter is decided by Phase 5's screen gate, not by this
+	// read path.
+	Status Status
+	// TeacherDisplayName is users.display_name of the classroom owner. It is the one
+	// piece of another account this DTO may contain, because the student card shows
+	// whose lesson it is; no id, account or email travels with it.
+	TeacherDisplayName string
+	// CurrentRun is the run of the OPEN period, and nil while CLOSED. The database
+	// keeps the two in lockstep (classrooms_run_consistency), so the zero value here
+	// is not "unknown" but "there is none".
+	CurrentRun *StudentCurrentRun
+	CreatedAt  time.Time
+}
+
+// StudentCurrentRun is the run reference embedded in a StudentClassroom.
+//
+// It carries id and openedAt and nothing else: the LiveKit room name is a
+// media-plane detail that Phase 6 hands out with the media token to a participant
+// who is entitled to join, never to a list endpoint (§33).
+type StudentCurrentRun struct {
+	ID       uuid.UUID
+	OpenedAt time.Time
+}
+
 // Student is one roster entry joined with the account it authorizes.
 type Student struct {
 	// ID is the account id (users.id), which is also classroom_students.student_id.
@@ -261,6 +311,15 @@ type Repository interface {
 	// ListByOwner returns a teacher's classrooms, newest first. No pagination: see
 	// the note on Service.List.
 	ListByOwner(ctx context.Context, ownerID uuid.UUID) ([]Classroom, error)
+	// ListForStudent returns the classrooms the student is authorized for, OPEN
+	// first. The authorization filter is part of the SQL (`classroom_students`
+	// JOINed in), never a filter applied after reading more rows than the caller may
+	// see (§14).
+	ListForStudent(ctx context.Context, studentID uuid.UUID) ([]StudentClassroom, error)
+	// GetForStudent returns one classroom the student is authorized for, or
+	// ErrStudentNotAssigned when there is no such row — the same answer for "no
+	// classroom with that id" and "not on its roster" (see Service.GetStudentClassroom).
+	GetForStudent(ctx context.Context, studentID, classroomID uuid.UUID) (*StudentClassroom, error)
 	// UpdateDetails rewrites name and/or description and bumps updated_at.
 	UpdateDetails(ctx context.Context, params UpdateParams) (*Classroom, error)
 	// ListStudents returns the whole roster (including DISABLED accounts), newest

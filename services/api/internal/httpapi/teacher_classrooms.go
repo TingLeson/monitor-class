@@ -25,6 +25,12 @@ import (
 // The service returns domain types, never DTOs: serialisation is the handler's job,
 // and the DTOs below have no field for the LiveKit room name or the owner's account,
 // so publishing either would have to be done deliberately.
+//
+// The two student reads are part of this interface because there is ONE classroom
+// service in the process (cmd/api wires a single *classroom.Service, which serves
+// both surfaces). student_classrooms.go declares them again as the narrow
+// StudentClassroomService that the student handlers accept, so a student route can
+// only ever reach the read-only part of the domain.
 type ClassroomService interface {
 	List(ctx context.Context, teacherID uuid.UUID) ([]classroom.Classroom, error)
 	Create(ctx context.Context, in classroom.CreateInput) (*classroom.Classroom, error)
@@ -35,6 +41,8 @@ type ClassroomService interface {
 	RemoveStudent(ctx context.Context, classroomID, studentID, teacherID uuid.UUID) error
 	Open(ctx context.Context, classroomID, teacherID uuid.UUID) (*classroom.Classroom, *classroom.Run, error)
 	Close(ctx context.Context, classroomID, teacherID uuid.UUID) (*classroom.Classroom, *classroom.Run, error)
+	ListStudentClassrooms(ctx context.Context, studentID uuid.UUID) ([]classroom.StudentClassroom, error)
+	GetStudentClassroom(ctx context.Context, studentID, classroomID uuid.UUID) (*classroom.StudentClassroom, error)
 }
 
 // maxClassroomBodyBytes bounds a classroom request body.

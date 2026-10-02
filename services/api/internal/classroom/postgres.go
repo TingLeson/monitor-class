@@ -235,6 +235,137 @@ func (p *Postgres) ListStudents(ctx context.Context, classroomID uuid.UUID) ([]S
 	return out, nil
 }
 
+// studentClassroomColumns is the projection of the student-facing read.
+//
+// It is separate from classroomColumns on purpose: that one carries the roster size
+// and the owner uuid, neither of which may reach a student (§26). Two projections
+// means adding a column to the teacher view cannot silently add it to this one.
+const studentClassroomColumns = `
+	c.id, c.name, c.description, c.status, c.created_at,
+	t.display_name, r.id, r.opened_at`
+
+// studentClassroomSource is the authorization-filtered source of both student reads.
+//
+// THE JOIN IS THE AUTHORIZATION (§14). `classroom_students` is joined on the caller's
+// own id, so a classroom the student was never granted is not in the result set at
+// all. The alternative — read every classroom and filter in Go, or in the handler,
+// or in the browser — would put other people's courses on the wire before anything
+// decided whether the caller may see them; one forgotten check later and the whole
+// school's timetable is a student's response body. Filtering in the JOIN also means
+// the database returns exactly the rows that will be sent, so there is no window and
+// no second list to keep in sync.
+//
+// JOIN users (not LEFT JOIN): owner_teacher_id is NOT NULL and FK-enforced, so the
+// teacher row always exists; an INNER JOIN states that, and makes a broken row
+// visible as a missing classroom rather than as a card with a blank teacher name.
+//
+// LEFT JOIN classroom_runs is the opposite choice and both directions matter: a
+// CLOSED classroom has no current run, and `classrooms_run_consistency` guarantees
+// an OPEN one does. The run is joined rather than looked up per row, which keeps
+// each list a single round trip.
+const studentClassroomSource = `
+	FROM classroom_students cs
+	JOIN classrooms c ON c.id = cs.classroom_id
+	JOIN users t ON t.id = c.owner_teacher_id
+	LEFT JOIN classroom_runs r ON r.id = c.current_run_id`
+
+// ListForStudent returns the classrooms the student is authorized for.
+//
+// EVERY authorized classroom comes back, OPEN and CLOSED alike. §14 is explicit
+// that a lesson which has not started is shown as "暂不可进入" rather than
+// disappearing: a card that vanishes and reappears makes a student think the course
+// was cancelled or that they lost access, and the question "am I even in this
+// class?" — the one the portal exists to answer — becomes unanswerable before the
+// lesson starts.
+//
+// The ordering is `status DESC, created_at DESC, id DESC`. `status DESC` puts OPEN
+// first because that is the only thing a student opening this page is trying to
+// find: "which lesson can I enter right now?" (PostgreSQL orders text by collation
+// and 'OPEN' sorts after 'CLOSED' in C and in every en_US-style collation, which is
+// what makes DESC the OPEN-first direction; the two values are fixed by §7, so the
+// list can never grow a third state that reorders this by accident.) The remaining
+// keys are the stable order used everywhere else in this package — created_at
+// defaults to the TRANSACTION timestamp, so a seeding script gives several rows the
+// same value, and without the id tiebreaker the list would reshuffle between two
+// refreshes of the same page. A student's dashboard jumping around while they read
+// it is exactly the bug the second key prevents.
+func (p *Postgres) ListForStudent(ctx context.Context, studentID uuid.UUID) ([]StudentClassroom, error) {
+	if p == nil || p.pool == nil {
+		return nil, errors.New("classroom: repository is not connected")
+	}
+	query := `SELECT ` + studentClassroomColumns + studentClassroomSource +
+		` WHERE cs.student_id = $1 ORDER BY c.status DESC, c.created_at DESC, c.id DESC`
+
+	rows, err := p.pool.Query(ctx, query, studentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	// Non-nil empty slice: a student with no classrooms gets `"classrooms": []`, not
+	// null, so the portal renders "you have no classes yet" without a null check.
+	out := make([]StudentClassroom, 0, 8)
+	for rows.Next() {
+		classroom, err := scanStudentClassroom(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *classroom)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetForStudent returns one classroom through the same authorization JOIN.
+//
+// There is deliberately no branch that reads the classroom first and then checks the
+// roster. One query means there is no moment at which an unauthorized classroom is
+// loaded "but not returned yet", which is the state a later refactor leaks from, and
+// it makes "not found" and "not assigned" the same EMPTY RESULT rather than two
+// results the caller has to remember to collapse (see Service.GetStudentClassroom).
+func (p *Postgres) GetForStudent(ctx context.Context, studentID, classroomID uuid.UUID) (*StudentClassroom, error) {
+	if p == nil || p.pool == nil {
+		return nil, errors.New("classroom: repository is not connected")
+	}
+	query := `SELECT ` + studentClassroomColumns + studentClassroomSource +
+		` WHERE cs.student_id = $1 AND cs.classroom_id = $2`
+
+	found, err := scanStudentClassroom(p.pool.QueryRow(ctx, query, studentID, classroomID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The driver error is dropped: "no rows" is not a business fact, and letting
+		// it escape would bypass the error envelope. Which of the two reasons it was
+		// is not knowable here by design — the JOIN does not distinguish them.
+		return nil, ErrStudentNotAssigned
+	}
+	return found, err
+}
+
+// scanStudentClassroom reads one row of studentClassroomColumns.
+func scanStudentClassroom(row pgx.Row) (*StudentClassroom, error) {
+	var (
+		c           StudentClassroom
+		status      string
+		runID       *uuid.UUID
+		runOpenedAt *time.Time
+	)
+	if err := row.Scan(
+		&c.ID, &c.Name, &c.Description, &status, &c.CreatedAt,
+		&c.TeacherDisplayName, &runID, &runOpenedAt,
+	); err != nil {
+		return nil, err
+	}
+	c.Status = Status(status)
+	// Both halves are required before a current run is reported: an id without an
+	// openedAt (or the reverse) would mean the run row is half-joined, and inventing
+	// an openedAt would be worse than reporting no run.
+	if runID != nil && runOpenedAt != nil {
+		c.CurrentRun = &StudentCurrentRun{ID: *runID, OpenedAt: *runOpenedAt}
+	}
+	return &c, nil
+}
+
 // AddStudents grants access to a set of accounts in one statement.
 //
 // `ON CONFLICT (classroom_id, student_id) DO NOTHING` is what makes the operation

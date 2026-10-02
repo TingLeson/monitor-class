@@ -145,6 +145,7 @@ func NewRouter(deps Deps) *gin.Engine {
 	registerAuthRoutes(v1, deps, resolver, entries)
 	registerAdminRoutes(v1, deps, entries)
 	registerTeacherRoutes(v1, deps, entries)
+	registerStudentRoutes(v1, deps, entries)
 
 	// Unknown routes and methods must go through the same error envelope as a
 	// handler failure. gin's defaults are bare text ("404 page not found"), which
@@ -300,6 +301,51 @@ func registerTeacherRoutes(v1 *gin.RouterGroup, deps Deps, entries []AuthEntry) 
 	writes.DELETE("/classrooms/:id/students/:studentId", handlers.removeStudent())
 	writes.POST("/classrooms/:id/open", handlers.openClassroom())
 	writes.POST("/classrooms/:id/close", handlers.closeClassroom())
+}
+
+// registerStudentRoutes mounts /api/v1/student/** — the student portal of §14/§70.
+//
+// The group is bound to the STUDENT entry exactly as /teacher is bound to the
+// teacher one, and the consequence is the whole of the student-side access control:
+// no session is 401 AUTH_REQUIRED, and a TEACHER or ADMIN session is 403
+// ROLE_FORBIDDEN. An administrator is not a super-student either — the admin surface
+// manages accounts, and a classroom roster is not something an administrator's
+// session may read on a student's behalf.
+//
+// Authorization stops there only because there is nothing else to check: which
+// classrooms a student sees is decided by the classroom_students JOIN inside the
+// repository (§14), keyed on the session's user id, so there is no per-classroom
+// ownership rule for a handler to state. That is deliberate — a filter applied in
+// Go is a filter somebody can forget, and the list endpoint has no single resource
+// whose owner could be compared.
+//
+// Phase 4 mounts READS ONLY (§70: "点击 Enter 暂时只进入 PreJoin"). The join, leave
+// and event endpoints of §42 belong to Phase 5/6/8, where a screen gate and a media
+// plane exist for them to mean something; they are not stubbed here. Because the
+// group has no unsafe route, it carries no CSRFProtection — an inline
+// `isSafeMethod` check would be doing that work for exactly one endpoint today and
+// would hide the omission when the first POST arrives. The coarse API rate limit
+// from NewRouter still applies to both routes like every other /api/v1 route.
+func registerStudentRoutes(v1 *gin.RouterGroup, deps Deps, entries []AuthEntry) {
+	studentEntry, ok := entryForRole(entries, user.RoleStudent)
+	if !ok || deps.Classroom == nil || deps.Auth == nil {
+		// No student entry (no configuration) or no classroom service (no
+		// database): the routes are not registered, so they answer 404 instead of
+		// existing without an authorization chain in front of them.
+		return
+	}
+
+	mw := newAuthMiddleware(deps.Auth, entries, deps.Config)
+	handlers := newStudentClassroomHandlers(deps.Classroom)
+
+	group := v1.Group("/student")
+	group.Use(
+		mw.RequireSession(studentEntry),
+		mw.RequireRole(studentEntry),
+	)
+
+	group.GET("/classrooms", handlers.listClassrooms())
+	group.GET("/classrooms/:id", handlers.getClassroom())
 }
 
 // entryForRole finds the entry point of one role.

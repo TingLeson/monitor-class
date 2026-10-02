@@ -372,6 +372,89 @@ func (s *Service) Close(ctx context.Context, classroomID, teacherID uuid.UUID) (
 	return closed, run, nil
 }
 
+// ListStudentClassrooms returns the classrooms the authenticated student may see.
+//
+// This is the whole of §14 and, in Phase 4, the whole of the student portal: the
+// authorization is the repository's JOIN on classroom_students, so there is nothing
+// to check here and — importantly — nothing to filter here either.
+//
+// There is NO "is this classroom OPEN?" logic in this method or in the one below.
+// The status is DATA the student's card renders ("已开启" / "暂不可进入" §14); the
+// decision "may this student actually enter right now?" belongs to the screen gate
+// of Phase 5, which is the first place that has to know whether a media session can
+// be created at all. Enforcing it here would mean a CLOSED classroom is reported to
+// the portal as an error, and the student would see a broken page instead of a card
+// that explains itself. (§33 also forbids reading anything into this path: the
+// control plane's status is the source of truth, and there is no media plane yet.)
+func (s *Service) ListStudentClassrooms(ctx context.Context, studentID uuid.UUID) ([]StudentClassroom, error) {
+	if studentID == uuid.Nil {
+		// A nil id can never match a grant row. Returning an empty list rather than
+		// an error keeps the "a student with no classrooms" contract identical for a
+		// programming error and for a real empty roster, and — unlike teacher
+		// reads — there is no resource id here to report as invalid.
+		return []StudentClassroom{}, nil
+	}
+	classrooms, err := s.repo.ListForStudent(ctx, studentID)
+	if err != nil {
+		return nil, err
+	}
+	// The count is logged, never the classrooms: this is a list endpoint that a
+	// whole school calls at the start of a lesson (§59). The ids and names in the
+	// response add nothing an operator can act on, while one line per request per
+	// student is exactly the volume that makes a log useless.
+	logging.FromContext(ctx).Info("student classrooms listed",
+		"action", "list_student_classrooms",
+		logging.FieldUserID, studentID.String(),
+		"classrooms", len(classrooms),
+	)
+	return classrooms, nil
+}
+
+// GetStudentClassroom returns one classroom as the given student sees it.
+//
+// "Not mine" is ErrStudentNotAssigned, the SAME answer for "no classroom has that
+// id" and "the classroom exists but you are not on its roster". WHY one code and not
+// a 404/403 pair:
+//
+//   - The id is the only thing the caller supplied, and it is a UUID. If an
+//     unauthorized id answered differently from a nonexistent one, a student could
+//     enumerate ids to learn which lessons exist in the school — a timetable they
+//     have no business reading (§14/§63).
+//   - "You are not in this classroom's list" is a true statement about both cases.
+//     The portal renders one message ("这个课堂不在你的名单里"), and it is correct
+//     either way.
+//   - A 403 here would additionally tell the student that the classroom is real,
+//     and would send the frontend into a "request access" flow for a course that
+//     may not exist.
+//
+// A malformed id never reaches this function: the handler answers 400 INVALID_REQUEST
+// (§58) before any lookup, so a string that is not an identifier is reported as a bad
+// request rather than as a missing classroom.
+func (s *Service) GetStudentClassroom(ctx context.Context, studentID, classroomID uuid.UUID) (*StudentClassroom, error) {
+	if studentID == uuid.Nil {
+		// Same collapse as above: no grant row can match, so there is nothing to look
+		// up and the answer is the one this endpoint already gives for "not yours".
+		return nil, ErrStudentNotAssigned
+	}
+	if classroomID == uuid.Nil {
+		// Unlike the list, this request named a resource. A nil uuid is not an
+		// identifier the client could have meant, so it is a malformed request — and
+		// answering INVALID_REQUEST keeps a nil id from ever behaving like a wildcard
+		// if a future query loses its WHERE clause.
+		return nil, invalidf("classroom id must be a UUID")
+	}
+	found, err := s.repo.GetForStudent(ctx, studentID, classroomID)
+	if err != nil {
+		return nil, err
+	}
+	if found == nil {
+		// "nil without an error" is a broken repository contract, not an empty
+		// result: answering 404 would hide the bug behind a plausible product state.
+		return nil, errors.New("classroom: repository returned no classroom for a student read")
+	}
+	return found, nil
+}
+
 // owned loads a classroom and verifies that teacherID owns it.
 //
 // WHY this runs on every endpoint including the read-only ones: §37 and §63 make

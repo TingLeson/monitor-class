@@ -163,7 +163,17 @@ export const API_ERROR_MESSAGES: Record<ApiErrorCode, string> = {
   CLASSROOM_ALREADY_OPEN: '课堂已经处于开启状态。',
   CLASSROOM_ALREADY_CLOSED: '课堂已经处于关闭状态。',
 
-  STUDENT_NOT_ASSIGNED: '你不在该课堂的学生名单中。',
+  /**
+   * 学生不在（或不再在）该课堂的名单里：学生端读详情时是 404（§15 Step 1），
+   * 老师端移除学生时也是 404（§11）。
+   *
+   * WHY 是"你不在…请联系老师确认"这种学生口吻：这个码真正的使用场景是**学生端**
+   * 读课堂详情（未授权与不存在都返回它，§63 最小信息暴露），而文案必须同时给出
+   * 下一步动作——"找老师确认"，否则学生只会反复点刷新。
+   * 老师端遇到它时不会直接用这句话（teacher-web 自己说明"该学生不在名单里，
+   * 名单已刷新"，见 docs/frontend/teacher.md §4.3）。
+   */
+  STUDENT_NOT_ASSIGNED: '你不在这个课堂的名单里，请联系老师确认。',
   // 逐条拒绝原因（批量添加）与顶层错误共用这两句：老师要做的动作是同一个。
   STUDENT_NOT_FOUND: '账号不存在，请核对账号。',
   NOT_A_STUDENT: '该账号不是学生账号。',

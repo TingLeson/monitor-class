@@ -64,6 +64,11 @@ export type {
   ClassroomStudentListResponse,
   CreateClassroomRequest,
   RejectedClassroomStudent,
+  StudentClassroom,
+  StudentClassroomCurrentRun,
+  StudentClassroomListResponse,
+  StudentClassroomResponse,
+  StudentClassroomTeacher,
   UpdateClassroomRequest,
 } from './classroom'
 
