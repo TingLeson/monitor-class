@@ -386,6 +386,39 @@ func (f *fakeRepo) GetForStudent(_ context.Context, studentID, classroomID uuid.
 	return &view, nil
 }
 
+// GetStudentEntry mirrors the same JOIN as GetForStudent, but projects the run in
+// full — including the LiveKit room name, which the portal read must never carry.
+func (f *fakeRepo) GetStudentEntry(_ context.Context, studentID, classroomID uuid.UUID) (*StudentEntry, error) {
+	f.callCount++
+	f.lastStudentRead = studentID
+	f.lastClassroomRead = classroomID
+	if f.getForStudentErr != nil {
+		return nil, f.getForStudentErr
+	}
+	c, ok := f.classrooms[classroomID]
+	if !ok || !hasGrant(f.grants[classroomID], studentID) {
+		return nil, ErrStudentNotAssigned
+	}
+	entry := StudentEntry{ClassroomID: c.ID, Status: c.Status}
+	if c.CurrentRun != nil {
+		run := *c.CurrentRun
+		run.ClassroomID = c.ID
+		entry.Run = &run
+	}
+	return &entry, nil
+}
+
+// GetRunByID mirrors the single-row run read by primary key.
+func (f *fakeRepo) GetRunByID(_ context.Context, runID uuid.UUID) (*Run, error) {
+	f.callCount++
+	run, ok := f.runs[runID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	stored := *run
+	return &stored, nil
+}
+
 // studentView projects a classroom the way the SQL projection does.
 func (f *fakeRepo) studentView(c *Classroom) StudentClassroom {
 	view := StudentClassroom{
@@ -1240,3 +1273,177 @@ func TestInvalidMessageOnlyAnswersForInvalidRequests(t *testing.T) {
 }
 
 func ptr[T any](value T) *T { return &value }
+
+// ---------------------------------------------------------------------------
+// Phase 6 seams: room teardown (§49) and the join/leave reads
+// ---------------------------------------------------------------------------
+
+// fakeTerminator records the room teardown calls Close makes.
+type fakeTerminator struct {
+	roomNames []string
+	err       error
+}
+
+func (f *fakeTerminator) TerminateRoom(_ context.Context, roomName string) error {
+	f.roomNames = append(f.roomNames, roomName)
+	return f.err
+}
+
+// TestCloseTerminatesTheMediaRoom is §49: the classroom is closed in the database
+// first, and the media room is cleaned up afterwards.
+func TestCloseTerminatesTheMediaRoom(t *testing.T) {
+	h := newHarness(t)
+	terminator := &fakeTerminator{}
+	h.service.WithRoomTerminator(terminator)
+	owned := h.mustCreate(t, "算法")
+	_, run, err := h.service.Open(context.Background(), owned.ID, h.teacher.ID)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	if _, _, err := h.service.Close(context.Background(), owned.ID, h.teacher.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if len(terminator.roomNames) != 1 || terminator.roomNames[0] != run.LiveKitRoomName {
+		t.Fatalf("terminated rooms = %v, want [%s]", terminator.roomNames, run.LiveKitRoomName)
+	}
+	// The control plane decided first: the classroom is CLOSED whether or not the
+	// media call happened.
+	if h.repo.classrooms[owned.ID].Status != StatusClosed {
+		t.Error("the classroom is not CLOSED after a close")
+	}
+}
+
+// TestCloseSucceedsWhenTheRoomCannotBeTerminated is the §33 trade-off: a media-plane
+// failure must not roll back, fail or even delay a control-plane decision that already
+// committed.
+func TestCloseSucceedsWhenTheRoomCannotBeTerminated(t *testing.T) {
+	h := newHarness(t)
+	terminator := &fakeTerminator{err: errors.New("livekit: delete room: connection refused")}
+	h.service.WithRoomTerminator(terminator)
+	owned := h.mustCreate(t, "算法")
+	if _, _, err := h.service.Open(context.Background(), owned.ID, h.teacher.ID); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	closed, _, err := h.service.Close(context.Background(), owned.ID, h.teacher.ID)
+	if err != nil {
+		t.Fatalf("Close() = %v, want success despite the media failure", err)
+	}
+	if closed.Status != StatusClosed {
+		t.Errorf("status = %s, want CLOSED", closed.Status)
+	}
+	if len(terminator.roomNames) != 1 {
+		t.Errorf("the terminator was not called: %v", terminator.roomNames)
+	}
+}
+
+// TestCloseWithoutAMediaPlane: the degraded deployment (LiveKit unreachable at boot)
+// must still be able to close a classroom.
+func TestCloseWithoutAMediaPlane(t *testing.T) {
+	h := newHarness(t)
+	owned := h.mustCreate(t, "算法")
+	if _, _, err := h.service.Open(context.Background(), owned.ID, h.teacher.ID); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, _, err := h.service.Close(context.Background(), owned.ID, h.teacher.ID); err != nil {
+		t.Fatalf("Close() = %v, want success without a media plane", err)
+	}
+}
+
+// TestStudentEntryIsRosterAuthorized: the join read must answer "not assigned" for a
+// classroom the student is not on, and must carry the room name only when a run exists.
+func TestStudentEntryIsRosterAuthorized(t *testing.T) {
+	// The fixture's openLab is already OPEN with a run and studentA + studentB on the
+	// roster; the room name comes from the stored run, not from a re-derivation.
+	f := newStudentFixtures(t)
+
+	entry, err := f.service.StudentEntry(context.Background(), f.studentA.ID, f.openLab.ID)
+	if err != nil {
+		t.Fatalf("StudentEntry: %v", err)
+	}
+	if entry.Status != StatusOpen || entry.Run == nil {
+		t.Fatalf("entry = %+v, want an OPEN classroom with its run", entry)
+	}
+	if entry.Run.LiveKitRoomName != f.repo.runs[entry.Run.ID].LiveKitRoomName {
+		t.Errorf("room name = %q, want the stored %q", entry.Run.LiveKitRoomName, f.repo.runs[entry.Run.ID].LiveKitRoomName)
+	}
+
+	// Not on the roster: the same answer as "no such classroom" (the fixture's
+	// "foreign" classroom has studentA on nobody's roster).
+	if _, err := f.service.StudentEntry(context.Background(), f.studentA.ID, f.foreign.ID); !errors.Is(err, ErrStudentNotAssigned) {
+		t.Errorf("unassigned student: err = %v, want ErrStudentNotAssigned", err)
+	}
+	// A nil id can never match a grant row.
+	if _, err := f.service.StudentEntry(context.Background(), uuid.Nil, f.openLab.ID); !errors.Is(err, ErrStudentNotAssigned) {
+		t.Errorf("nil student: err = %v, want ErrStudentNotAssigned", err)
+	}
+}
+
+// TestStudentEntryReportsAClosedClassroom: the status is data, not an error — the join
+// endpoint decides what a CLOSED classroom means (§58's 409).
+func TestStudentEntryReportsAClosedClassroom(t *testing.T) {
+	f := newStudentFixtures(t)
+	if err := f.repo.AddStudents(context.Background(), f.closedDesign.ID, []uuid.UUID{f.studentA.ID}, f.other.ID); err != nil {
+		t.Fatalf("AddStudents: %v", err)
+	}
+
+	entry, err := f.service.StudentEntry(context.Background(), f.studentA.ID, f.closedDesign.ID)
+	if err != nil {
+		t.Fatalf("StudentEntry: %v", err)
+	}
+	if entry.Status != StatusClosed || entry.Run != nil {
+		t.Errorf("entry = %+v, want CLOSED with no run", entry)
+	}
+}
+
+// TestRunByIDResolvesTheRoomName: the leave path needs the room of a session's run, and
+// the naming scheme must not be re-implemented outside this package.
+func TestRunByIDResolvesTheRoomName(t *testing.T) {
+	h := newHarness(t)
+	owned := h.mustCreate(t, "算法")
+	_, run, err := h.service.Open(context.Background(), owned.ID, h.teacher.ID)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	found, err := h.service.RunByID(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("RunByID: %v", err)
+	}
+	if found.LiveKitRoomName != run.LiveKitRoomName {
+		t.Errorf("room name = %q, want %q", found.LiveKitRoomName, run.LiveKitRoomName)
+	}
+	if _, err := h.service.RunByID(context.Background(), uuid.New()); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown run: err = %v, want ErrNotFound", err)
+	}
+	if _, err := h.service.RunByID(context.Background(), uuid.Nil); !errors.Is(err, ErrNotFound) {
+		t.Errorf("nil run: err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestClassroomReadCarriesTheRoomName: the classroom read used by the teacher media
+// token and the monitor must resolve the room of the current run, while the HTTP DTOs
+// keep it out of every response (asserted in internal/httpapi).
+func TestClassroomReadCarriesTheRoomName(t *testing.T) {
+	h := newHarness(t)
+	owned := h.mustCreate(t, "算法")
+	_, run, err := h.service.Open(context.Background(), owned.ID, h.teacher.ID)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	loaded, err := h.service.Get(context.Background(), owned.ID, h.teacher.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if loaded.CurrentRun == nil {
+		t.Fatal("CurrentRun is nil for an OPEN classroom")
+	}
+	if loaded.CurrentRun.LiveKitRoomName != run.LiveKitRoomName {
+		t.Errorf("room name = %q, want %q", loaded.CurrentRun.LiveKitRoomName, run.LiveKitRoomName)
+	}
+	if loaded.CurrentRun.Status != StatusOpen {
+		t.Errorf("run status = %q, want OPEN", loaded.CurrentRun.Status)
+	}
+}

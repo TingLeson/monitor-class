@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { ApiError, isApiError } from '@classwatch/api-client'
 import {
   AppAlert,
   AppButton,
@@ -7,17 +8,24 @@ import {
   ProtectedRouteGate,
   StatusDot,
 } from '@classwatch/ui'
-import { computed, onBeforeUnmount, watch } from 'vue'
-import { RouterLink, useRoute } from 'vue-router'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { classroomStatusLabel, classroomStatusTone } from '../lib/classroom-status'
-import { checkScreenCaptureSupport, type ScreenCaptureSupport } from '../lib/screen-capture'
-import { describeScreenGateFailure } from '../lib/screen-capture-messages'
+import {
+  checkScreenCaptureSupport,
+  describeScreenCapture,
+  toJoinCaptureDiagnostics,
+  type ScreenCaptureSupport,
+} from '../lib/screen-capture'
+import { describeScreenGateFailure, describeScreenGateState } from '../lib/screen-capture-messages'
 import { describeStudentClassroomError, isNotAssigned } from '../lib/student-classroom-error'
+import { joinClassroom } from '../lib/student-sessions-api.ts'
 import { useClassroomsStore } from '../stores/classrooms'
+import { useMediaSessionStore } from '../stores/media-session.ts'
 import { useScreenShareStore } from '../stores/screen-share'
 
 /**
- * PreJoin —— 进入课堂前的最后一步（§15 Step 2；§16 / §17 / §57；§71）。
+ * PreJoin —— 进入课堂前的最后一步（§15 Step 2；§16 / §17 / §18 / §43 / §57）。
  *
  * 这一页是学生**唯一**一次在"真的被看见"之前做决定的地方，因此它的结构是固定的：
  *
@@ -25,16 +33,18 @@ import { useScreenShareStore } from '../stores/screen-share'
  * 2. §57 的隐私告知原文，且必须出现在**任何**捕获请求之前；
  * 3. 能力自检（§17）——不满足就禁用主按钮并把原因写清楚，**绝不**降级成窗口共享；
  * 4. 点击之后才请求整屏，并过 §16 的 `displaySurface` 硬 Gate；
- * 5. Gate 通过 = "共享已就绪"。把这条轨道发布到课堂是 Phase 6（§20），
- *    本页只能停在这里，并且必须把这件事写出来。
+ * 5. Gate 通过之后才调 join（§18：顺序不能变），把 Gate 的诊断值一并提交（§43），
+ *    拿到 `{sessionId, livekitUrl, token}`、把凭据与**同一条**轨道交给会话 store，
+ *    然后跳转到 `/student/session/:sessionId`。
  *
- * 顺序不能动（§18）：点击 → getDisplayMedia → displaySurface 检查 → monitor 才继续。
- * 本 Phase 没有 join 接口，所以"继续"的具体动作（POST join → LiveKit → publish）
- * 属于 Phase 6，页面上的终点就是"共享已就绪"。
+ * 第 5 步的关键约束：换页**不会**重新请求屏幕权限。轨道对象被整体移交（§20），
+ * 会话页只是把它 publish 出去——学生全程只会看到一次授权弹窗。
  */
 const route = useRoute()
+const router = useRouter()
 const store = useClassroomsStore()
 const screenShare = useScreenShareStore()
+const mediaSession = useMediaSessionStore()
 
 /**
  * 能力自检（§17）。
@@ -106,21 +116,29 @@ const loadFailed = computed(
 
 /**
  * 主按钮是否可点：本页有课堂 + 课堂 OPEN + 浏览器能力足够，三者缺一不可。
- * `requesting` 期间另外禁用（`start()` 内部还有一道重入保护，这里是给学生看的反馈）。
+ * join 请求飞行中另外禁用（store 内部还有一道重入保护，这里是给学生看的反馈）。
  */
-const canStartShare = computed(() => store.current !== null && !isClosed.value && support.supported)
-
-/** 从 lost / error 恢复时文案不同：§22 的原文要求是「重新共享整个屏幕」。 */
-const startButtonLabel = computed(() =>
-  screenShare.isLost || screenShare.hasFailed ? '重新共享整个屏幕' : '共享整个屏幕并进入课堂',
+const canStartShare = computed(
+  () => store.current !== null && !isClosed.value && support.supported && !joining.value,
 )
+
+/**
+ * 从 lost / error 恢复时文案不同：§22 的原文要求是「重新共享整个屏幕」。
+ * 已经共享、只是 join 失败时改成"重试进入课堂"——那种情况下按钮**不会**再请求
+ * 屏幕权限，措辞必须让学生知道这一点，否则他会以为要重新选一次共享范围。
+ */
+const startButtonLabel = computed(() => {
+  if (screenShare.isSharing && joinError.value !== null) return '重试进入课堂'
+  if (screenShare.isLost || screenShare.hasFailed) return '重新共享整个屏幕'
+  return '共享整个屏幕并进入课堂'
+})
 
 /**
  * 按钮被禁用时的原因。必须有：一个灰掉却不说话的按钮，学生只会一直点它。
  * 只在按钮确实渲染出来、且确实不可点时才有值。
  */
 const startButtonHint = computed(() => {
-  if (!store.current || canStartShare.value) return null
+  if (!store.current || canStartShare.value || joining.value) return null
   if (isClosed.value) return '老师尚未开启本课堂。开启后重新打开这个页面即可共享整个屏幕并进入。'
   return '当前浏览器无法确认你是否共享了完整显示器，因此不能进入课堂。'
 })
@@ -133,23 +151,103 @@ const startButtonHint = computed(() => {
  * store 里三者仍是分开的字段，因为它们的恢复动作并不相同（一个要换浏览器，
  * 一个要重选共享面，一个只要重新共享）。
  */
-const gateMessage = computed(() => {
-  if (screenShare.isLost) {
-    return describeScreenGateFailure({ kind: 'capture', code: 'SCREEN_TRACK_ENDED' })
+const gateMessage = computed(() =>
+  describeScreenGateState({
+    isLost: screenShare.isLost,
+    unsupportedReason: screenShare.unsupportedReason,
+    failure: screenShare.failure,
+  }),
+)
+
+/**
+ * join 失败（§43 的 404 / 409 / 401 / 403）。
+ *
+ * 只保留 ApiError（带契约里的 code），非 ApiError 一律走通用文案：
+ * 后端原始报文绝不进界面（§58）。
+ */
+const joinError = ref<ApiError | null>(null)
+const joinErrorMessage = computed(() =>
+  joinError.value === null ? null : describeStudentClassroomError(joinError.value),
+)
+
+/** join 请求飞行中（按钮 loading + 禁用，避免连点产生第二个 Session）。 */
+const joining = ref(false)
+
+/**
+ * 这次失败是不是"再点一次也没用"。
+ *
+ * 不在名单里、课堂已关闭、账号被停用、登录失效——这四种情况下继续握着屏幕轨道
+ * 没有任何意义，学生会带着"我还在共享"的错觉停在这一页。其余（网络、5xx、限流）
+ * 属于可重试，轨道必须留着：Gate 已经通过，重试不该再弹一次授权窗口。
+ */
+function isFatalJoinError(error: ApiError): boolean {
+  return (
+    error.code === 'STUDENT_NOT_ASSIGNED' ||
+    error.code === 'CLASSROOM_CLOSED' ||
+    error.code === 'ACCOUNT_DISABLED' ||
+    error.code === 'AUTH_REQUIRED'
+  )
+}
+
+/**
+ * 进入课堂：先 Gate，后 join（§18 的顺序不能变）。
+ *
+ * 已经共享过（join 失败后重试）时跳过 Gate，直接重发 join——这条路径下屏幕权限
+ * 还在，再请求一次只会让浏览器弹第二次授权框（§20 明确禁止）。
+ */
+async function enterClassroom(): Promise<void> {
+  if (joining.value) return
+
+  if (!screenShare.isSharing) {
+    // 必须在 click 处理函数里同步发起：getDisplayMedia 要求用户手势
+    // （transient activation）。这里刻意不 await 别的事情。
+    await screenShare.start()
+    if (!screenShare.isSharing) return
   }
-  if (screenShare.unsupportedReason) {
-    return describeScreenGateFailure({ kind: 'unsupported', reason: screenShare.unsupportedReason })
-  }
-  if (screenShare.failure) {
-    return describeScreenGateFailure({
-      kind: 'capture',
-      code: screenShare.failure.code,
-      surface: screenShare.failure.surface,
-      causeName: screenShare.failure.causeName,
+
+  const capture = screenShare.capture
+  if (capture === null) return
+
+  joining.value = true
+  joinError.value = null
+  try {
+    const response = await joinClassroom(
+      classroomId.value,
+      toJoinCaptureDiagnostics(describeScreenCapture(capture)),
+    )
+    /**
+     * 移交所有权：轨道**不停**，会话页要用同一条（§20）。
+     * 顺序很关键——先 join 成功再移交，这样失败时轨道仍归本页管，
+     * 学生可以直接重试进入课堂而不必重新选一次共享范围。
+     */
+    const handed = screenShare.handOff()
+    if (handed === null) return
+    mediaSession.prepare({
+      sessionId: response.sessionId,
+      classroomId: classroomId.value,
+      credentials: { livekitUrl: response.livekitUrl, token: response.token },
+      capture: handed,
     })
+    await router.push({
+      name: 'student-session',
+      params: { sessionId: response.sessionId },
+    })
+  } catch (cause) {
+    const error = isApiError(cause) ? cause : null
+    joinError.value = error
+    if (error !== null && isFatalJoinError(error)) {
+      // 走不到课堂了：停掉共享，别让学生继续被看着（§22 的同一条理由）。
+      screenShare.stop()
+    }
+  } finally {
+    joining.value = false
   }
-  return null
-})
+}
+
+function stopScreenShare(): void {
+  screenShare.stop()
+  joinError.value = null
+}
 
 /**
  * 共享中状态里的诊断值。
@@ -160,20 +258,6 @@ const gateMessage = computed(() => {
  * 只显示枚举值本身——设备名、窗口标题这类信息一个都不显示。
  */
 const surfaceDetail = computed(() => screenShare.diagnostics?.rawDisplaySurface ?? '未提供')
-
-function startScreenShare(): void {
-  /**
-   * 必须在 click 处理函数里**同步**发起：`getDisplayMedia` 要求用户手势
-   * （transient activation）。若先 await 别的事情，手势失效，浏览器会抛
-   * `InvalidStateError`，学生会看到一句和"选错共享面"毫无关系的报错。
-   * 这里刻意不 await：状态与文案都由 store/计算属性承担。
-   */
-  void screenShare.start()
-}
-
-function stopScreenShare(): void {
-  screenShare.stop()
-}
 
 function retry(): void {
   if (classroomId.value) void store.fetchDetail(classroomId.value)
@@ -340,27 +424,30 @@ function retry(): void {
         </div>
 
         <!--
-          §18 / §20：Gate 通过之后才轮到 join 与 publish，而那两步属于 Phase 6。
-          必须写出来，否则学生会以为"正在共享"就等于"已经进课堂了"，
-          然后坐在 PreJoin 页上等老师看到自己。
+          join 正在进行：说明"共享已就绪，正在进入课堂"。
+          这句话必须存在——否则学生会以为"正在共享"就等于"已经在课堂里了"，
+          然后坐在这页上等老师看到自己。
         -->
-        <AppAlert
-          class="mt-4"
-          tone="info"
-          title="整屏共享已就绪，进入课堂将在 Phase 6 接入"
-          data-testid="phase6-notice"
-        >
-          把这条已经授权的屏幕轨道发布到课堂（LiveKit）由 Phase 6
-          实现。现在无需重复共享，请保持本页打开。
-        </AppAlert>
+        <p v-if="joining" class="mt-4 text-sm text-ink-muted" data-testid="joining-classroom">
+          整屏共享已就绪，正在进入课堂…
+        </p>
       </AppCard>
+
+      <!--
+        join 失败（§43）：404 不在名单 / 409 课堂已关闭 / 网络错误。
+        可重试的失败**保留**已经通过的共享——再点一次按钮只会重发 join，
+        不会重新弹一次屏幕授权（§20）。
+      -->
+      <AppAlert v-if="joinErrorMessage" tone="danger" title="进入课堂失败" data-testid="join-error">
+        {{ joinErrorMessage }}
+      </AppAlert>
 
       <!--
         §22：共享被结束（学生点了浏览器的"停止共享"，或浏览器自己结束了轨道）。
         这不是"错误"而是"当前状态不满足课堂要求"，所以用 ⚠ + 一个明确的恢复动作，
         并且**留在本页**——跳走或伪装成功都会在老师那端留下一个没有屏幕的"在线"学生。
       -->
-      <AppCard v-else-if="screenShare.isLost" data-testid="screen-lost">
+      <AppCard v-if="screenShare.isLost" data-testid="screen-lost">
         <div class="space-y-2">
           <h2 class="text-base font-medium">⚠ 已停止屏幕共享</h2>
           <p class="text-sm leading-relaxed text-ink-muted">当前课堂要求持续共享整个屏幕。</p>
@@ -372,7 +459,7 @@ function retry(): void {
         每句文案都必须带"下一步做什么"，因为学生此刻唯一的出路就是再点一次按钮。
       -->
       <AppAlert
-        v-else-if="gateMessage"
+        v-if="gateMessage"
         tone="danger"
         :title="gateMessage.title"
         data-testid="screen-gate-error"
@@ -382,12 +469,11 @@ function retry(): void {
 
       <div class="space-y-3">
         <AppButton
-          v-if="!screenShare.isSharing"
           block
           :disabled="!canStartShare || screenShare.isRequesting"
-          :loading="screenShare.isRequesting"
+          :loading="screenShare.isRequesting || joining"
           data-testid="enter-classroom"
-          @click="startScreenShare"
+          @click="enterClassroom"
         >
           {{ startButtonLabel }}
         </AppButton>

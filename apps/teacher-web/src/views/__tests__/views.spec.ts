@@ -18,12 +18,24 @@ import LoginView from '../LoginView.vue'
  * 页面级冒烟测试：每个 view 都在**真实 URL**下挂载一次。
  *
  * 既验证 §55 的路径契约，也钉住"哪些页面已经是真实实现、哪些仍是占位"——
- * Phase 3 结束后只有监督墙还是占位（它属于 Phase 7），其余页面必须真的渲染数据。
+ * Phase 6 之后教师端**没有**占位页了：监督墙也是真实实现（§29/§51/§52）。
  */
 vi.mock('../../lib/auth-api.ts', () => ({
   login: vi.fn(),
   fetchCurrentUser: vi.fn().mockRejectedValue(new ApiError({ code: 'AUTH_REQUIRED', status: 401 })),
   logout: vi.fn().mockResolvedValue(undefined),
+}))
+
+/**
+ * 监督接口：这一页现在会真的申请媒体凭据并拉 monitor 数据。
+ * 页面级的冒烟测试只关心"渲染出内容"，媒体链路的行为由
+ * `classroom-monitor-view.spec.ts` 覆盖，这里给一个不产生副作用的空列表。
+ */
+vi.mock('../../lib/teacher-monitor-api.ts', () => ({
+  getMonitor: vi.fn().mockResolvedValue([]),
+  requestMediaToken: vi
+    .fn()
+    .mockResolvedValue({ livekitUrl: 'wss://example.invalid', token: 'test-token' }),
 }))
 
 vi.mock('../../lib/teacher-classrooms-api.ts', () => ({
@@ -69,17 +81,16 @@ describe('教师端页面', () => {
     expect(wrapper.findComponent(PhasePlaceholder).exists()).toBe(false)
   })
 
-  it('/teacher/classrooms/:id/monitor 仍是占位页，写明 Phase 7 与监督墙范围', async () => {
+  it('Phase 6：监督墙不再是占位页，而是真的渲染课堂与学生卡片容器', async () => {
     const wrapper = await mountAt('/teacher/classrooms/room-1/monitor', ClassroomMonitorView)
 
     const text = wrapper.text()
-    expect(text).toContain('/teacher/classrooms/room-1/monitor')
     expect(text).toContain('课堂监督墙')
-    expect(text).toContain('将在 Phase 7：多学生监督墙与 Focus View 实现')
-    expect(text).toContain('Focus View')
+    expect(text).toContain('C++ 算法训练')
+    expect(wrapper.findComponent(PhasePlaceholder).exists()).toBe(false)
   })
 
-  it('监督墙占位页给出回到课堂详情的入口（不用按浏览器后退）', async () => {
+  it('监督墙给出回到课堂详情的入口（不用按浏览器后退）', async () => {
     const wrapper = await mountAt('/teacher/classrooms/room-1/monitor', ClassroomMonitorView)
 
     expect(wrapper.find('[data-testid="monitor-back"]').attributes('href')).toBe(

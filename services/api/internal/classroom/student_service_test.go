@@ -280,6 +280,12 @@ func (nilRepository) GetForStudent(context.Context, uuid.UUID, uuid.UUID) (*Stud
 	return nil, nil
 }
 
+func (nilRepository) GetStudentEntry(context.Context, uuid.UUID, uuid.UUID) (*StudentEntry, error) {
+	return nil, nil
+}
+
+func (nilRepository) GetRunByID(context.Context, uuid.UUID) (*Run, error) { return nil, nil }
+
 // names renders a list of classrooms for a failure message: ids only, because a
 // classroom name in a test failure is noise (and is user content).
 func names(classrooms []StudentClassroom) []string {

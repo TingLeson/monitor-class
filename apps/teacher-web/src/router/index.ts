@@ -66,7 +66,8 @@ export const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: true, title: '课堂详情' },
   },
 
-  // Phase 7：老师监督墙（多学生桌面网格 + Focus View，§29 / §30）。
+  // Phase 6：老师监督墙（桌面卡片列表 + 手动订阅，§29 / §51 / §52）。
+  // Focus View 与"按可见性动态订阅"属 Phase 7（§30 / §52），本 Phase 不做。
   {
     path: '/teacher/classrooms/:id/monitor',
     name: 'teacher-classroom-monitor',

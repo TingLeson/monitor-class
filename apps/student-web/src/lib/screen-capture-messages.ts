@@ -147,3 +147,44 @@ export function describeScreenGateFailure(failure: ScreenGateFailure): ScreenGat
       }
   }
 }
+
+/** Gate 相关状态的最小快照（PreJoin 与会话页各有一份，形状相同）。 */
+export interface ScreenGateStateInput {
+  /** 曾经共享过、现在断了（§22 → 要提示重新共享）。 */
+  isLost: boolean
+  /** 能力自检失败的原因（§17）。 */
+  unsupportedReason: ScreenCaptureUnsupportedReason | null
+  /** Gate 拒绝 / 请求失败。 */
+  failure: {
+    code: ScreenCaptureErrorCode
+    surface: ScreenSurface | null
+    causeName: string | null
+  } | null
+}
+
+/**
+ * 把 screen-share store 的三类状态折叠成一段可直接渲染的说明（§16/§17/§22）。
+ *
+ * WHY 抽出来给两个页面共用：PreJoin（第一次共享）与会话页（屏幕丢失后重新共享，
+ * §22）必须给出**完全一样**的话术。学生在这两个地方遇到的是同一件事——"现在没有
+ * 满足课堂要求的共享"——如果措辞不同，他会以为遇到了两种不同的问题。
+ *
+ * 返回 null 表示"没有什么要说的"（正在共享 / 未开始）。
+ */
+export function describeScreenGateState(state: ScreenGateStateInput): ScreenGateMessage | null {
+  if (state.isLost) {
+    return describeScreenGateFailure({ kind: 'capture', code: 'SCREEN_TRACK_ENDED' })
+  }
+  if (state.unsupportedReason !== null) {
+    return describeScreenGateFailure({ kind: 'unsupported', reason: state.unsupportedReason })
+  }
+  if (state.failure !== null) {
+    return describeScreenGateFailure({
+      kind: 'capture',
+      code: state.failure.code,
+      surface: state.failure.surface,
+      causeName: state.failure.causeName,
+    })
+  }
+  return null
+}

@@ -73,9 +73,10 @@ livekit  (healthy) ─┘
 | `POSTGRES_PORT` / `REDIS_PORT` | PostgreSQL / Redis 在宿主机的端口 | 默认 `5432` / `6380`（6379 常被其它项目占用） |
 | `DATABASE_URL` | 宿主机直连数据库 | 容器内由 compose 覆盖为 `postgres:5432` |
 | `REDIS_ADDR` | Redis 地址 | 容器内为 `redis:6379` |
-| `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | LiveKit 服务端凭据 | **只注入后端与 LiveKit 容器**；绝不能进前端产物 |
-| `LIVEKIT_URL` | 下发给浏览器的信令地址 | 必须是**浏览器可达**的地址（`ws://localhost:7880`） |
-| `LIVEKIT_API_URL` | 后端调用 LiveKit HTTP API | 容器内为 `http://livekit:7880` |
+| `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | LiveKit 服务端凭据 | **只注入后端**；绝不能进前端产物、日志或仓库 |
+| `LIVEKIT_URL` | 下发给浏览器的信令地址 | `wss://` 开头（Cloud）或 `ws://localhost:7880`（本地容器） |
+| `LIVEKIT_API_URL` | 后端调用 LiveKit HTTP API | `https://` 开头（Cloud）或 `http://localhost:7880`（本地容器） |
+| `LIVEKIT_TOKEN_TTL` | 媒体 Token 有效期 | 默认 `2h`；课堂中途重连要用同一个 Token，不宜过短 |
 | `CORS_ALLOWED_ORIGINS` | 允许携带 Cookie 的来源白名单 | 禁止用 `*`；新增端口必须同步修改 |
 | `DB_AUTO_MIGRATE` | 启动时自动迁移 | 默认 `false`；生产必须为 `false` |
 | `SESSION_COOKIE_SECURE` | Cookie 是否要求 HTTPS | 本地 http 必须为 `false`，生产必须为 `true` |
@@ -125,6 +126,36 @@ make test            # Go 单测 + 前端单测
 make test-integration# 需要真实 PostgreSQL 的集成测试（复用 compose 里的实例）
 make ci              # 与 CI 等价的完整检查
 ```
+
+### 4.0 媒体面：LiveKit Cloud 或本地容器（二选一）
+
+ClassWatch 只要求"有一个 LiveKit SFU"，不关心它在哪。默认用 **LiveKit Cloud**（`.env` 里配置），
+需要完全离线开发时用本地容器：
+
+```bash
+# A) LiveKit Cloud（默认）
+#   在 .env 里配置（真实密钥只放 .env，.env.example 永远只有占位值）：
+#     LIVEKIT_URL=wss://<project>.livekit.cloud
+#     LIVEKIT_API_URL=https://<project>.livekit.cloud
+#     LIVEKIT_API_KEY=...
+#     LIVEKIT_API_SECRET=...
+make up            # 只起 postgres / redis / migrate / api
+
+# B) 本地容器
+docker compose --profile local-media up -d     # 额外起 livekit（容器名 classwatch-livekit-1）
+#   然后把 .env 改成：
+#     LIVEKIT_URL=ws://localhost:7880
+#     LIVEKIT_API_URL=http://localhost:7880
+#     LIVEKIT_API_KEY=devkey
+#     LIVEKIT_API_SECRET=classwatch_dev_livekit_secret_32b
+```
+
+为什么本地容器放进 `profile`：**避免"以为在用云、其实连的是本地容器"**这种最难排查的错配。
+API 启动时会自己去探活配置里的 LiveKit（`/readyz` 的 `livekit` 项就是它），
+探不通就按 `STARTUP_REQUIRE_DEPENDENCIES` 拒绝启动——不会出现"服务起来了但媒体面是坏的"。
+
+> 注意两种模式的协议不同：浏览器侧是 `wss://`，后端侧是 `https://`（本地是 `ws://` / `http://`）。
+> 写错的表现分别是"浏览器连不上"和"后端探活失败"，症状完全不同，别混。
 
 ### 4.1 第一次使用：创建管理员与测试账号
 
@@ -222,7 +253,10 @@ TEST_DATABASE_URL='postgres://classwatch:classwatch_dev_password@localhost:5432/
 | 前端能打开但接口全部失败（连到了别的服务） | 检查 `VITE_API_PROXY_TARGET` 是否指向本项目的 `API_PORT`；改完 `.env` 需要重启前端 dev server |
 | 前端请求 404 / CORS 报错 | 前端通过 Vite 代理访问 `/api`；若直连 API，需要把来源加入 `CORS_ALLOWED_ORIGINS` 并重启 api |
 | Cookie 登录后立刻失效（Phase 1 起） | 本地是 http，`SESSION_COOKIE_SECURE` 必须为 `false`；跨端口场景下前后端必须是同源（Vite 代理保证） |
-| `livekit: error` 但容器在跑 | 检查 `.env` 中 `LIVEKIT_API_KEY/SECRET` 与 `LIVEKIT_KEYS` 注入是否一致；`make logs S=livekit` |
+| `readyz` 的 `livekit: unauthenticated` | key/secret 不匹配（常见于切换了 Cloud 项目但没改 `.env`） |
+| `readyz` 的 `livekit: unreachable` | `LIVEKIT_API_URL` 写错协议或网络不通；Cloud 项目已删除时也会这样 |
+| 浏览器能连后端但连不上媒体 | 前端拿到的是 `wss://` 地址，检查 `.env` 的 `LIVEKIT_URL` 是不是误写成 `https://` |
+| 想确认当前用的是哪个 LiveKit | `make doctor` 会打印实际探测的地址（`LiveKit (<LIVEKIT_API_URL>)`） |
 | PostgreSQL 大版本升级后起不来 | 数据卷与 `PGDATA` 布局绑定：`make nuke` 清空本地数据后重建（开发库无重要数据） |
 | `pnpm install` 报 peer 冲突 | 先 `pnpm install` 保证 lockfile 一致；不要用 `--force` 掩盖，应修正版本 |
 | `docker build` / `make up` 卡住几分钟没输出 | macOS Docker Desktop 的凭据助手 `docker-credential-desktop` 有时会挂住（会一直等待钥匙串）。用隔离的 docker 配置绕过（不改动你的 `~/.docker/config.json`）：见下方「凭据助手卡死」 |

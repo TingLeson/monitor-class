@@ -115,6 +115,14 @@ export function makeFakeStream(tracks: FakeTrack[], withVideo = true): FakeStrea
 
 export interface MediaDevicesStub {
   calls: CapturedCall[]
+  /**
+   * 每次调用返回的流，按顺序排列。
+   *
+   * WHY 要留下来：Phase 6 最关键的断言是"publish 的是**同一条**轨道"。
+   * 只有能拿到替身造出来的那条 track，才能把它和 publish 的入参做身份比较
+   * （而不是比较一个宽泛的"被调用过"）。
+   */
+  streams: FakeStream[]
   /** 下一次（以及之后）的选择；要在中途换结果就直接改这个字段。 */
   surface: ScreenSurfaceUnderTest
   /** 让 getDisplayMedia 抛出这个错误（模拟用户取消 / 系统拒绝 / 其它失败）。 */
@@ -129,6 +137,7 @@ export function makeMediaDevicesStub(
 ): MediaDevicesStub {
   const stub: MediaDevicesStub = {
     calls: [],
+    streams: [],
     surface,
     failWith: null,
     beforeCall: null,
@@ -136,7 +145,9 @@ export function makeMediaDevicesStub(
       stub.beforeCall?.()
       stub.calls.push({ constraints, surface: stub.surface })
       if (stub.failWith) return Promise.reject(stub.failWith)
-      return Promise.resolve(makeFakeStream([makeFakeTrack(stub.surface)]))
+      const stream = makeFakeStream([makeFakeTrack(stub.surface)])
+      stub.streams.push(stream)
+      return Promise.resolve(stream)
     },
   }
   return stub
@@ -198,6 +209,17 @@ export function makeFakeCapture(
       options.onStop?.()
     },
     onEnded(listener: () => void): () => void {
+      /**
+       * 已经结束的轨道不会再触发 `ended`：直接回调一次。
+       *
+       * 这与真实实现（`screen-capture.ts`）的契约一致，也是会话页必须处理的一个
+       * 真实窗口——轨道可能在"订阅监听"之前就被浏览器结束了。替身少了这一条，
+       * 那个窗口就永远不会被测到。
+       */
+      if (stopped || track.readyState === 'ended') {
+        listener()
+        return () => undefined
+      }
       listeners.push(listener)
       return () => {
         const index = listeners.indexOf(listener)

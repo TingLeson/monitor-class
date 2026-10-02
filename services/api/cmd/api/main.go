@@ -35,6 +35,7 @@ import (
 	"github.com/classwatch/classwatch/services/api/internal/infrastructure/redis"
 	"github.com/classwatch/classwatch/services/api/internal/media"
 	"github.com/classwatch/classwatch/services/api/internal/ratelimit"
+	"github.com/classwatch/classwatch/services/api/internal/session"
 	"github.com/classwatch/classwatch/services/api/internal/user"
 )
 
@@ -110,6 +111,7 @@ func run() error {
 		Auth:      deps.authService(logger, cfg, users),
 		Admin:     deps.adminService(logger, cfg, users),
 		Classroom: deps.classroomService(logger, users),
+		Session:   deps.sessionService(logger, cfg, users),
 		Limiter:   deps.rateLimiter(logger),
 	})
 
@@ -257,13 +259,66 @@ func (d *dependencies) adminService(logger *slog.Logger, cfg *config.Config, use
 // classroom repository itself is separate because it owns different tables — and,
 // more importantly, because its Open/Close transactions are the only place allowed
 // to lock a classroom row.
+//
+// The LiveKit client is attached as the room terminator (§49) so a closed classroom
+// ends its media room. It is attached only when LiveKit was reachable at boot: a
+// degraded process has no media plane to clean up, and Close must not fail because of
+// one.
 func (d *dependencies) classroomService(logger *slog.Logger, users user.Repository) httpapi.ClassroomService {
 	if users == nil {
 		logger.Warn("postgres is not connected; teacher classroom routes are disabled",
 			"hint", "STARTUP_REQUIRE_DEPENDENCIES=false must only be used for local work")
 		return nil
 	}
-	return classroom.NewService(classroom.NewPostgres(d.postgres.Pool()), users)
+	service := classroom.NewService(classroom.NewPostgres(d.postgres.Pool()), users)
+	if d.livekit != nil {
+		service.WithRoomTerminator(d.livekit)
+	}
+	return service
+}
+
+// sessionService builds the student media session service (§43/§51).
+//
+// It reuses the classroom service for every authorization question (roster, ownership,
+// classroom state) instead of querying those tables itself: "may this student enter?"
+// must have exactly one implementation, or the join endpoint and the classroom portal
+// will eventually disagree about who is allowed in.
+//
+// The media client is passed even when LiveKit was unreachable at boot — the service
+// then answers MEDIA_TOKEN_FAILED on join/media-token rather than pretending to have a
+// media plane, while the monitor still reports the control plane's own state (§33).
+func (d *dependencies) sessionService(logger *slog.Logger, cfg *config.Config, users user.Repository) httpapi.SessionService {
+	if users == nil {
+		logger.Warn("postgres is not connected; student session routes are disabled",
+			"hint", "STARTUP_REQUIRE_DEPENDENCIES=false must only be used for local work")
+		return nil
+	}
+	classrooms := classroom.NewService(classroom.NewPostgres(d.postgres.Pool()), users)
+	sessionRepo := session.NewPostgres(d.postgres.Pool())
+
+	// The classroom service instance is deliberately a second one (not the one wired
+	// into the teacher routes): both are thin wrappers over the same repositories and
+	// the same rules, and sharing one mutable object across two Deps fields would make
+	// the room terminator attachment above depend on initialization order.
+	mediaPlane := mediaPlaneOrNil(d.livekit)
+	if mediaPlane == nil {
+		logger.Warn("livekit is not reachable; join and media-token will answer MEDIA_TOKEN_FAILED",
+			"hint", "media sessions need the media plane; the monitor still reports control-plane state")
+	}
+	return session.NewService(sessionRepo, classrooms, mediaPlane, session.Config{
+		LiveKitURL: cfg.LiveKitURL,
+		TokenTTL:   cfg.LiveKitTokenTTL,
+	})
+}
+
+// mediaPlaneOrNil narrows the LiveKit client to the media-plane port, mapping "not
+// connected at boot" onto a nil interface so the session service can answer honestly
+// instead of calling into a client that was never verified reachable.
+func mediaPlaneOrNil(client *media.Client) session.MediaPlane {
+	if client == nil {
+		return nil
+	}
+	return client
 }
 
 // rateLimiter builds the rate limiter: Redis when it is available, degrading to

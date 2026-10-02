@@ -59,8 +59,9 @@ const VIEW_CASES: {
   {
     path: '/student/session/session-1',
     component: SessionView,
-    // 课堂会话仍是 Phase 6 的占位页：路径与 Phase 标注都要如实显示。
-    expected: ['/student/session/session-1', '课堂会话 · Phase 6 起实现', '将在 Phase 6 实现'],
+    // Phase 6 起会话页是真的：没有凭据（内存里没有 PreparedSession）时，
+    // 它必须给出"会话信息已丢失 + 回列表"这条确定的出路，而不是一个空页面。
+    expected: ['会话信息已丢失', '返回我的课堂'],
   },
 ]
 

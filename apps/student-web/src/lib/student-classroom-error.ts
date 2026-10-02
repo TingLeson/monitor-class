@@ -34,6 +34,16 @@ const MESSAGES: Partial<Record<ApiErrorCode, string>> = {
   // （后端没有下发 retryAfter，编一个数字等于撒谎），也**不自动重试**。
   RATE_LIMITED: '尝试过于频繁，请稍后再试。',
   NETWORK_ERROR: '网络连接失败，请检查网络后重试。',
+  /**
+   * join 三种拒绝（§43）。
+   *
+   * 每一句都要说清"现在该做什么"，因为学生此刻已经**共享着整块屏幕**：
+   * 一句含糊的"进入失败"会让他保持共享并反复点按钮。前两种还意味着
+   * "再点一次也没用"（PreJoin 会据此停止共享，见视图里的 isFatalJoinError）。
+   */
+  CLASSROOM_CLOSED: '本课堂当前未开启或已被老师关闭。请返回我的课堂，等老师开启后再进入。',
+  SESSION_ALREADY_ACTIVE: '你已经在另一个页面进入了这个课堂。请关闭其他标签页后重试。',
+  MEDIA_TOKEN_FAILED: '课堂的媒体服务暂时不可用。请稍后重试，或返回我的课堂。',
 }
 
 /**

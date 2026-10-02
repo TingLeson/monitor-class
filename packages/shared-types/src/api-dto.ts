@@ -36,6 +36,11 @@ export interface CaptureDiagnostics {
  * 前置条件由前端在调用前完成：已通过整个屏幕 Gate。
  * 真正被后端检查的是（§43）：学生已认证、ACTIVE、课堂 OPEN、学生已被授权、
  * 当前存在 ClassroomRun；任何一条不满足都返回对应错误码。
+ *
+ * `capture` **只有** §43 冻结的这三个字段。多塞字段（rawDisplaySurface、
+ * surfaceActive 之类）在这里是有害的：后端按严格模式解析请求体，未知字段会被
+ * 400 拒绝，于是一次本来能成功的进入课堂变成了学生界面上的一句"请求不合法"。
+ * 前端另有更丰富的诊断信息，但那是日志/UI 的事，不是这份契约的事。
  */
 export interface JoinClassroomRequest {
   capture?: CaptureDiagnostics
@@ -50,6 +55,22 @@ export interface JoinClassroomRequest {
 export interface JoinClassroomResponse {
   sessionId: Uuid
   /** 学生浏览器直连的 LiveKit 地址（wss://...）。 */
+  livekitUrl: string
+  token: string
+}
+
+/**
+ * 老师端媒体 Token 响应（§42 Teacher `POST /classrooms/:id/media-token`）。
+ *
+ * 结构与 {@link JoinClassroomResponse} 的前两项完全相同，但**刻意分成两个类型**：
+ * 它们回答的是两个不同的问题——学生响应里的 `sessionId` 是"这次进入课堂产生的
+ * 会话"，老师端没有会话，强行复用一个类型会逼出一个永远为 null 的字段。
+ *
+ * 地址与 token 都由后端下发（§44）：前端不拼 URL、不持有 key/secret，
+ * Token 只放内存，禁止写入 Web Storage / URL / 日志。
+ */
+export interface MediaTokenResponse {
+  /** 老师浏览器直连的 LiveKit 地址（wss://...）。 */
   livekitUrl: string
   token: string
 }

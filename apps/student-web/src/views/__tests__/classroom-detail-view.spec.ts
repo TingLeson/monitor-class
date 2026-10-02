@@ -9,9 +9,11 @@ import {
   makeMediaDevicesStub,
   type MediaDevicesStub,
 } from '../../__tests__/screen-fixtures'
+import { makeJoinResponse } from '../../__tests__/media-fixtures'
 import { ScreenGateError } from '../../lib/screen-capture'
 import { routes } from '../../router'
 import { useClassroomsStore } from '../../stores/classrooms'
+import { useMediaSessionStore } from '../../stores/media-session.ts'
 import { useScreenShareStore } from '../../stores/screen-share'
 import ClassroomDetailView from '../ClassroomDetailView.vue'
 
@@ -32,15 +34,27 @@ import ClassroomDetailView from '../ClassroomDetailView.vue'
  * 是**真的**：能力自检必须端到端地真的去读 `navigator.mediaDevices`，
  * 否则"能力不足时禁用主按钮"这条断言就没有意义。
  */
-const { getClassroomMock, requestEntireScreenMock, releaseScreenCaptureMock } = vi.hoisted(() => ({
-  getClassroomMock: vi.fn(),
-  requestEntireScreenMock: vi.fn(),
-  releaseScreenCaptureMock: vi.fn(),
-}))
+const { getClassroomMock, requestEntireScreenMock, releaseScreenCaptureMock, joinClassroomMock } =
+  vi.hoisted(() => ({
+    getClassroomMock: vi.fn(),
+    requestEntireScreenMock: vi.fn(),
+    releaseScreenCaptureMock: vi.fn(),
+    joinClassroomMock: vi.fn(),
+  }))
 
 vi.mock('../../lib/student-classrooms-api.ts', () => ({
   listClassrooms: vi.fn(),
   getClassroom: getClassroomMock,
+}))
+
+/**
+ * join 走替身：真实实现在 `student-sessions-api.spec.ts` 里被逐字钉住
+ * （路径、CSRF、"请求体只有 §43 的三个字段"）。这里关心的是页面对
+ * "join 成功 / 失败"的反应，以及**交接**（同一页不再请求第二次屏幕）。
+ */
+vi.mock('../../lib/student-sessions-api.ts', () => ({
+  joinClassroom: joinClassroomMock,
+  leaveSession: vi.fn(),
 }))
 
 vi.mock('../../lib/screen-capture.ts', async (importOriginal) => {
@@ -95,6 +109,8 @@ describe('PreJoin 页', () => {
     releaseScreenCaptureMock.mockReset().mockImplementation((capture: { stop(): void } | null) => {
       capture?.stop()
     })
+    // 默认 join 成功：绝大多数用例关心的是"进去之后"的行为。
+    joinClassroomMock.mockReset().mockResolvedValue(makeJoinResponse())
   })
 
   it('顶部显示课堂名、说明副标题、老师与状态', async () => {
@@ -169,26 +185,128 @@ describe('PreJoin 页', () => {
     expect(requestEntireScreenMock).toHaveBeenCalledTimes(1)
   })
 
-  it('Gate 通过：显示「正在共享整个屏幕」+ 诊断值 + Phase 6 说明，且没有自身预览', async () => {
+  it('§18：Gate 通过后才 join，并把 capture 诊断一起提交；成功后进入会话页', async () => {
     installCapableBrowser()
     requestEntireScreenMock.mockResolvedValue(makeFakeCapture())
+    const { wrapper, router } = await mountView('room-open')
+
+    // Gate 之前绝不 join：§18 的顺序不能变（先进课堂再要权限就晚了）。
+    expect(joinClassroomMock).not.toHaveBeenCalled()
+
+    await wrapper.find('[data-testid="enter-classroom"]').trigger('click')
+    await flushPromises()
+
+    expect(joinClassroomMock).toHaveBeenCalledWith('room-open', {
+      displaySurface: 'monitor',
+      width: 0,
+      height: 0,
+    })
+    expect(router.currentRoute.value.fullPath).toBe('/student/session/session-1')
+    // 屏幕共享只申请一次（§20）：这一页不再有第二次请求的机会。
+    expect(requestEntireScreenMock).toHaveBeenCalledTimes(1)
+    expect(wrapper.find('video').exists()).toBe(false)
+  })
+
+  it('Phase 6：成功的 join 会把凭据与同一条轨道交接给会话 store', async () => {
+    installCapableBrowser()
+    const capture = makeFakeCapture()
+    requestEntireScreenMock.mockResolvedValue(capture)
     const { wrapper } = await mountView('room-open')
 
     await wrapper.find('[data-testid="enter-classroom"]').trigger('click')
     await flushPromises()
 
-    expect(wrapper.find('[data-testid="screen-sharing-status"]').text()).toBe('🖥 正在共享整个屏幕')
-    // displaySurface 的原始值是 Gate 的唯一判据，展示出来才有诊断价值。
-    expect(wrapper.find('[data-testid="screen-surface"]').text()).toBe('monitor')
-    expect(wrapper.find('[data-testid="phase6-notice"]').text()).toContain(
-      '进入课堂将在 Phase 6 接入',
-    )
-    expect(wrapper.find('[data-testid="phase6-notice"]').text()).toContain('LiveKit')
-    // 共享中不再显示主按钮（避免第二次请求 / 重复授权弹窗）。
-    expect(wrapper.find('[data-testid="enter-classroom"]').exists()).toBe(false)
+    const mediaSession = useMediaSessionStore()
+    expect(mediaSession.phase).toBe('prepared')
+    expect(mediaSession.sessionId).toBe('session-1')
+    // 轨道所有权已经移交：PreJoin 的 store 交出去之后不再持有它。
+    expect(useScreenShareStore().capture).toBeNull()
+    // 交接**不能**停掉轨道（§20：会话页要用同一条）。
+    expect(capture.track.readyState).toBe('live')
+    expect(releaseScreenCaptureMock).not.toHaveBeenCalledWith(capture)
+  })
+
+  it('join 失败（网络错误）：保留已经通过的共享，按钮变成「重试进入课堂」', async () => {
+    installCapableBrowser()
+    requestEntireScreenMock.mockResolvedValue(makeFakeCapture())
+    joinClassroomMock.mockRejectedValue(new ApiError({ code: 'NETWORK_ERROR', status: 0 }))
+    const { wrapper, router } = await mountView('room-open')
+
+    await wrapper.find('[data-testid="enter-classroom"]').trigger('click')
+    await flushPromises()
+
+    const error = wrapper.find('[data-testid="join-error"]')
+    expect(error.exists()).toBe(true)
+    expect(error.text()).toContain('网络连接失败')
+    // 没有跳转，也没有把共享丢掉：学生重试时不必再选一次共享范围。
+    expect(router.currentRoute.value.fullPath).toBe('/student/classrooms/room-open')
     expect(wrapper.find('[data-testid="stop-screen-share"]').exists()).toBe(true)
-    // §56：绝不显示自己的屏幕预览。
-    expect(wrapper.find('video').exists()).toBe(false)
+
+    const button = wrapper.find('[data-testid="enter-classroom"]')
+    expect(button.text()).toBe('重试进入课堂')
+
+    // 重试：不再请求第二次屏幕（否则学生会看到第二次授权弹窗，§20）。
+    joinClassroomMock.mockResolvedValue(makeJoinResponse())
+    await button.trigger('click')
+    await flushPromises()
+
+    expect(requestEntireScreenMock).toHaveBeenCalledTimes(1)
+    expect(joinClassroomMock).toHaveBeenCalledTimes(2)
+    expect(router.currentRoute.value.fullPath).toBe('/student/session/session-1')
+  })
+
+  it('join 409 CLASSROOM_CLOSED：说明原因并**停止共享**（走不到课堂就别继续被看着）', async () => {
+    installCapableBrowser()
+    const capture = makeFakeCapture()
+    requestEntireScreenMock.mockResolvedValue(capture)
+    joinClassroomMock.mockRejectedValue(new ApiError({ code: 'CLASSROOM_CLOSED', status: 409 }))
+    const { wrapper, router } = await mountView('room-open')
+
+    await wrapper.find('[data-testid="enter-classroom"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="join-error"]').text()).toContain('已被老师关闭')
+    expect(capture.track.readyState).toBe('ended')
+    expect(releaseScreenCaptureMock).toHaveBeenCalledWith(capture)
+    expect(router.currentRoute.value.fullPath).toBe('/student/classrooms/room-open')
+    expect(useScreenShareStore().status).toBe('idle')
+  })
+
+  it('join 404 STUDENT_NOT_ASSIGNED：同样停止共享，不给"再试一次"的错觉', async () => {
+    installCapableBrowser()
+    const capture = makeFakeCapture()
+    requestEntireScreenMock.mockResolvedValue(capture)
+    joinClassroomMock.mockRejectedValue(new ApiError({ code: 'STUDENT_NOT_ASSIGNED', status: 404 }))
+    const { wrapper } = await mountView('room-open')
+
+    await wrapper.find('[data-testid="enter-classroom"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="join-error"]').text()).toContain('不在这个课堂的名单里')
+    expect(capture.track.readyState).toBe('ended')
+  })
+
+  it('join 飞行中：显示"正在进入课堂"，按钮禁用（不产生第二个 Session）', async () => {
+    installCapableBrowser()
+    requestEntireScreenMock.mockResolvedValue(makeFakeCapture())
+    let releaseJoin: (value: ReturnType<typeof makeJoinResponse>) => void = () => undefined
+    joinClassroomMock.mockReturnValue(
+      new Promise((resolve) => {
+        releaseJoin = resolve
+      }),
+    )
+    const { wrapper } = await mountView('room-open')
+
+    await wrapper.find('[data-testid="enter-classroom"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="joining-classroom"]').text()).toContain('正在进入课堂')
+    expect(wrapper.find('[data-testid="enter-classroom"]').attributes('disabled')).toBeDefined()
+    expect(joinClassroomMock).toHaveBeenCalledTimes(1)
+
+    releaseJoin(makeJoinResponse())
+    await flushPromises()
+    expect(joinClassroomMock).toHaveBeenCalledTimes(1)
   })
 
   it('选了窗口（SCREEN_NOT_MONITOR）：就地展示原因、不跳转、可重试（§65 Case 7）', async () => {
@@ -268,15 +386,22 @@ describe('PreJoin 页', () => {
     expect(error.text()).toContain(UNVERIFIABLE_NOTICE)
   })
 
-  it('共享被结束：显示「已停止屏幕共享 / 当前课堂要求持续共享整个屏幕」+ 重新共享', async () => {
+  it('共享在 join 途中被结束：不跳转，显示「已停止屏幕共享」+ 重新共享（§22）', async () => {
     installCapableBrowser()
     const capture = makeFakeCapture()
     requestEntireScreenMock.mockResolvedValue(capture)
-    const { wrapper } = await mountView('room-open')
+    // join 还没回来时学生点了浏览器的"停止共享"：这正是最危险的一个窗口——
+    // 如果这时照常跳转，会话页会拿到一条已经死掉的轨道。
+    let releaseJoin: (value: ReturnType<typeof makeJoinResponse>) => void = () => undefined
+    joinClassroomMock.mockReturnValue(
+      new Promise((resolve) => {
+        releaseJoin = resolve
+      }),
+    )
+    const { wrapper, router } = await mountView('room-open')
 
     await wrapper.find('[data-testid="enter-classroom"]').trigger('click')
     await flushPromises()
-    expect(wrapper.find('[data-testid="screen-sharing-status"]').exists()).toBe(true)
 
     capture.emitEnded()
     await flushPromises()
@@ -285,22 +410,44 @@ describe('PreJoin 页', () => {
     expect(lost.exists()).toBe(true)
     expect(lost.text()).toContain('已停止屏幕共享')
     expect(lost.text()).toContain('当前课堂要求持续共享整个屏幕')
+    // 断了就是断了：不能还挂着"正在共享"。
+    expect(wrapper.find('[data-testid="screen-sharing-status"]').exists()).toBe(false)
+    expect(releaseScreenCaptureMock).toHaveBeenCalledWith(capture)
+    expect(capture.track.readyState).toBe('ended')
+
+    // join 这时才回来：绝不能拿着一条已经死掉的轨道跳进会话页。
+    releaseJoin(makeJoinResponse())
+    await flushPromises()
+
+    expect(router.currentRoute.value.fullPath).toBe('/student/classrooms/room-open')
+    expect(useMediaSessionStore().phase).toBe('idle')
 
     const button = wrapper.find('[data-testid="enter-classroom"]')
     expect(button.text()).toBe('重新共享整个屏幕')
     expect(button.attributes('disabled')).toBeUndefined()
-    // 断了就是断了：不能还挂着"正在共享"。
-    expect(wrapper.find('[data-testid="screen-sharing-status"]').exists()).toBe(false)
-    expect(releaseScreenCaptureMock).toHaveBeenCalled()
-    expect(capture.track.readyState).toBe('ended')
+  })
 
-    // §65 Case 11：重新共享能恢复"正在共享"状态。
+  it('§65 Case 11：重新共享后恢复"正在共享"并进入课堂', async () => {
+    installCapableBrowser()
+    const capture = makeFakeCapture()
+    requestEntireScreenMock.mockResolvedValue(capture)
+    joinClassroomMock.mockRejectedValueOnce(new ApiError({ code: 'NETWORK_ERROR', status: 0 }))
+    const { wrapper, router } = await mountView('room-open')
+
+    await wrapper.find('[data-testid="enter-classroom"]').trigger('click')
+    await flushPromises()
+    // 第一次 join 失败 → 学生停止共享 → 重新共享（走完整 Gate）。
+    capture.emitEnded()
+    await flushPromises()
+    expect(wrapper.find('[data-testid="screen-lost"]').exists()).toBe(true)
+
     requestEntireScreenMock.mockResolvedValue(makeFakeCapture())
-    await button.trigger('click')
+    joinClassroomMock.mockResolvedValue(makeJoinResponse())
+    await wrapper.find('[data-testid="enter-classroom"]').trigger('click')
     await flushPromises()
 
-    expect(wrapper.find('[data-testid="screen-sharing-status"]').exists()).toBe(true)
-    expect(wrapper.find('[data-testid="screen-lost"]').exists()).toBe(false)
+    expect(requestEntireScreenMock).toHaveBeenCalledTimes(2)
+    expect(router.currentRoute.value.fullPath).toBe('/student/session/session-1')
   })
 
   it('重复点击只触发一次捕获（请求飞行中按钮禁用 + store 重入保护）', async () => {
@@ -311,6 +458,7 @@ describe('PreJoin 页', () => {
         release = resolve
       }),
     )
+    joinClassroomMock.mockReturnValue(new Promise(() => undefined))
     const { wrapper } = await mountView('room-open')
 
     const button = wrapper.find('[data-testid="enter-classroom"]')
@@ -374,10 +522,11 @@ describe('PreJoin 页', () => {
     expect(requestEntireScreenMock).not.toHaveBeenCalled()
   })
 
-  it('离开页面时释放屏幕轨道（§65 Case 14：退出课堂即停止捕获）', async () => {
+  it('join 失败后离开页面：释放屏幕轨道（§65 Case 14：退出即停止捕获）', async () => {
     installCapableBrowser()
     const capture = makeFakeCapture()
     requestEntireScreenMock.mockResolvedValue(capture)
+    joinClassroomMock.mockRejectedValue(new ApiError({ code: 'NETWORK_ERROR', status: 0 }))
     const { wrapper } = await mountView('room-open')
 
     await wrapper.find('[data-testid="enter-classroom"]').trigger('click')
@@ -391,6 +540,26 @@ describe('PreJoin 页', () => {
     expect(useScreenShareStore().status).toBe('idle')
   })
 
+  it('join 成功后离开页面：轨道已经移交，不由 PreJoin 释放', async () => {
+    installCapableBrowser()
+    const capture = makeFakeCapture()
+    requestEntireScreenMock.mockResolvedValue(capture)
+    const { wrapper } = await mountView('room-open')
+
+    await wrapper.find('[data-testid="enter-classroom"]').trigger('click')
+    await flushPromises()
+
+    // 真实应用里这里是路由切换（组件卸载）。轨道已经归会话 store，
+    // PreJoin 的卸载清理**不能**把它停掉——那会让会话页 publish 一条死轨道。
+    wrapper.unmount()
+
+    expect(useScreenShareStore().capture).toBeNull()
+    expect(capture.track.readyState).toBe('live')
+    // reset 仍会被调用，但此时它手里已经没有轨道（capture 为 null），
+    // 因此绝不会出现 releaseScreenCapture(capture) 这一次调用。
+    expect(releaseScreenCaptureMock).not.toHaveBeenCalledWith(capture)
+  })
+
   it('切换课堂时重置共享状态（不会把上一个课堂的共享带到新课堂）', async () => {
     installCapableBrowser()
     const capture = makeFakeCapture()
@@ -400,6 +569,7 @@ describe('PreJoin 页', () => {
         id === 'room-open' ? OPEN : makeOpenStudentClassroom({ id: 'room-b', name: 'B 课堂' }),
       ),
     )
+    joinClassroomMock.mockRejectedValue(new ApiError({ code: 'NETWORK_ERROR', status: 0 }))
     const { wrapper, router } = await mountView('room-open')
 
     await wrapper.find('[data-testid="enter-classroom"]').trigger('click')
@@ -418,6 +588,8 @@ describe('PreJoin 页', () => {
     installCapableBrowser()
     const capture = makeFakeCapture()
     requestEntireScreenMock.mockResolvedValue(capture)
+    // join 失败 → 共享还留在本页，学生可以随时停止它。
+    joinClassroomMock.mockRejectedValue(new ApiError({ code: 'NETWORK_ERROR', status: 0 }))
     const { wrapper } = await mountView('room-open')
 
     await wrapper.find('[data-testid="enter-classroom"]').trigger('click')
@@ -440,6 +612,7 @@ describe('PreJoin 页', () => {
     installCapableBrowser()
     const capture = makeFakeCapture()
     requestEntireScreenMock.mockResolvedValue(capture)
+    joinClassroomMock.mockRejectedValue(new ApiError({ code: 'NETWORK_ERROR', status: 0 }))
     const { wrapper } = await mountView('room-open')
 
     // idle

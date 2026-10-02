@@ -23,6 +23,8 @@
  *    只有它看到 `'monitor'` 才放行；其余一律 `track.stop()` + 拒绝。
  */
 
+import type { CaptureDiagnostics } from '@classwatch/shared-types'
+
 /** 屏幕捕获相关的本地错误码（§58 下半部分，已在 shared-types 登记）。 */
 export type ScreenCaptureErrorCode =
   | 'SCREEN_PERMISSION_DENIED'
@@ -72,6 +74,16 @@ export interface ScreenCaptureSettings {
   rawDisplaySurface?: string
   /** 声明这块画面是否还能继续产生新帧（`getSettings()` 里少见的**强制**约束）。 */
   surfaceActive?: boolean
+  /**
+   * 画面尺寸（像素）。
+   *
+   * WHY 放在 Gate 的产物里而不是 publish 时现读：§43 的 join 请求体要求提交
+   * `{displaySurface, width, height}` 作为诊断。`getSettings()` 在轨道已经 ended
+   * 之后会抛 `InvalidStateError`，而 join 恰好可能发生在"Gate 通过、还没来得及
+   * 提交"的窗口里；在 Gate 那一刻把值快照下来，是唯一不会在半路失败的时机。
+   */
+  width?: number
+  height?: number
 }
 
 export interface ScreenCapture {
@@ -89,6 +101,9 @@ export interface ScreenCapture {
    * `track.addEventListener('ended', fn)` 都能收到浏览器"停止共享"，但前者会被
    * 后来的赋值覆盖、后者需要显式 remove。把这层差异关在本文件里，store 与视图
    * 就只需要处理"结束了"这一个事实。
+   *
+   * 同一时刻只应有一个订阅者：内部实现共用一份 `onended` 属性（见下），
+   * 交接所有权时要先取消订阅再重新订阅（Phase 6 的 PreJoin → Session 交接即如此）。
    */
   onEnded(listener: () => void): () => void
 }
@@ -103,6 +118,8 @@ export interface ScreenCaptureDiagnostics {
   displaySurface: ScreenSurface
   rawDisplaySurface: string | null
   surfaceActive: boolean | null
+  width: number | null
+  height: number | null
 }
 
 /* -------------------------------------------------------------------------- */
@@ -263,14 +280,29 @@ interface ExtendedMediaTrackSettings extends MediaTrackSettings {
   surfaceActive?: boolean
 }
 
-/** 只挑出我们需要的三个字段，浏览器对象不进入任何状态/存储（§43）。 */
+/** 只挑出我们需要的那几个字段，浏览器对象不进入任何状态/存储（§43）。 */
 function readSettings(settings: ExtendedMediaTrackSettings): ScreenCaptureSettings {
   const raw = settings.displaySurface
   return {
     displaySurface: normalizeSurface(raw),
     rawDisplaySurface: typeof raw === 'string' ? raw : undefined,
     surfaceActive: settings.surfaceActive,
+    width: normalizeDimension(settings.width),
+    height: normalizeDimension(settings.height),
   }
+}
+
+/**
+ * 尺寸归一化：只有"有限的正数"才算拿到了尺寸。
+ *
+ * WHY 不直接用 `settings.width`：浏览器可能给 `undefined`，也可能给 0（某些实现
+ * 在捕获刚开始、还没有第一帧时就是这样）。把 0 当尺寸提交给后端，会让诊断数据
+ * 里出现一堆"学生共享了 0×0 屏幕"的假记录，比缺字段更难排查。
+ */
+function normalizeDimension(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? Math.round(value)
+    : undefined
 }
 
 /** 幂等地停掉一批轨道：`stop()` 本身可重复调用，这里只是省去调用方的判空。 */
@@ -509,5 +541,29 @@ export function describeScreenCapture(capture: ScreenCapture): ScreenCaptureDiag
     displaySurface: capture.settings.displaySurface,
     rawDisplaySurface: capture.settings.rawDisplaySurface ?? null,
     surfaceActive: capture.settings.surfaceActive ?? null,
+    width: capture.settings.width ?? null,
+    height: capture.settings.height ?? null,
+  }
+}
+
+/**
+ * §43 冻结的 join 诊断字段：`{ displaySurface, width, height }`。
+ *
+ * WHY 要在这里"砍掉"上面那些更丰富的诊断值：请求体是**冻结契约**，后端按严格
+ * 模式解析（未知字段 400）。rawDisplaySurface / surfaceActive 对排查很有用，
+ * 但它们属于客户端日志与界面，不属于这份契约——多塞一个字段的代价是这位学生
+ * 根本进不去课堂。
+ *
+ * 缺失的尺寸用 0 表示（而不是省略字段）：后端契约里 width/height 是 number。
+ * 0 的含义在诊断侧是明确的"浏览器没报告尺寸"，与"共享了一块 0×0 的屏幕"
+ * 不可能混淆——Gate 已经保证共享的是整块物理显示器。
+ */
+export function toJoinCaptureDiagnostics(
+  diagnostics: ScreenCaptureDiagnostics,
+): CaptureDiagnostics {
+  return {
+    displaySurface: diagnostics.displaySurface,
+    width: diagnostics.width ?? 0,
+    height: diagnostics.height ?? 0,
   }
 }

@@ -244,7 +244,7 @@ POST /api/v1/teacher/classrooms/:id/close
     5. 读回最终行
     COMMIT
     ───────────────────────────────────────────────  ← 媒体面 / 实时面在这里之后
-    Phase 6（未实现）：调用 LiveKit TerminateRoom(lk_<run_uuid>)
+    Phase 6（已实现）：`classroom.Service.Close` 在事务提交后调用 LiveKit `TerminateRoom`（detached ctx + 3s 超时，失败只 Warn 不回滚）
     Phase 8（未实现）：把该 Run 下活跃 student_sessions 置 ROOM_CLOSED，写 session_events，广播 ROOM_CLOSED
 ```
 

@@ -46,6 +46,12 @@ type Deps struct {
 	// that cannot read or write classrooms must not expose endpoints that pretend
 	// otherwise.
 	Classroom ClassroomService
+	// Session is the student media session service of §12/§43/§51: join, leave, the
+	// teacher media token and the monitoring wall. A nil value means those four
+	// routes are not registered, again for the same reason — an API with no database
+	// cannot record a session, and an endpoint that issued media tokens without one
+	// would produce participants nobody can supervise.
+	Session SessionService
 	// Limiter protects /api/v1 and, more strictly, the login endpoints. A nil
 	// value installs no rate limiting at all, which is only appropriate in tests:
 	// §2.2/§63 make it mandatory in every real deployment, and main always wires
@@ -162,6 +168,19 @@ func NewRouter(deps Deps) *gin.Engine {
 	return router
 }
 
+// SessionService is the whole session surface of §43/§51 as the router sees it: the
+// student half (join, leave) and the teacher half (media token, monitor).
+//
+// WHY one interface here while the handlers accept two narrow ones: the router is
+// where the two ENTRY POINTS are wired, and it must be able to hand each group only
+// the methods it is allowed to use. The narrow interfaces live next to their handlers
+// (StudentSessionService, TeacherSessionService), so the split is enforced by the
+// compiler at the point where a route could overreach.
+type SessionService interface {
+	StudentSessionService
+	TeacherSessionService
+}
+
 // registerAuthRoutes mounts the three independent entry points.
 //
 // Each entry gets its own cookie, its own role check and its own middleware
@@ -273,15 +292,14 @@ func registerAdminRoutes(v1 *gin.RouterGroup, deps Deps, entries []AuthEntry) {
 // lose the CSRF check — and there is no wrong group to add it to.
 func registerTeacherRoutes(v1 *gin.RouterGroup, deps Deps, entries []AuthEntry) {
 	teacherEntry, ok := entryForRole(entries, user.RoleTeacher)
-	if !ok || deps.Classroom == nil || deps.Auth == nil {
-		// No teacher entry (no configuration) or no classroom service (no
-		// database): the routes are not registered, so they answer 404 instead of
-		// existing without an authorization chain in front of them.
+	if !ok || deps.Auth == nil || (deps.Classroom == nil && deps.Session == nil) {
+		// No teacher entry (no configuration) or no service behind the routes: the
+		// routes are not registered, so they answer 404 instead of existing without an
+		// authorization chain in front of them.
 		return
 	}
 
 	mw := newAuthMiddleware(deps.Auth, entries, deps.Config)
-	handlers := newClassroomHandlers(deps.Classroom)
 
 	group := v1.Group("/teacher")
 	group.Use(
@@ -289,18 +307,31 @@ func registerTeacherRoutes(v1 *gin.RouterGroup, deps Deps, entries []AuthEntry) 
 		mw.RequireRole(teacherEntry),
 	)
 
-	group.GET("/classrooms", handlers.listClassrooms())
-	group.GET("/classrooms/:id", handlers.getClassroom())
-	group.GET("/classrooms/:id/students", handlers.listStudents())
-
 	writes := group.Group("")
 	writes.Use(mw.CSRFProtection(teacherEntry))
-	writes.POST("/classrooms", handlers.createClassroom())
-	writes.PATCH("/classrooms/:id", handlers.updateClassroom())
-	writes.POST("/classrooms/:id/students", handlers.addStudents())
-	writes.DELETE("/classrooms/:id/students/:studentId", handlers.removeStudent())
-	writes.POST("/classrooms/:id/open", handlers.openClassroom())
-	writes.POST("/classrooms/:id/close", handlers.closeClassroom())
+
+	if deps.Classroom != nil {
+		handlers := newClassroomHandlers(deps.Classroom)
+		group.GET("/classrooms", handlers.listClassrooms())
+		group.GET("/classrooms/:id", handlers.getClassroom())
+		group.GET("/classrooms/:id/students", handlers.listStudents())
+		writes.POST("/classrooms", handlers.createClassroom())
+		writes.PATCH("/classrooms/:id", handlers.updateClassroom())
+		writes.POST("/classrooms/:id/students", handlers.addStudents())
+		writes.DELETE("/classrooms/:id/students/:studentId", handlers.removeStudent())
+		writes.POST("/classrooms/:id/open", handlers.openClassroom())
+		writes.POST("/classrooms/:id/close", handlers.closeClassroom())
+	}
+
+	if deps.Session != nil {
+		// The two media routes of Phase 6. The monitor read lands on the outer group
+		// (a GET changes no state from the client's point of view) and the media token
+		// on the write group: minting a credential is exactly the kind of action a
+		// cross-site request must not be able to trigger with the teacher's cookie.
+		handlers := newTeacherSessionHandlers(deps.Session)
+		group.GET("/classrooms/:id/monitor", handlers.monitor())
+		writes.POST("/classrooms/:id/media-token", handlers.mediaToken())
+	}
 }
 
 // registerStudentRoutes mounts /api/v1/student/** — the student portal of §14/§70.
@@ -319,24 +350,22 @@ func registerTeacherRoutes(v1 *gin.RouterGroup, deps Deps, entries []AuthEntry) 
 // Go is a filter somebody can forget, and the list endpoint has no single resource
 // whose owner could be compared.
 //
-// Phase 4 mounts READS ONLY (§70: "点击 Enter 暂时只进入 PreJoin"). The join, leave
-// and event endpoints of §42 belong to Phase 5/6/8, where a screen gate and a media
-// plane exist for them to mean something; they are not stubbed here. Because the
-// group has no unsafe route, it carries no CSRFProtection — an inline
-// `isSafeMethod` check would be doing that work for exactly one endpoint today and
-// would hide the omission when the first POST arrives. The coarse API rate limit
-// from NewRouter still applies to both routes like every other /api/v1 route.
+// Phase 4 mounted READS ONLY (§70: "点击 Enter 暂时只进入 PreJoin"). Phase 6 adds the two
+// endpoints the screen gate needs — join and leave — and they are the first unsafe
+// routes of this group, so the group now has a write subgroup carrying
+// CSRFProtection. The structure is the same one /admin and /teacher use: reads outside,
+// writes inside, so a new write endpoint added to the wrong group is the only way to
+// lose the check — and there is no wrong group to add it to.
 func registerStudentRoutes(v1 *gin.RouterGroup, deps Deps, entries []AuthEntry) {
 	studentEntry, ok := entryForRole(entries, user.RoleStudent)
-	if !ok || deps.Classroom == nil || deps.Auth == nil {
-		// No student entry (no configuration) or no classroom service (no
-		// database): the routes are not registered, so they answer 404 instead of
-		// existing without an authorization chain in front of them.
+	if !ok || deps.Auth == nil || (deps.Classroom == nil && deps.Session == nil) {
+		// No student entry (no configuration) or no service behind the routes: the
+		// routes are not registered, so they answer 404 instead of existing without an
+		// authorization chain in front of them.
 		return
 	}
 
 	mw := newAuthMiddleware(deps.Auth, entries, deps.Config)
-	handlers := newStudentClassroomHandlers(deps.Classroom)
 
 	group := v1.Group("/student")
 	group.Use(
@@ -344,8 +373,22 @@ func registerStudentRoutes(v1 *gin.RouterGroup, deps Deps, entries []AuthEntry) 
 		mw.RequireRole(studentEntry),
 	)
 
-	group.GET("/classrooms", handlers.listClassrooms())
-	group.GET("/classrooms/:id", handlers.getClassroom())
+	if deps.Classroom != nil {
+		handlers := newStudentClassroomHandlers(deps.Classroom)
+		group.GET("/classrooms", handlers.listClassrooms())
+		group.GET("/classrooms/:id", handlers.getClassroom())
+	}
+
+	if deps.Session != nil {
+		handlers := newStudentSessionHandlers(deps.Session)
+		writes := group.Group("")
+		writes.Use(mw.CSRFProtection(studentEntry))
+		// Both are POSTs and both change state: join creates or revives a session, and
+		// leave ends one. A join without a CSRF token would let any website start a
+		// media session in a logged-in student's name.
+		writes.POST("/classrooms/:id/join", handlers.join())
+		writes.POST("/sessions/:id/leave", handlers.leave())
+	}
 }
 
 // entryForRole finds the entry point of one role.

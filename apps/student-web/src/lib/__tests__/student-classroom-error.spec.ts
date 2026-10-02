@@ -29,12 +29,32 @@ describe('学生端课堂错误文案', () => {
   })
 
   it('未登记的错误码走共享表的通用文案，不编造原因', () => {
-    expect(describeStudentClassroomError(new ApiError({ code: 'CLASSROOM_CLOSED' }))).toBe(
-      API_ERROR_MESSAGES.CLASSROOM_CLOSED,
+    // CLASSROOM_NOT_OWNER 属于老师端的码，学生端不该遇到；真遇到了也只给通用文案。
+    expect(describeStudentClassroomError(new ApiError({ code: 'CLASSROOM_NOT_OWNER' }))).toBe(
+      API_ERROR_MESSAGES.CLASSROOM_NOT_OWNER,
     )
     expect(describeStudentClassroomError(new ApiError({ code: 'INTERNAL', status: 500 }))).toBe(
       API_ERROR_MESSAGES.INTERNAL,
     )
+  })
+
+  it('join 被拒的三种码有学生专用文案，且都指向下一步动作（§43）', () => {
+    // 学生此刻已经共享着整块屏幕：含糊的"进入失败"会让他保持共享并反复点按钮。
+    const closed = describeStudentClassroomError(
+      new ApiError({ code: 'CLASSROOM_CLOSED', status: 409 }),
+    )
+    expect(closed).toContain('老师关闭')
+    expect(closed).toContain('返回我的课堂')
+
+    const duplicated = describeStudentClassroomError(
+      new ApiError({ code: 'SESSION_ALREADY_ACTIVE', status: 409 }),
+    )
+    expect(duplicated).toContain('另一个页面')
+
+    const mediaToken = describeStudentClassroomError(
+      new ApiError({ code: 'MEDIA_TOKEN_FAILED', status: 502 }),
+    )
+    expect(mediaToken).toContain('请稍后重试')
   })
 
   it('非 ApiError 的意外失败也降级成通用文案，不把异常内容渲染给学生', () => {

@@ -35,6 +35,8 @@ import {
  *    （§57：不要偷偷请求，也不要在学生以为"没反应"时弹出第二个授权窗口）。
  * 3. **轨道必须被显式释放**。丢失、停止、重置、组件卸载都要走 `releaseScreenCapture`，
  *    否则浏览器会一直显示"正在共享"，学生在一节已经退出的课堂里被持续看着。
+ *    唯一的例外是 `handOff()`（Phase 6）：把轨道**连同所有权**交给会话页，
+ *    由会话页在真正退出课堂时释放——它不是"忘了释放"，而是"换了责任人"。
  */
 
 export type ScreenShareStatus = 'idle' | 'requesting' | 'sharing' | 'lost' | 'error'
@@ -198,6 +200,34 @@ export const useScreenShareStore = defineStore('student-screen-share', () => {
     stop()
   }
 
+  /**
+   * 把轨道所有权**移交**给会话页（Phase 6 / §20 / §18）。
+   *
+   * 与 `stop()` 的区别只有一个，但它是决定性的：**不停止轨道**。
+   * Gate 通过之后这条 track 就是"进入课堂的凭证"，§20 明确要求把它复用为
+   * LiveKit 的 ScreenShare 轨道；如果在这里 stop 掉，会话页要么 publish 一条
+   * 已死的轨道，要么再调一次 `getDisplayMedia`——后者会让学生看到第二次授权弹窗。
+   *
+   * 同时摘掉本 store 的 ended 监听（`detachEndedListener`）：一条轨道在同一时刻
+   * 只应有一个订阅者，交接之后由会话 store 负责 §22 的"共享被停止"。
+   * 这也顺带保证了 PreJoin 的 `onBeforeUnmount` 不会把它清掉——
+   * 移交后本 store 的 `capture` 已经是 null，`reset()` 自然成了空操作。
+   *
+   * 返回 null 表示当前没有可移交的轨道（Gate 未通过、已丢失、已停止），
+   * 调用方必须把这种情况当成失败处理，而不是"继续往下走"。
+   */
+  function handOff(): ScreenCapture | null {
+    const current = capture.value
+    if (!current) return null
+    detachEndedListener()
+    capture.value = null
+    diagnostics.value = null
+    failure.value = null
+    unsupportedReason.value = null
+    status.value = 'idle'
+    return current
+  }
+
   return {
     status,
     capture,
@@ -211,5 +241,6 @@ export const useScreenShareStore = defineStore('student-screen-share', () => {
     start,
     stop,
     reset,
+    handOff,
   }
 })

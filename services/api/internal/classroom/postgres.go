@@ -45,11 +45,17 @@ const (
 // wrong fields and fails silently whenever two columns share a type. The roster
 // size and the current run are part of the same read because both are needed by
 // every response that contains a classroom.
+//
+// The run's room name is part of this projection because the domain type carries it
+// and Phase 6 needs it for every media operation. It is still absent from every HTTP
+// DTO: the room name is handed out with the media token, never in a list (§33), and
+// that is enforced where the DTOs are defined rather than by leaving it unloaded —
+// an unloaded field is a nil that a handler would have to remember not to follow.
 const classroomColumns = `
 	c.id, c.name, c.description, c.owner_teacher_id, c.status, c.current_run_id,
 	c.created_at, c.updated_at,
 	(SELECT count(*) FROM classroom_students cs WHERE cs.classroom_id = c.id),
-	r.id, r.opened_at`
+	r.id, r.status, r.livekit_room_name, r.opened_at, r.closed_at`
 
 // classroomSource joins the current run.
 //
@@ -342,6 +348,91 @@ func (p *Postgres) GetForStudent(ctx context.Context, studentID, classroomID uui
 	return found, err
 }
 
+// GetStudentEntry returns the classroom and its current run for an authorized
+// student — the authorization check the join API of §43 cannot skip.
+//
+// It runs through studentClassroomSource, the same JOIN that authorizes the two
+// portal reads, so "this student may see the classroom" and "this student may enter
+// it" cannot drift apart. The join to `users` in that source is unused here and is
+// kept anyway: one definition of the authorization shape is worth one extra index
+// lookup on a request that happens once per student per lesson.
+//
+// A CLOSED classroom is returned, not refused: whether "closed" is an error is the
+// caller's decision (§43 answers 409), and a repository that decided it would hide
+// the status from the one place that has to report it.
+func (p *Postgres) GetStudentEntry(ctx context.Context, studentID, classroomID uuid.UUID) (*StudentEntry, error) {
+	if p == nil || p.pool == nil {
+		return nil, errors.New("classroom: repository is not connected")
+	}
+	query := `SELECT c.id, c.status, r.id, r.status, r.livekit_room_name, r.opened_at, r.closed_at` +
+		studentClassroomSource + ` WHERE cs.student_id = $1 AND cs.classroom_id = $2`
+
+	var (
+		entry       StudentEntry
+		status      string
+		runID       *uuid.UUID
+		runStatus   *string
+		roomName    *string
+		runOpenedAt *time.Time
+		runClosedAt *time.Time
+	)
+	err := p.pool.QueryRow(ctx, query, studentID, classroomID).Scan(
+		&entry.ClassroomID, &status, &runID, &runStatus, &roomName, &runOpenedAt, &runClosedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The driver error is dropped deliberately and the two reasons ("no such
+		// classroom", "not on its roster") collapse into one answer, exactly as in
+		// GetForStudent — see Service.GetStudentClassroom for why.
+		return nil, ErrStudentNotAssigned
+	}
+	if err != nil {
+		return nil, err
+	}
+	entry.Status = Status(status)
+	if runID != nil && runStatus != nil && roomName != nil && runOpenedAt != nil {
+		entry.Run = &Run{
+			ID:              *runID,
+			ClassroomID:     entry.ClassroomID,
+			Status:          Status(*runStatus),
+			LiveKitRoomName: *roomName,
+			OpenedAt:        *runOpenedAt,
+			ClosedAt:        runClosedAt,
+		}
+	}
+	return &entry, nil
+}
+
+// GetRunByID returns one run, or ErrNotFound.
+//
+// WHY it is needed at all: a student session stores the run id, and the leave path
+// has to name the media room to remove the participant from. Reading the run is the
+// only way back to its room name, and deriving it in the session package would mean
+// a second implementation of "lk_<run_uuid>" in the codebase.
+func (p *Postgres) GetRunByID(ctx context.Context, runID uuid.UUID) (*Run, error) {
+	if p == nil || p.pool == nil {
+		return nil, errors.New("classroom: repository is not connected")
+	}
+	run, err := scanRun(p.pool.QueryRow(ctx, `SELECT `+runColumns+` FROM classroom_runs WHERE id = $1`, runID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return run, err
+}
+
+// scanRun reads one row of runColumns.
+func scanRun(row pgx.Row) (*Run, error) {
+	var (
+		run      Run
+		status   string
+		closedAt *time.Time
+	)
+	if err := row.Scan(&run.ID, &run.ClassroomID, &status, &run.LiveKitRoomName, &run.OpenedAt, &closedAt); err != nil {
+		return nil, err
+	}
+	run.Status = Status(status)
+	run.ClosedAt = closedAt
+	return &run, nil
+}
+
 // scanStudentClassroom reads one row of studentClassroomColumns.
 func scanStudentClassroom(row pgx.Row) (*StudentClassroom, error) {
 	var (
@@ -508,13 +599,11 @@ func (p *Postgres) Open(ctx context.Context, params OpenParams) (*Classroom, *Ru
 // never (CLOSED, run still running).
 //
 // ---------------------------------------------------------------------------
-// SEAMS FOR LATER PHASES — deliberately empty in Phase 3:
+// SEAMS FOR LATER PHASES — deliberately empty here:
 //
-//   - Phase 6 calls LiveKit TerminateRoom here, AFTER this transaction commits and
-//     never before: the control plane must already say CLOSED when the media room
-//     disappears, otherwise a student reconnecting into the still-live room would be
-//     looking at a classroom the database believes is closed (§33). Terminating
-//     inside the transaction would also hold a row lock across a network call.
+//   - Phase 6's TerminateRoom is NOT called from this method. It runs in the service
+//     (Service.Close), after this function has committed, for exactly the reason the
+//     media plane must never be allowed to decide a database outcome (§33).
 //   - Phase 8 marks the run's student_sessions ROOM_CLOSED and broadcasts
 //     ROOM_CLOSED to the connected consoles here — again after the commit, so a
 //     listener that reacts by re-reading the classroom sees CLOSED.
@@ -555,24 +644,22 @@ func (p *Postgres) Close(ctx context.Context, classroomID, teacherID uuid.UUID) 
 			return nil, errors.New("classroom: OPEN classroom has no current run")
 		}
 
-		run := &Run{}
-		var runStatus string
-		var closedAt *time.Time
-		err = tx.QueryRow(ctx, `
+		// RETURNING the row and scanning it with scanRun keeps the close path on the
+		// same projection as every other run read. The room name it returns is what
+		// Phase 6 terminates after this transaction commits (see the seam note above).
+		run, err := scanRun(tx.QueryRow(ctx, `
 			UPDATE classroom_runs
 			   SET status = 'CLOSED', closed_at = now()
 			 WHERE id = $1 AND status = 'OPEN'
 			RETURNING `+runColumns,
 			*currentRunID,
-		).Scan(&run.ID, &run.ClassroomID, &runStatus, &run.LiveKitRoomName, &run.OpenedAt, &closedAt)
+		))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.New("classroom: current run is not OPEN")
 		}
 		if err != nil {
 			return nil, translateWriteError(err)
 		}
-		run.Status = Status(runStatus)
-		run.ClosedAt = closedAt
 
 		if _, err := tx.Exec(ctx, `
 			UPDATE classrooms
@@ -620,22 +707,31 @@ func scanClassroom(row pgx.Row) (*Classroom, error) {
 		status      string
 		currentRun  *uuid.UUID
 		runID       *uuid.UUID
+		runStatus   *string
+		roomName    *string
 		runOpenedAt *time.Time
+		runClosedAt *time.Time
 	)
 	if err := row.Scan(
 		&c.ID, &c.Name, &c.Description, &c.OwnerTeacherID, &status, &currentRun,
-		&c.CreatedAt, &c.UpdatedAt, &c.StudentCount, &runID, &runOpenedAt,
+		&c.CreatedAt, &c.UpdatedAt, &c.StudentCount,
+		&runID, &runStatus, &roomName, &runOpenedAt, &runClosedAt,
 	); err != nil {
 		return nil, err
 	}
 	c.Status = Status(status)
 	c.CurrentRunID = currentRun
-	if runID != nil && runOpenedAt != nil {
+	// Every half of the joined run is required before a run is reported: a partial
+	// row would mean the LEFT JOIN matched something that is not a run, and inventing
+	// the missing values would be worse than reporting no run at all.
+	if runID != nil && runStatus != nil && roomName != nil && runOpenedAt != nil {
 		c.CurrentRun = &Run{
-			ID:          *runID,
-			ClassroomID: c.ID,
-			Status:      StatusOpen,
-			OpenedAt:    *runOpenedAt,
+			ID:              *runID,
+			ClassroomID:     c.ID,
+			Status:          Status(*runStatus),
+			LiveKitRoomName: *roomName,
+			OpenedAt:        *runOpenedAt,
+			ClosedAt:        runClosedAt,
 		}
 	}
 	return &c, nil

@@ -12,19 +12,31 @@ package media
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/livekit/protocol/livekit"
 	lksdk "github.com/livekit/server-sdk-go/v2"
+	"github.com/twitchtv/twirp"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Client is a thin wrapper around the LiveKit RoomService API.
 //
-// Only room lifecycle calls are exposed in Phase 0. Participant administration
-// and webhook handling arrive with the phases that actually need them.
+// It exposes exactly what the Control Plane needs from the Media Plane: room
+// lifecycle (Phase 0/3/6), participant observation (Phase 6) and participant-scoped
+// token minting (Phase 6). Participant administration beyond "remove", and webhook
+// handling, arrive with the phases that actually need them (§74).
 type Client struct {
 	rooms *lksdk.RoomServiceClient
+	// apiKey/apiSecret sign tokens. They exist only in this backend process and must
+	// never be logged, serialised into a response, or copied into a frontend bundle
+	// (§44/§59) — see NewClient.
+	apiKey    string
+	apiSecret string
 }
 
 // NewClient builds a RoomService client from the API URL, key and secret.
@@ -49,7 +61,11 @@ func NewClient(apiURL, apiKey, apiSecret string) (*Client, error) {
 		// Report presence, never the value.
 		return nil, fmt.Errorf("livekit: api secret is required")
 	}
-	return &Client{rooms: lksdk.NewRoomServiceClient(apiURL, apiKey, apiSecret)}, nil
+	return &Client{
+		rooms:     lksdk.NewRoomServiceClient(apiURL, apiKey, apiSecret),
+		apiKey:    apiKey,
+		apiSecret: apiSecret,
+	}, nil
 }
 
 // HealthCheck verifies the LiveKit server is reachable by listing rooms.
@@ -114,6 +130,142 @@ func (c *Client) TerminateRoom(ctx context.Context, roomName string) error {
 	return nil
 }
 
+// EnsureRoom creates the room if it is not already there, and reports success if it
+// is. It is the idempotent form of CreateRoom, and the one callers should use (§43).
+//
+// WHY idempotent, and why it matters more than it looks: every student of a lesson
+// joins the SAME room, so "create the room" is executed once per join. A second
+// create must not be able to fail the second student's join — the room they need is
+// right there. Two ways this shows up in practice:
+//
+//   - The LiveKit server may answer `already exists` for a name that exists
+//     (AlreadyExists, or the same thing expressed as a gRPC status depending on the
+//     transport). That is the desired end state, so it is success, not an error.
+//   - A teacher's media token (which also calls this) and a student's join can race.
+//     Both want a room with the same name; both must succeed.
+//
+// Treating it as an error would make "the room already exists" — the normal case for
+// everyone except the first participant — look like an outage, and the join endpoint
+// would answer MEDIA_TOKEN_FAILED to a student whose room is perfectly fine.
+func (c *Client) EnsureRoom(ctx context.Context, roomName string) error {
+	err := c.CreateRoom(ctx, roomName)
+	if err == nil || isAlreadyExists(err) {
+		return nil
+	}
+	return err
+}
+
+// ParticipantTracks is what the media plane reports about the media one participant
+// is publishing right now.
+//
+// It is a derived view (booleans per track source) rather than a list of LiveKit
+// track objects on purpose: the Control Plane needs to answer "is the screen up?"
+// (§21/§51), and handing SDK structs to the session logic would make every future
+// LiveKit field a potential business fact.
+type ParticipantTracks struct {
+	// ScreenShare is true when a screen-share track is published and not muted. §21
+	// makes it the invariant behind ONLINE: a student who is ONLINE is sharing.
+	ScreenShare bool
+	// Camera and Microphone are always false in Phase 6 (only screen sharing is in
+	// scope, §72). They are observed anyway because the monitor DTO of §51 reports
+	// them today, and deriving them from the same snapshot later means the two cannot
+	// disagree about what the room looked like at one instant.
+	Camera     bool
+	Microphone bool
+}
+
+// ObserveRoom lists the participants of a room and what each one publishes.
+//
+// The result is keyed by livekit identity, which for this project is always
+// `student_sessions.id` / the teacher's login session id (§44) — opaque UUIDs, never
+// names. Callers map it onto business rows; it must never be rendered directly (§51).
+//
+// WHAT this is NOT: an authority. It is an observation of the media plane at one
+// moment, and the control plane decides what it means (§33). A participant missing
+// from this map is "not observed", which is why the caller must not treat a FAILED
+// call as "everybody disconnected" — see internal/session's monitor.
+func (c *Client) ObserveRoom(ctx context.Context, roomName string) (map[string]ParticipantTracks, error) {
+	if err := validateOpaqueRoomName(roomName); err != nil {
+		return nil, err
+	}
+	resp, err := c.rooms.ListParticipants(ctx, &livekit.ListParticipantsRequest{Room: roomName})
+	if err != nil {
+		return nil, fmt.Errorf("livekit: list participants: %w", err)
+	}
+	observed := make(map[string]ParticipantTracks, len(resp.GetParticipants()))
+	for _, participant := range resp.GetParticipants() {
+		// LiveKit keeps a participant in the list for a short while after its
+		// connection dropped, with state DISCONNECTED. Counting that as "present"
+		// would keep a student who closed their laptop ONLINE until the entry is
+		// reaped, which is exactly the kind of false "still being supervised" the
+		// monitoring wall must not display.
+		if !isConnectedState(participant.GetState()) {
+			continue
+		}
+		var tracks ParticipantTracks
+		for _, track := range participant.GetTracks() {
+			// A muted track is published but carries no media — a muted camera or a
+			// muted screen share is not "active" in any sense the teacher's wall
+			// cares about.
+			if track.GetMuted() {
+				continue
+			}
+			switch track.GetSource() {
+			case livekit.TrackSource_SCREEN_SHARE:
+				tracks.ScreenShare = true
+			case livekit.TrackSource_CAMERA:
+				tracks.Camera = true
+			case livekit.TrackSource_MICROPHONE:
+				tracks.Microphone = true
+			}
+		}
+		observed[participant.GetIdentity()] = tracks
+	}
+	return observed, nil
+}
+
+// RemoveParticipant disconnects one participant from a room.
+//
+// It is the media-plane half of "student leaves" (§50/§43): with the identity gone,
+// the room's tiles and subscriptions disappear immediately instead of waiting for the
+// client to close its own peer connection. A participant who is already gone is
+// success — the caller asked for an end state, not for an action.
+//
+// WHY this cannot be the control-plane truth: disconnecting a participant says
+// nothing about whether the student left the LESSON. That is the `student_sessions`
+// row, written by the leave endpoint before this call (§33/§49).
+func (c *Client) RemoveParticipant(ctx context.Context, roomName, identity string) error {
+	if err := validateOpaqueRoomName(roomName); err != nil {
+		return err
+	}
+	if !isOpaqueIdentity(identity) {
+		// Refusing here is a safety net for §44: a name, account or phone number must
+		// never be able to reach the media plane, not even as a lookup key.
+		return fmt.Errorf("livekit: participant identity must be an opaque uuid")
+	}
+	if _, err := c.rooms.RemoveParticipant(ctx, &livekit.RoomParticipantIdentity{
+		Room:     roomName,
+		Identity: identity,
+	}); err != nil && !isNotFound(err) {
+		return fmt.Errorf("livekit: remove participant: %w", err)
+	}
+	return nil
+}
+
+// isConnectedState reports whether a participant still holds a media connection.
+//
+// JOINING and JOINED are the transient states of a participant that is connecting;
+// treating them as absent would make a student who is one second away from being
+// online look disconnected on every poll.
+func isConnectedState(state livekit.ParticipantInfo_State) bool {
+	switch state {
+	case livekit.ParticipantInfo_JOINING, livekit.ParticipantInfo_JOINED, livekit.ParticipantInfo_ACTIVE:
+		return true
+	default:
+		return false
+	}
+}
+
 // Room name and participant policy, named so the reasoning is greppable.
 const (
 	// emptyRoomTimeoutSeconds: a room with no participants is dropped after this
@@ -143,12 +295,82 @@ func validateOpaqueRoomName(roomName string) error {
 	if !strings.HasPrefix(roomName, roomNamePrefix) {
 		return fmt.Errorf("livekit: room name must start with %q and stay opaque", roomNamePrefix)
 	}
+	// The prefix alone is not a room: a name that carries nothing after it would be a
+	// single shared room for the whole deployment, which is precisely the collision the
+	// per-run naming exists to prevent.
+	if strings.TrimPrefix(roomName, roomNamePrefix) == "" {
+		return fmt.Errorf("livekit: room name must be %s<opaque id>, not the prefix alone", roomNamePrefix)
+	}
 	return nil
 }
 
 // roomNamePrefix marks every ClassWatch media room so LiveKit-side tooling can
 // tell our rooms apart from anything else sharing the deployment.
 const roomNamePrefix = "lk_"
+
+// isOpaqueIdentity accepts only a UUID-shaped participant identity (§44).
+//
+// WHY a UUID check and not "not empty": identity is the one string of ours visible
+// to every participant in the room and to the LiveKit dashboard. The rule "identities
+// are opaque UUIDs" is worth more as a check than as a comment, because the call site
+// that would break it (a debugging shortcut passing a student's account) looks
+// harmless at the moment it is written.
+func isOpaqueIdentity(identity string) bool {
+	_, err := uuid.Parse(identity)
+	return err == nil
+}
+
+// isAlreadyExists recognises "the room is already there" across the two error
+// shapes the LiveKit client can produce.
+//
+// WHY both a code check and a message check: the RoomService API is invoked over
+// Twirp (HTTP) in this SDK, and the server may express the condition as an
+// AlreadyExists code or merely as text, depending on version and transport. The code
+// check is the real rule; the substring check exists so a version that changes only
+// the code mapping cannot turn a routine second join into a failed one. A false
+// positive here is harmless — the room does exist, which is all the caller asserts.
+func isAlreadyExists(err error) bool {
+	return matchesServerError(err,
+		func(err twirp.Error) bool { return err.Code() == twirp.AlreadyExists },
+		func(code codes.Code) bool { return code == codes.AlreadyExists },
+		"already exists",
+	)
+}
+
+// isNotFound recognises "there is no such participant", which for
+// RemoveParticipant is the desired end state rather than a failure.
+func isNotFound(err error) bool {
+	return matchesServerError(err,
+		func(err twirp.Error) bool { return err.Code() == twirp.NotFound },
+		func(code codes.Code) bool { return code == codes.NotFound },
+		"not found", "does not exist",
+	)
+}
+
+// matchesServerError reports whether err is a Twirp/gRPC error the caller
+// classifies as "this specific, expected condition".
+//
+// The message check is case-insensitive and deliberately last: it is the fallback for
+// a mapping change, not the primary rule.
+func matchesServerError(err error, byTwirp func(twirp.Error) bool, byCode func(codes.Code) bool, messages ...string) bool {
+	if err == nil {
+		return false
+	}
+	var twirpErr twirp.Error
+	if errors.As(err, &twirpErr) && byTwirp(twirpErr) {
+		return true
+	}
+	if byCode(status.Code(err)) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	for _, message := range messages {
+		if strings.Contains(text, message) {
+			return true
+		}
+	}
+	return false
+}
 
 // NOTE on token issuance (Phase 6): minting LiveKit join tokens is deliberately
 // NOT implemented here. A token's grants are the security-critical part — room

@@ -20,15 +20,15 @@
 | [frontend/student.md](frontend/student.md) | 学生端页面、我的课堂卡片、PreJoin 与隐私告知（§57 原文）、学生间隔离在各层的落点、错误码行为 | Phase 4 起（Phase 5/6 扩展） |
 | [database/state-machines.md](database/state-machines.md) | Classroom / ClassroomRun 状态机：允许的迁移、触发者、副作用、为什么禁止反向与跳变、并发与幂等 | Phase 3 |
 | [architecture/control-plane.md](architecture/control-plane.md) | 控制面边界与 Source of Truth、请求链中的授权位置、开课/关课事务与并发分析、错误码契约、Phase 6/8 接缝 | Phase 3 |
+| [media/webrtc-basics.md](media/webrtc-basics.md) | Track/Source、为什么课堂是 1 上行 N 下行、`autoSubscribe=false` 的理由、客户端与服务端各自能证明什么 | Phase 6 |
+| [media/livekit-architecture.md](media/livekit-architecture.md) | Room/Participant/Track、Token 权限位逐字段依据、identity 为什么必须 opaque、Room 生命周期、Cloud 与本地容器两种模式 | Phase 6 |
+| [media/sfu.md](media/sfu.md) | SFU 与 Mesh/MCU 的取舍、规模假设与带宽量级、为什么不能用假 `<video>` 标签压测 | Phase 6 |
 
 ## 计划中的文档（按 Phase 产出）
 
 | 文档 | 内容 | Phase |
 | --- | --- | --- |
 | `labs/browser-screen-capture.md` | Screen Capture API、MediaStream/Track、`displaySurface`、浏览器隐私边界 | 5 |
-| `media/webrtc-basics.md` | SDP/ICE/Track 基础，为什么课堂场景是 1 上行 N 下行 | 6 |
-| `media/livekit-architecture.md` | Room/Participant/Track、Token 与权限位、为什么 `auto_create=false` | 6 |
-| `media/sfu.md` | SFU 与 Mesh/MCU 的取舍、订阅控制与带宽 | 6 |
 | `architecture/media-plane.md` | 媒体面边界、Webhook 作为唯一权威观测、`ONLINE` 判定权 | 8 |
 | `architecture/realtime-flow.md` | WebSocket 业务事件流、与 DataChannel 的分工 | 8 |
 | `media/track-permissions.md` | 各角色的 publish/subscribe 权限矩阵、学生间隔离如何实现 | 7-10 |

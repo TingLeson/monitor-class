@@ -88,7 +88,13 @@ export type {
 } from './session'
 
 export { CONNECTION_QUALITIES, isConnectionQuality } from './monitor'
-export type { ConnectionQuality, TeacherMonitorStudent, TrackActiveState } from './monitor'
+export type {
+  ConnectionQuality,
+  MonitorResponse,
+  MonitorStudent,
+  TeacherMonitorStudent,
+  TrackActiveState,
+} from './monitor'
 
 export {
   API_ERROR_CODES,
@@ -113,4 +119,5 @@ export type {
   CaptureDiagnostics,
   JoinClassroomRequest,
   JoinClassroomResponse,
+  MediaTokenResponse,
 } from './api-dto'

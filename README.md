@@ -108,7 +108,7 @@ LiveKit secret 只存在于后端、短时 LiveKit Token、Webhook 签名校验�
 | 3     | Classroom 领域与 ClassroomRun（开关课堂、学生名单）  | ✅ 完成 |
 | 4     | 学生课堂门户（我的课堂 + PreJoin）                   | ✅ 完成 |
 | 5     | 整屏共享 Gate（能力自检 + displaySurface 硬闸门）    | ✅ 完成 |
-| 6     | LiveKit：1 老师 + 1 学生                             | ⏳      |
+| 6     | LiveKit：1 老师 + 1 学生（真实媒体链路）             | ✅ 完成 |
 | 7     | 多学生监督墙与 Focus View                            | ⏳      |
 | 8     | 运行时状态与事件（WebSocket + Webhook）              | ⏳      |
 | 9     | 摄像头                                               | ⏳      |

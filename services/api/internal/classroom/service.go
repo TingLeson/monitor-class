@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -23,15 +24,47 @@ import (
 type Service struct {
 	repo     Repository
 	accounts AccountDirectory
+	// rooms is the media-plane cleanup used by Close (§49). A nil value means "no
+	// media plane is wired" — the classroom lifecycle is then purely a control-plane
+	// operation, which is exactly the state the unit tests run in.
+	rooms RoomTerminator
 	// newID mints the run id. It is injectable so a test can assert the room name
 	// is derived from the run id rather than invented separately.
 	newID func() uuid.UUID
 }
 
+// RoomTerminator is the one media-plane operation the classroom lifecycle needs in
+// Phase 6: closing a classroom must end its media room (§49).
+//
+// WHY this is an interface declared here rather than *media.Client: the classroom
+// domain must stay testable without a LiveKit server, and a one-method port is the
+// smallest thing that says "this is the only media call this package makes".
+type RoomTerminator interface {
+	TerminateRoom(ctx context.Context, roomName string) error
+}
+
+// terminateRoomTimeout bounds the media-plane cleanup that follows a close. The
+// database has already committed by then, so this is a bounded courtesy call and not
+// a step the answer depends on.
+const terminateRoomTimeout = 3 * time.Second
+
 // NewService wires the service. accounts resolves submitted student accounts; it
 // is the user repository in production (see AccountDirectory).
 func NewService(repo Repository, accounts AccountDirectory) *Service {
 	return &Service{repo: repo, accounts: accounts, newID: uuid.New}
+}
+
+// WithRoomTerminator attaches the media-plane room teardown of §49.
+//
+// WHY a setter instead of a constructor argument: every existing caller and test
+// keeps working without a media plane — and, more importantly, "no terminator" is a
+// state the code has to handle anyway, because STARTUP_REQUIRE_DEPENDENCIES=false
+// allows the API to run with LiveKit unreachable. Making it an explicit,
+// optional attachment keeps that degraded mode visible at the wiring site in main.go
+// rather than hidden behind a nil interface argument in every test.
+func (s *Service) WithRoomTerminator(rooms RoomTerminator) *Service {
+	s.rooms = rooms
+	return s
 }
 
 // CreateInput is the request of Create.
@@ -345,11 +378,22 @@ func (s *Service) Open(ctx context.Context, classroomID, teacherID uuid.UUID) (*
 
 // Close ends the current run and flips the classroom to CLOSED (§49).
 //
-// Phase 6 will call LiveKit TerminateRoom and Phase 8 will mark this run's
-// student_sessions ROOM_CLOSED and broadcast ROOM_CLOSED — both AFTER this call
-// returns, so the database already says CLOSED when anything downstream reacts (see
-// the seam note on Repository.Close). Phase 3 has neither, and no stub is left here
-// pretending otherwise.
+// The order is: commit the control plane, THEN tell the media plane. Terminating the
+// LiveKit room is cleanup that makes the media plane catch up with a decision the
+// database has already recorded — never the other way round (§33). Two consequences,
+// both deliberate:
+//
+//   - A failing TerminateRoom does NOT fail the request and does NOT roll anything
+//     back. The classroom IS closed; the room is merely behind, and LiveKit's own
+//     empty_timeout collects it once the last participant drops. Reporting a 500 here
+//     would tell the teacher the close failed while the students' dashboards already
+//     show it as closed.
+//   - The cleanup runs on a context detached from the request. The commit is done, so
+//     a browser that navigated away must not cancel the teardown, and a bug in the
+//     media call must not be able to extend the response beyond terminateRoomTimeout.
+//
+// Phase 8 will additionally mark this run's student_sessions ROOM_CLOSED and
+// broadcast ROOM_CLOSED, also after the commit.
 func (s *Service) Close(ctx context.Context, classroomID, teacherID uuid.UUID) (*Classroom, *Run, error) {
 	current, err := s.owned(ctx, classroomID, teacherID)
 	if err != nil {
@@ -369,7 +413,38 @@ func (s *Service) Close(ctx context.Context, classroomID, teacherID uuid.UUID) (
 		logging.FieldClassroomID, classroomID.String(),
 		logging.FieldRunID, run.ID.String(),
 	)
+	s.terminateRoom(ctx, classroomID, run)
 	return closed, run, nil
+}
+
+// terminateRoom ends the media room of a run that was just closed.
+//
+// It never returns an error: the caller's state change has already succeeded, and the
+// only correct responses to a media-plane failure are a log line and the knowledge
+// that LiveKit will expire the room on its own (§49).
+func (s *Service) terminateRoom(ctx context.Context, classroomID uuid.UUID, run *Run) {
+	if s.rooms == nil || run == nil || run.LiveKitRoomName == "" {
+		// No media plane wired, or a run without a room name (impossible while the
+		// column is NOT NULL, but a nil dereference here would abort the response of
+		// an operation that already succeeded).
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminateRoomTimeout)
+	defer cancel()
+
+	if err := s.rooms.TerminateRoom(cleanupCtx, run.LiveKitRoomName); err != nil {
+		// The room name is logged (it is an opaque uuid, not a person §8) because
+		// "which room stayed alive?" is the only actionable part of this line. The
+		// error's own text is logged: it is a media-plane error, not a credential.
+		logging.FromContext(ctx).Warn("media room was not terminated after close",
+			"action", "terminate_room_failed",
+			logging.FieldClassroomID, classroomID.String(),
+			logging.FieldRunID, run.ID.String(),
+			"room", run.LiveKitRoomName,
+			"error", err,
+			"consequence", "the room is cleaned up by LiveKit's empty timeout instead",
+		)
+	}
 }
 
 // ListStudentClassrooms returns the classrooms the authenticated student may see.
@@ -453,6 +528,50 @@ func (s *Service) GetStudentClassroom(ctx context.Context, studentID, classroomI
 		return nil, errors.New("classroom: repository returned no classroom for a student read")
 	}
 	return found, nil
+}
+
+// StudentEntry returns the classroom and the run a student asking to enter would
+// join (§43).
+//
+// The authorization rule is the repository's roster JOIN, so this method adds no
+// filter of its own: "may this student see the classroom" and "may this student
+// enter it" are the same question asked with the same data, and answering them with
+// two different queries is how the two answers eventually disagree (§14/§63).
+//
+// The classroom's status is returned rather than enforced. WHY: whether a CLOSED
+// classroom is a 409 or a page that says "还没开始" is a product decision that belongs
+// to the caller that knows the operation; a repository or service that refused would
+// leave the join endpoint unable to distinguish "not yours" from "not open", which
+// are the two answers the student UI renders differently (§58).
+func (s *Service) StudentEntry(ctx context.Context, studentID, classroomID uuid.UUID) (*StudentEntry, error) {
+	if studentID == uuid.Nil || classroomID == uuid.Nil {
+		// Same collapse as the portal reads: a nil uuid can never match a grant row,
+		// and answering "not assigned" keeps a nil id from ever behaving like a
+		// wildcard if a future query loses its WHERE clause.
+		return nil, ErrStudentNotAssigned
+	}
+	entry, err := s.repo.GetStudentEntry(ctx, studentID, classroomID)
+	if err != nil {
+		return nil, err
+	}
+	if entry == nil {
+		return nil, errors.New("classroom: repository returned no entry for a student join")
+	}
+	return entry, nil
+}
+
+// RunByID returns one run by id.
+//
+// WHY the session package cannot work this out for itself: a student session stores
+// the run id, and leaving a session has to name the media room to remove the
+// participant from. Re-deriving `lk_<run_uuid>` outside this package would put a
+// second implementation of the naming scheme in the codebase, and the two would
+// eventually disagree about a room that is actually live (§8).
+func (s *Service) RunByID(ctx context.Context, runID uuid.UUID) (*Run, error) {
+	if runID == uuid.Nil {
+		return nil, ErrNotFound
+	}
+	return s.repo.GetRunByID(ctx, runID)
 }
 
 // owned loads a classroom and verifies that teacherID owns it.

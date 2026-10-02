@@ -26,9 +26,13 @@ x-api-environment: &api-environment
   DATABASE_URL: postgres://${POSTGRES_USER:-classwatch}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置：请先执行 make init}@postgres:5432/${POSTGRES_DB:-classwatch}?sslmode=disable
   REDIS_ADDR: redis:6379
   REDIS_DB: ${REDIS_DB:-0}
-  # 服务端调用 LiveKit 用容器内地址；下发给浏览器的地址必须是宿主可达地址。
-  LIVEKIT_API_URL: http://livekit:7880
+  # LiveKit 的两个地址都来自 .env，不再写死成本地容器：
+  #   LIVEKIT_URL     —— 下发给**浏览器**的信令地址（wss://...）
+  #   LIVEKIT_API_URL —— 后端调用 RoomService 的地址（https://...）
+  # 默认走 LiveKit Cloud / 自建生产实例；需要完全离线开发时用
+  # `docker compose --profile local-media up -d` 起本地容器并把这两个值改成 localhost。
   LIVEKIT_URL: ${LIVEKIT_URL:-ws://localhost:7880}
+  LIVEKIT_API_URL: ${LIVEKIT_API_URL:-http://localhost:7880}
   LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?LIVEKIT_API_KEY 未设置：请先执行 make init}
   LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?LIVEKIT_API_SECRET 未设置：请先执行 make init}
   CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:5174,http://localhost:5175}
@@ -95,7 +99,13 @@ services:
       timeout: 3s
       retries: 20
 
+  # 本地 LiveKit 容器（**可选**，默认不启动）。
+  # 默认媒体面是 .env 里配置的 LiveKit（当前为 LiveKit Cloud）；只有需要完全离线开发时才
+  # 用 `docker compose --profile local-media up -d` 起这个容器，并把 .env 的
+  # LIVEKIT_URL/LIVEKIT_API_URL 指向 localhost。
+  # 放进 profile 的另一个好处：不会出现"以为在用云、其实连的是本地容器"这种最难查的错配。
   livekit:
+    profiles: ['local-media']
     # 固定到具体补丁版本：LiveKit 的媒体行为会随小版本变化，dev/prod 必须一致。
     image: livekit/livekit-server:v1.13.6
     restart: unless-stopped
@@ -163,9 +173,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      livekit:
-        condition: service_started
       # schema 必须先就位，服务才允许开始接收请求。
+      # 这里**不**依赖本地 livekit：媒体面可能在本机之外（LiveKit Cloud），
+      # API 启动时会自己去探活，探不通就按 STARTUP_REQUIRE_DEPENDENCIES 拒绝启动。
       migrate:
         condition: service_completed_successfully
     healthcheck:

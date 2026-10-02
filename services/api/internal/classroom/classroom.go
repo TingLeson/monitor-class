@@ -164,6 +164,27 @@ type StudentCurrentRun struct {
 	OpenedAt time.Time
 }
 
+// StudentEntry is what the join path of §43 needs to know about one classroom and
+// the student asking to enter it.
+//
+// WHY it is not StudentClassroom: the portal's read path must never carry the
+// LiveKit room name — it is a media-plane handle that is handed out with the media
+// token, to a participant who is entitled to join (§33). The join path cannot work
+// without it. Two types, with the room name present in exactly one of them, keep
+// that asymmetry a property of the code instead of a rule a future DTO change has
+// to remember. Nothing here reaches a response body: the room name is used to
+// create the room and to scope the token.
+type StudentEntry struct {
+	ClassroomID uuid.UUID
+	// Status is the classroom's status. It is reported, not enforced, here: the
+	// caller decides what a CLOSED classroom means for its operation (§43 answers
+	// 409 CLASSROOM_CLOSED).
+	Status Status
+	// Run is the current run and is nil exactly while Status is CLOSED, which is the
+	// invariant the database enforces (classrooms_run_consistency).
+	Run *Run
+}
+
 // Student is one roster entry joined with the account it authorizes.
 type Student struct {
 	// ID is the account id (users.id), which is also classroom_students.student_id.
@@ -320,6 +341,14 @@ type Repository interface {
 	// ErrStudentNotAssigned when there is no such row — the same answer for "no
 	// classroom with that id" and "not on its roster" (see Service.GetStudentClassroom).
 	GetForStudent(ctx context.Context, studentID, classroomID uuid.UUID) (*StudentClassroom, error)
+	// GetStudentEntry returns the classroom and its current run through the same
+	// roster JOIN as GetForStudent, with the room name included. It backs the join of
+	// §43, which has to decide "may this student enter, and into which run?" before
+	// any media session exists.
+	GetStudentEntry(ctx context.Context, studentID, classroomID uuid.UUID) (*StudentEntry, error)
+	// GetRunByID returns one run, or ErrNotFound. The leave path needs the room name
+	// of the run a session belongs to (a session row stores the run id, not the room).
+	GetRunByID(ctx context.Context, runID uuid.UUID) (*Run, error)
 	// UpdateDetails rewrites name and/or description and bumps updated_at.
 	UpdateDetails(ctx context.Context, params UpdateParams) (*Classroom, error)
 	// ListStudents returns the whole roster (including DISABLED accounts), newest

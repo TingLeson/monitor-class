@@ -370,7 +370,7 @@ async function confirmRemove(): Promise<void> {
             :to="{ name: 'teacher-classroom-monitor', params: { id: store.current.id } }"
             class="inline-flex h-10 items-center justify-center rounded-control border border-border-subtle bg-surface px-4 text-sm font-medium text-ink transition-colors hover:bg-surface-muted"
           >
-            监督墙（Phase 7）
+            进入监督墙
           </RouterLink>
           <AppButton
             :variant="store.current.status === 'OPEN' ? 'danger' : 'primary'"

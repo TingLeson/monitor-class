@@ -23,6 +23,7 @@ func clearEnv(t *testing.T) {
 		"DB_MAX_CONN_LIFETIME", "DB_HEALTH_CHECK_PERIOD",
 		"REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB",
 		"LIVEKIT_URL", "LIVEKIT_API_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET",
+		"LIVEKIT_TOKEN_TTL",
 		"SESSION_COOKIE_NAME", "SESSION_TTL", "SESSION_COOKIE_SECURE",
 		"SESSION_IDLE_TOUCH_INTERVAL", "PASSWORD_MIN_LENGTH",
 		"RATE_LIMIT_LOGIN_PER_MINUTE", "RATE_LIMIT_LOGIN_PER_ACCOUNT_PER_10MIN",
@@ -207,6 +208,70 @@ func TestLoadSessionTTL(t *testing.T) {
 				t.Errorf("SessionTTL = %v, want %v", cfg.SessionTTL, tc.want)
 			}
 		})
+	}
+}
+
+// TestLoadLiveKitTokenTTL pins the media token lifetime rules: a duration, strictly
+// positive, and bounded by a day.
+//
+// WHY the upper bound is a test and not only validation code: a typo here ("240h"
+// instead of "24h") would hand every participant a credential valid for a week, and
+// the API would start happily. The ceiling is what turns that typo into a boot failure.
+func TestLoadLiveKitTokenTTL(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "hours", raw: "2h", want: 2 * time.Hour},
+		{name: "a lesson length", raw: "90m", want: 90 * time.Minute},
+		{name: "at the ceiling", raw: "24h", want: 24 * time.Hour},
+		{name: "not a duration", raw: "two-hours", wantErr: true},
+		{name: "missing unit", raw: "7200", wantErr: true},
+		{name: "zero", raw: "0s", wantErr: true},
+		{name: "negative", raw: "-30m", wantErr: true},
+		{name: "beyond the ceiling", raw: "25h", wantErr: true},
+		{name: "an obvious typo", raw: "240h", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			setMinimalValidEnv(t)
+			t.Setenv("LIVEKIT_TOKEN_TTL", tc.raw)
+
+			cfg, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("Load() succeeded for LIVEKIT_TOKEN_TTL=%q, want error", tc.raw)
+				}
+				if !strings.Contains(err.Error(), "LIVEKIT_TOKEN_TTL") {
+					t.Errorf("error = %q, want it to name LIVEKIT_TOKEN_TTL", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() returned error: %v", err)
+			}
+			if cfg.LiveKitTokenTTL != tc.want {
+				t.Errorf("LiveKitTokenTTL = %v, want %v", cfg.LiveKitTokenTTL, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadLiveKitTokenTTLDefault keeps the default in one place: two hours is the
+// value the media documentation promises and the value the session tests assume.
+func TestLoadLiveKitTokenTTLDefault(t *testing.T) {
+	clearEnv(t)
+	setMinimalValidEnv(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.LiveKitTokenTTL != 2*time.Hour {
+		t.Errorf("LiveKitTokenTTL = %v, want the 2h default", cfg.LiveKitTokenTTL)
 	}
 }
 

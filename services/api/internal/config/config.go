@@ -93,6 +93,20 @@ type Config struct {
 	// logs, never in API responses (§44/§59).
 	LiveKitAPIKey    string
 	LiveKitAPISecret string
+	// LiveKitTokenTTL is how long an issued participant token stays valid (§63 makes
+	// it short-lived). Default 2h; must be > 0 and at most 24h.
+	//
+	// WHY not a very short TTL with an automatic refresh (the "5 minutes + renew"
+	// pattern a media SDK makes easy): a reconnect in the middle of a lesson — a wifi
+	// blip, a laptop lid, a browser that reloaded — has to happen with the token the
+	// participant already holds, because the refresh call itself is a request the
+	// student's browser may not be able to make while its media connection is down.
+	// A five-minute token would turn every brief network interruption into "you must
+	// re-enter the classroom", which is exactly when a supervision product must not
+	// ask the student to do anything. The token is still bounded by the lesson: 2h
+	// covers a long evening session, and Phase 11 adds rotation/refresh for
+	// deployments that need a tighter window.
+	LiveKitTokenTTL time.Duration
 
 	// SessionCookieName is the base name of the HttpOnly session cookie. The
 	// effective name is per entry point (see SessionCookieNameFor); this value is
@@ -211,6 +225,9 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if err := parseTrustedProxies(cfg); err != nil {
+		return nil, err
+	}
+	if err := parseLiveKitToken(cfg); err != nil {
 		return nil, err
 	}
 	if err := parsePostgresPool(cfg); err != nil {
@@ -417,6 +434,32 @@ func parseTrustedProxies(cfg *Config) error {
 	cfg.TrustedProxies = nets
 	return nil
 }
+
+// parseLiveKitToken validates the media token lifetime.
+//
+// The upper bound is not decoration: a token is a bearer credential for a media room,
+// and an operator who typed "240h" instead of "2h" would hand every participant a
+// valid key for a week. 24 hours is the ceiling because no lesson of this product
+// lasts a day, so anything beyond it is a typo rather than a policy.
+func parseLiveKitToken(cfg *Config) error {
+	raw := envString("LIVEKIT_TOKEN_TTL", "2h")
+	ttl, err := time.ParseDuration(raw)
+	if err != nil {
+		return fmt.Errorf("LIVEKIT_TOKEN_TTL must be a Go duration such as 2h or 90m (got %q)", raw)
+	}
+	if ttl <= 0 {
+		return fmt.Errorf("LIVEKIT_TOKEN_TTL must be greater than zero (got %q)", raw)
+	}
+	if ttl > maxLiveKitTokenTTL {
+		return fmt.Errorf("LIVEKIT_TOKEN_TTL must be at most %s (got %q)", maxLiveKitTokenTTL, raw)
+	}
+	cfg.LiveKitTokenTTL = ttl
+	return nil
+}
+
+// maxLiveKitTokenTTL is the hard ceiling for a media token's lifetime. It is a
+// constant and not a configuration value: see parseLiveKitToken.
+const maxLiveKitTokenTTL = 24 * time.Hour
 
 func parsePostgresPool(cfg *Config) error {
 	maxConns, err := envInt("DB_MAX_CONNS", 10)

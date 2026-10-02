@@ -91,7 +91,8 @@ dev-web: ## 只启动三个前端 dev server
 doctor: env ## 检查本地环境健康状态（API + 依赖连通性）
 	@printf '%-34s' "GET /healthz"; curl -s -o /tmp/cw_healthz.json -w '%{http_code} ' http://localhost:$${API_PORT:-8090}/healthz; cat /tmp/cw_healthz.json; echo
 	@printf '%-34s' "GET /readyz"; curl -s -o /tmp/cw_readyz.json -w '%{http_code} ' http://localhost:$${API_PORT:-8090}/readyz; cat /tmp/cw_readyz.json; echo
-	@printf '%-34s' "LiveKit 7880"; curl -s -o /dev/null -w '%{http_code}\n' http://localhost:7880/ || true
+	@# 媒体面可能在本机之外（LiveKit Cloud），因此探测 .env 里配置的地址而不是写死 7880。
+	@printf '%-34s' "LiveKit (${LIVEKIT_API_URL})"; curl -s -o /dev/null -w '%{http_code}\n' "$${LIVEKIT_API_URL:-http://localhost:7880}/" || true
 	@$(COMPOSE) ps
 
 # ---------------------------------------------------------------- 数据库

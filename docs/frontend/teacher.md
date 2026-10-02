@@ -167,7 +167,24 @@ POST /api/v1/teacher/classrooms/:id/close   → { "classroom": ..., "run": ... }
 
 ---
 
-## 7. 未做（按 Phase 归属）
+## 7. 监督墙（Phase 6：能真的看到画面）
+
+进入 `/teacher/classrooms/:id/monitor` 后：
+
+```text
+POST /teacher/classrooms/:id/media-token   ← 只允许 owner，课堂必须 OPEN
+   ↓  连接 SFU（autoSubscribe = false，§52）
+GET  /teacher/classrooms/:id/monitor       ← 业务状态（来自 PostgreSQL + 服务端对媒体面的观测）
+   ↓  对 screen.active = true 的学生，手动订阅其屏幕轨道并渲染到卡片主体（§29）
+```
+
+- **业务状态与媒体状态分开**（§51）：卡片上的徽章（🟢 正常 / 🔴 屏幕中断 / ⚪ 未连接）来自 Monitor DTO；
+  画面来自 LiveKit。绝不拿 LiveKit participant 当业务模型。
+- **手动订阅**：`autoSubscribe = false`，只订阅需要看的画面；同一个 participant 不会重复订阅。
+- 老师端**可以**显示学生的屏幕画面（这正是监督墙的意义）；Phase 7 会加网格、Focus View 与按可见性动态订阅。
+- Phase 6 是"1 老师 + 1 学生"的形态；多学生网格与降质策略属 Phase 7。
+
+## 8. 未做（按 Phase 归属）
 
 | 项 | Phase |
 | --- | --- |
