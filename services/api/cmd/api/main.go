@@ -35,6 +35,7 @@ import (
 	"github.com/classwatch/classwatch/services/api/internal/infrastructure/redis"
 	"github.com/classwatch/classwatch/services/api/internal/media"
 	"github.com/classwatch/classwatch/services/api/internal/ratelimit"
+	"github.com/classwatch/classwatch/services/api/internal/realtime"
 	"github.com/classwatch/classwatch/services/api/internal/session"
 	"github.com/classwatch/classwatch/services/api/internal/user"
 )
@@ -104,14 +105,34 @@ func run() error {
 	// session store: they are two views of the same accounts, and giving each its
 	// own would let them disagree about what a user row says.
 	users := deps.userRepository(logger)
+
+	// Phase 8's runtime layer (§47): one hub for the process, one service that decides
+	// who receives what, and the processor that turns media-plane observations into
+	// session states, event rows and messages. It is built before the router because the
+	// classroom lifecycle and the session service both report into it.
+	runtime, hub := deps.runtimeLayer(logger, cfg)
+	if hub != nil {
+		// Close the sockets with a proper "going away" frame before the HTTP server
+		// stops: WebSocket connections are hijacked, so http.Server.Shutdown does not
+		// wait for them, and a client that is told why it was disconnected reconnects
+		// with a backoff instead of treating a deploy as a network failure.
+		defer func() {
+			hubCtx, hubCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+			defer hubCancel()
+			hub.Shutdown(hubCtx)
+		}()
+	}
+
 	router := httpapi.NewRouter(httpapi.Deps{
 		Logger:    logger,
 		Config:    cfg,
 		Ready:     deps.readiness(),
 		Auth:      deps.authService(logger, cfg, users),
 		Admin:     deps.adminService(logger, cfg, users),
-		Classroom: deps.classroomService(logger, users),
-		Session:   deps.sessionService(logger, cfg, users),
+		Classroom: deps.classroomService(logger, users, runtime),
+		Session:   deps.sessionService(logger, cfg, users, runtime),
+		Webhook:   deps.webhookDeps(cfg, runtime),
+		Socket:    hub,
 		Limiter:   deps.rateLimiter(logger),
 	})
 
@@ -264,7 +285,11 @@ func (d *dependencies) adminService(logger *slog.Logger, cfg *config.Config, use
 // ends its media room. It is attached only when LiveKit was reachable at boot: a
 // degraded process has no media plane to clean up, and Close must not fail because of
 // one.
-func (d *dependencies) classroomService(logger *slog.Logger, users user.Repository) httpapi.ClassroomService {
+//
+// The runtime hooks (§47/§48/§49) are attached when the event layer exists: open
+// broadcasts ROOM_OPENED, close marks the run's sessions ROOM_CLOSED and broadcasts
+// ROOM_CLOSED — all after the commit, all unable to fail the teacher's request.
+func (d *dependencies) classroomService(logger *slog.Logger, users user.Repository, runtime *session.Processor) httpapi.ClassroomService {
 	if users == nil {
 		logger.Warn("postgres is not connected; teacher classroom routes are disabled",
 			"hint", "STARTUP_REQUIRE_DEPENDENCIES=false must only be used for local work")
@@ -273,6 +298,9 @@ func (d *dependencies) classroomService(logger *slog.Logger, users user.Reposito
 	service := classroom.NewService(classroom.NewPostgres(d.postgres.Pool()), users)
 	if d.livekit != nil {
 		service.WithRoomTerminator(d.livekit)
+	}
+	if runtime != nil {
+		service.WithRuntimeHooks(runtime)
 	}
 	return service
 }
@@ -287,7 +315,10 @@ func (d *dependencies) classroomService(logger *slog.Logger, users user.Reposito
 // The media client is passed even when LiveKit was unreachable at boot — the service
 // then answers MEDIA_TOKEN_FAILED on join/media-token rather than pretending to have a
 // media plane, while the monitor still reports the control plane's own state (§33).
-func (d *dependencies) sessionService(logger *slog.Logger, cfg *config.Config, users user.Repository) httpapi.SessionService {
+//
+// The runtime processor is attached as the lifecycle event path (§13): join records
+// SESSION_CREATED, leave records STUDENT_LEFT and tells the teacher's console.
+func (d *dependencies) sessionService(logger *slog.Logger, cfg *config.Config, users user.Repository, runtime *session.Processor) httpapi.SessionService {
 	if users == nil {
 		logger.Warn("postgres is not connected; student session routes are disabled",
 			"hint", "STARTUP_REQUIRE_DEPENDENCIES=false must only be used for local work")
@@ -305,10 +336,60 @@ func (d *dependencies) sessionService(logger *slog.Logger, cfg *config.Config, u
 		logger.Warn("livekit is not reachable; join and media-token will answer MEDIA_TOKEN_FAILED",
 			"hint", "media sessions need the media plane; the monitor still reports control-plane state")
 	}
-	return session.NewService(sessionRepo, classrooms, mediaPlane, session.Config{
+	service := session.NewService(sessionRepo, classrooms, mediaPlane, session.Config{
 		LiveKitURL: cfg.LiveKitURL,
 		TokenTTL:   cfg.LiveKitTokenTTL,
 	})
+	if runtime != nil {
+		service.WithLifecycleEvents(runtime)
+	}
+	return service
+}
+
+// runtimeLayer builds the runtime event path of Phase 8: the WebSocket hub (§47), the
+// service that resolves who may receive what (§26), and the processor that owns the
+// session state machine and the event log (§13/§45).
+//
+// It returns (nil, nil) when PostgreSQL is not connected, and (processor, hub) otherwise.
+// A nil hub is a valid deployment: the state machine keeps working and only the live
+// messages are skipped (§52's single-instance assumption, and any deployment that has
+// not enabled the sockets). A nil processor disables the webhook route, because events
+// that cannot be recorded must not be accepted.
+func (d *dependencies) runtimeLayer(logger *slog.Logger, cfg *config.Config) (*session.Processor, *realtime.Hub) {
+	if d.postgres == nil {
+		logger.Warn("postgres is not connected; runtime events and websockets are disabled",
+			"hint", "STARTUP_REQUIRE_DEPENDENCIES=false must only be used for local work")
+		return nil, nil
+	}
+	hub := realtime.NewHub(realtime.HubConfig{
+		Logger: logger,
+		// The same origin allowlist the HTTP API uses: the frontends are configured once,
+		// and a WebSocket handshake must be refused for exactly the origins that are
+		// refused a cross-origin fetch (§63).
+		AllowedOrigins: cfg.CORSOrigins(),
+	})
+	runtime := realtime.NewService(hub, realtime.NewAudience(d.postgres.Pool()), logger)
+	return session.NewProcessor(session.NewPostgres(d.postgres.Pool()), runtime), hub
+}
+
+// webhookDeps builds the LiveKit webhook endpoint's two halves (§45).
+//
+// A nil result means the route is not registered, which is the correct behaviour when
+// the LiveKit key pair is not configured or PostgreSQL is missing: an endpoint that
+// cannot verify a signature, or cannot record what it verified, must not exist.
+func (d *dependencies) webhookDeps(cfg *config.Config, runtime *session.Processor) *httpapi.WebhookDeps {
+	if runtime == nil {
+		return nil
+	}
+	verifier, err := media.NewWebhookVerifier(cfg.LiveKitAPIKey, cfg.LiveKitAPISecret)
+	if err != nil {
+		// The secret itself is never printed (§59); the message says only what is
+		// missing.
+		slog.Warn("livekit webhook verification is not configured; the endpoint is not registered",
+			"reason", err)
+		return nil
+	}
+	return &httpapi.WebhookDeps{Verifier: verifier, Processor: runtime}
 }
 
 // mediaPlaneOrNil narrows the LiveKit client to the media-plane port, mapping "not

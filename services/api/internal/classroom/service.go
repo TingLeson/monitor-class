@@ -28,9 +28,37 @@ type Service struct {
 	// media plane is wired" — the classroom lifecycle is then purely a control-plane
 	// operation, which is exactly the state the unit tests run in.
 	rooms RoomTerminator
+	// runtime is the event path of §47/§48/§49: the session states a close ends, and the
+	// WebSocket messages both lifecycle transitions produce. A nil value means "no
+	// runtime layer is wired", which is a supported state (§52's single-instance
+	// deployment without a hub, and every unit test that is about the classroom rules).
+	runtime RuntimeHooks
 	// newID mints the run id. It is injectable so a test can assert the room name
 	// is derived from the run id rather than invented separately.
 	newID func() uuid.UUID
+}
+
+// RuntimeHooks is the runtime layer as the classroom lifecycle sees it (§47/§48/§49).
+//
+// WHY the close flow's two steps are one port: they are one sequence — the sessions of
+// the run end, then the clients are told — and a caller that could do one without the
+// other would be able to leave the teacher's console showing a lesson that is over. The
+// implementation is internal/session's Processor, which owns both halves; this package
+// only decides WHEN they happen (after the commit, never before).
+//
+// Every method returns an error and none of them may fail the request: the classroom's
+// state change is already committed when they run, and a broadcast is not a transaction
+// participant (§33). The service logs the failure and still answers the teacher.
+type RuntimeHooks interface {
+	// CloseRunSessions marks the run's active student sessions ROOM_CLOSED, records one
+	// event per row and tells the owner about each. It returns how many it closed, which
+	// is zero when they were already terminal (the room_finished webhook got there
+	// first) — a normal outcome, not a failure.
+	CloseRunSessions(ctx context.Context, runID uuid.UUID) (int, error)
+	// RoomOpened announces a new run to the students it authorizes (§48).
+	RoomOpened(ctx context.Context, classroomID, runID uuid.UUID) error
+	// RoomClosed announces the end of a run to its students and its owner (§49).
+	RoomClosed(ctx context.Context, classroomID, runID uuid.UUID) error
 }
 
 // RoomTerminator is the one media-plane operation the classroom lifecycle needs in
@@ -48,6 +76,11 @@ type RoomTerminator interface {
 // a step the answer depends on.
 const terminateRoomTimeout = 3 * time.Second
 
+// runtimeHookTimeout bounds each post-commit runtime step (closing the run's sessions,
+// broadcasting ROOM_OPENED/ROOM_CLOSED). Same reasoning as terminateRoomTimeout: the
+// decision is already committed, and a slow listener must not extend a teacher's request.
+const runtimeHookTimeout = 3 * time.Second
+
 // NewService wires the service. accounts resolves submitted student accounts; it
 // is the user repository in production (see AccountDirectory).
 func NewService(repo Repository, accounts AccountDirectory) *Service {
@@ -64,6 +97,17 @@ func NewService(repo Repository, accounts AccountDirectory) *Service {
 // rather than hidden behind a nil interface argument in every test.
 func (s *Service) WithRoomTerminator(rooms RoomTerminator) *Service {
 	s.rooms = rooms
+	return s
+}
+
+// WithRuntimeHooks attaches the event path of §47/§48/§49 (session_events, the
+// ROOM_OPENED/ROOM_CLOSED broadcasts).
+//
+// Same reasoning as WithRoomTerminator: the classroom lifecycle is complete without it,
+// and making it an explicit attachment keeps a deployment without a realtime layer
+// visible at the wiring site instead of implied by a nil interface argument.
+func (s *Service) WithRuntimeHooks(hooks RuntimeHooks) *Service {
+	s.runtime = hooks
 	return s
 }
 
@@ -373,15 +417,19 @@ func (s *Service) Open(ctx context.Context, classroomID, teacherID uuid.UUID) (*
 		logging.FieldClassroomID, classroomID.String(),
 		logging.FieldRunID, run.ID.String(),
 	)
+	// §48: the students' dashboards update without a reload. AFTER the commit, and
+	// never able to fail the open — the classroom IS open, and a broadcast is a
+	// courtesy that the next page load or poll repairs.
+	s.announceOpen(ctx, classroomID, run)
 	return opened, run, nil
 }
 
 // Close ends the current run and flips the classroom to CLOSED (§49).
 //
-// The order is: commit the control plane, THEN tell the media plane. Terminating the
-// LiveKit room is cleanup that makes the media plane catch up with a decision the
-// database has already recorded — never the other way round (§33). Two consequences,
-// both deliberate:
+// The order is: commit the control plane, THEN tell the media plane and the clients.
+// Terminating the LiveKit room is cleanup that makes the media plane catch up with a
+// decision the database has already recorded — never the other way round (§33). Two
+// consequences, both deliberate:
 //
 //   - A failing TerminateRoom does NOT fail the request and does NOT roll anything
 //     back. The classroom IS closed; the room is merely behind, and LiveKit's own
@@ -392,8 +440,11 @@ func (s *Service) Open(ctx context.Context, classroomID, teacherID uuid.UUID) (*
 //     a browser that navigated away must not cancel the teardown, and a bug in the
 //     media call must not be able to extend the response beyond terminateRoomTimeout.
 //
-// Phase 8 will additionally mark this run's student_sessions ROOM_CLOSED and
-// broadcast ROOM_CLOSED, also after the commit.
+// Phase 8 adds the two runtime steps of §49, in this order and all after the commit:
+// mark the run's student sessions ROOM_CLOSED (+ one event each), then broadcast
+// ROOM_CLOSED. The LiveKit room_finished webhook arrives afterwards and is idempotent
+// against both — the sessions are already terminal, so it closes nothing and sends
+// nothing.
 func (s *Service) Close(ctx context.Context, classroomID, teacherID uuid.UUID) (*Classroom, *Run, error) {
 	current, err := s.owned(ctx, classroomID, teacherID)
 	if err != nil {
@@ -413,8 +464,83 @@ func (s *Service) Close(ctx context.Context, classroomID, teacherID uuid.UUID) (
 		logging.FieldClassroomID, classroomID.String(),
 		logging.FieldRunID, run.ID.String(),
 	)
+	// Control plane first (the sessions of a finished run are over, and the record of it
+	// must exist even if everything after this line fails), then the media plane, then
+	// the clients.
+	s.closeRunSessions(ctx, classroomID, run)
 	s.terminateRoom(ctx, classroomID, run)
+	s.announceClose(ctx, classroomID, run)
 	return closed, run, nil
+}
+
+// closeRunSessions marks the run's active sessions ROOM_CLOSED (§49).
+//
+// A failure is a Warn and nothing else. The alternative — failing the teacher's close
+// because a student row could not be updated — would be a lie: the classroom is closed,
+// the run is closed, and no API can reopen them. What is left behind is a session row
+// that still says ONLINE; the room_finished webhook (which is already on its way, the
+// room having been terminated) closes it, and the monitor endpoint's fallback keeps the
+// wall honest in the meantime.
+func (s *Service) closeRunSessions(ctx context.Context, classroomID uuid.UUID, run *Run) {
+	if s.runtime == nil || run == nil {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runtimeHookTimeout)
+	defer cancel()
+
+	closed, err := s.runtime.CloseRunSessions(cleanupCtx, run.ID)
+	if err != nil {
+		logging.FromContext(ctx).Warn("student sessions were not closed with the run",
+			"action", "close_run_sessions_failed",
+			logging.FieldClassroomID, classroomID.String(),
+			logging.FieldRunID, run.ID.String(),
+			"error", err,
+			"consequence", "the classroom IS closed; the room_finished webhook closes the remaining sessions",
+		)
+		return
+	}
+	logging.FromContext(ctx).Info("student sessions closed with the run",
+		"action", "close_run_sessions",
+		logging.FieldClassroomID, classroomID.String(),
+		logging.FieldRunID, run.ID.String(),
+		"closed", closed,
+	)
+}
+
+// announceOpen broadcasts ROOM_OPENED (§48).
+func (s *Service) announceOpen(ctx context.Context, classroomID uuid.UUID, run *Run) {
+	if s.runtime == nil || run == nil {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runtimeHookTimeout)
+	defer cancel()
+	if err := s.runtime.RoomOpened(cleanupCtx, classroomID, run.ID); err != nil {
+		logging.FromContext(ctx).Warn("room opened was not broadcast",
+			"action", "room_opened_broadcast_failed",
+			logging.FieldClassroomID, classroomID.String(),
+			logging.FieldRunID, run.ID.String(),
+			"error", err,
+			"consequence", "the classroom IS open; students see it on their next load or poll",
+		)
+	}
+}
+
+// announceClose broadcasts ROOM_CLOSED (§49).
+func (s *Service) announceClose(ctx context.Context, classroomID uuid.UUID, run *Run) {
+	if s.runtime == nil || run == nil {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runtimeHookTimeout)
+	defer cancel()
+	if err := s.runtime.RoomClosed(cleanupCtx, classroomID, run.ID); err != nil {
+		logging.FromContext(ctx).Warn("room closed was not broadcast",
+			"action", "room_closed_broadcast_failed",
+			logging.FieldClassroomID, classroomID.String(),
+			logging.FieldRunID, run.ID.String(),
+			"error", err,
+			"consequence", "the classroom IS closed; students see it on their next load or poll",
+		)
+	}
 }
 
 // terminateRoom ends the media room of a run that was just closed.

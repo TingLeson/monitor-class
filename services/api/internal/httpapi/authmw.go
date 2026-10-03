@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -110,62 +111,130 @@ func newAuthMiddleware(service AuthService, entries []AuthEntry, cfg *config.Con
 // login page.
 func (m *authMiddleware) RequireSession(entry AuthEntry) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		raw := m.cookieValue(c, entry.SessionCookie)
-
-		if raw == "" {
-			// No cookie for this entry. Before answering 401, check whether the
-			// caller holds a live session on a different entry point — that is an
-			// authorization failure, not a missing login.
-			if other, principal := m.sessionFromOtherEntry(c, entry); principal != nil {
-				clearAuthCookies(c, entry, m.cfg)
-				LoggerFrom(c).Info("cross-entry access rejected",
-					"entry", entry.PathPrefix,
-					"session_entry", other.PathPrefix,
-					logging.FieldUserID, principal.UserID.String(),
-					logging.FieldRole, string(principal.Role),
-					"path", c.Request.URL.Path,
-				)
-				RespondError(c, apperr.New(apperr.CodeRoleForbidden))
-				return
-			}
-			clearAuthCookies(c, entry, m.cfg)
-			RespondError(c, apperr.New(apperr.CodeAuthRequired))
+		_, err := m.authenticate(c, entry)
+		if err != nil {
+			m.logSessionRejection(c, entry, err)
+			RespondError(c, err)
 			return
 		}
+		// NOTE: the request logger is deliberately NOT enriched with the identity
+		// here. Every line that needs it (login, logout, session rejection, CSRF
+		// rejection) adds user_id and role itself, and doing it in both places emits
+		// duplicate fields — noise in text logs and an ambiguous document in JSON
+		// ones. The access log reads the principal from the context instead (see
+		// AccessLogMiddleware).
+		c.Next()
+	}
+}
 
-		principal, err := m.service.Authenticate(c.Request.Context(), raw)
-		switch {
-		case err == nil:
-			c.Set(principalContextKey, principal)
-			c.Set(authEntryContextKey, entry)
-			// The raw token is kept in the request context (never logged) so
-			// logout can revoke exactly this session.
-			setSessionToken(c, raw)
-			// NOTE: the request logger is deliberately NOT enriched with the
-			// identity here. Every line that needs it (login, logout, session
-			// rejection, CSRF rejection) adds user_id and role itself, and doing it
-			// in both places emits duplicate fields — noise in text logs and an
-			// ambiguous document in JSON ones. The access log reads the principal
-			// from the context instead (see AccessLogMiddleware).
-			c.Next()
+// authenticate performs RequireSession's DECISION and its cookie hygiene, and writes
+// nothing to the response.
+//
+// WHY the decision is separated from its presentation: the REST routes answer a failed
+// handshake with the error envelope, but a WebSocket client CANNOT read the status of a
+// failed upgrade — the browser reports only "the connection failed". The socket routes
+// therefore need the same decision expressed differently (an accepted upgrade followed by
+// a close code, see SocketService.Refuse), and a second implementation of "is this cookie
+// a live session of this entry point?" is exactly the kind of duplicate authorization
+// logic this codebase refuses to have.
+//
+// On success the caller's context is ready to use: the principal, the entry point and the
+// raw session token are all stored. On failure this entry's cookies have been cleared
+// (the cookie is what the frontend reads to decide "am I logged in?", and leaving a dead
+// one in the browser makes the app retry forever instead of showing the login page).
+func (m *authMiddleware) authenticate(c *gin.Context, entry AuthEntry) (*auth.Principal, error) {
+	raw := m.cookieValue(c, entry.SessionCookie)
 
-		case isAuthError(err, auth.ErrAccountDisabled):
+	if raw == "" {
+		// No cookie for this entry. Before answering "not authenticated", check whether
+		// the caller holds a live session on a DIFFERENT entry point: that is an
+		// authorization failure, not a missing login, and the two must not collapse
+		// (see the doc comment above).
+		if _, principal := m.sessionFromOtherEntry(c, entry); principal != nil {
 			clearAuthCookies(c, entry, m.cfg)
-			LoggerFrom(c).Info("session rejected: account disabled",
-				"entry", entry.PathPrefix, "path", c.Request.URL.Path)
-			RespondError(c, apperr.New(apperr.CodeAccountDisabled))
+			return nil, crossEntryError(entry, principal)
+		}
+		clearAuthCookies(c, entry, m.cfg)
+		return nil, apperr.New(apperr.CodeAuthRequired)
+	}
 
-		case isAuthError(err, auth.ErrSessionInvalid):
-			clearAuthCookies(c, entry, m.cfg)
+	principal, err := m.service.Authenticate(c.Request.Context(), raw)
+	switch {
+	case err == nil:
+		c.Set(principalContextKey, principal)
+		c.Set(authEntryContextKey, entry)
+		// The raw token is kept in the request context (never logged) so logout can
+		// revoke exactly this session.
+		setSessionToken(c, raw)
+		return principal, nil
+
+	case isAuthError(err, auth.ErrAccountDisabled):
+		clearAuthCookies(c, entry, m.cfg)
+		return nil, apperr.New(apperr.CodeAccountDisabled)
+
+	case isAuthError(err, auth.ErrSessionInvalid):
+		clearAuthCookies(c, entry, m.cfg)
+		// Wrapped rather than New: the cause is what tells the log line "a cookie WAS
+		// presented and the database rejected it" apart from "no cookie at all", and the
+		// client-visible code and message are identical either way (Wrap never appends
+		// the cause to the message, §58).
+		return nil, apperr.Wrap(apperr.CodeAuthRequired, err)
+
+	default:
+		// Database failure and friends: an internal error, and the cookie is
+		// deliberately left alone — clearing it would log the user out because of a
+		// transient outage.
+		return nil, err
+	}
+}
+
+// crossEntryError is the rejection of a caller who is authenticated on another entry
+// point. It exists as its own function so the log line and the WebSocket close code can
+// both name WHICH entry point the cookie belonged to.
+func crossEntryError(entry AuthEntry, principal *auth.Principal) error {
+	origin := entry.PathPrefix
+	if principal != nil && principal.Role != "" {
+		origin = principal.Role.Lower()
+	}
+	// The cause is logged and never sent to the client (`RespondError` renders only code
+	// and message, §58). It answers the question an operator actually has — "which cookie
+	// did this browser send?" — without naming a person.
+	return apperr.Wrap(apperr.CodeRoleForbidden,
+		fmt.Errorf("session belongs to the %s entry point, not %s", origin, entry.PathPrefix))
+}
+
+// logSessionRejection keeps the log lines of a rejected request where they were: one
+// line per cause, at Info (these are expected outcomes, not incidents), and NOTHING for
+// a request that simply presented no cookie — an anonymous probe of a protected route is
+// not worth a line, and logging it would let anybody fill the log from the internet.
+func (m *authMiddleware) logSessionRejection(c *gin.Context, entry AuthEntry, err error) {
+	appErr := apperr.From(err)
+	if appErr == nil {
+		// An infrastructure failure: RespondError logs it at Error with its cause.
+		return
+	}
+	switch appErr.Code {
+	case apperr.CodeRoleForbidden:
+		attrs := []any{"entry", entry.PathPrefix, "path", c.Request.URL.Path}
+		if appErr.Err != nil {
+			attrs = append(attrs, "cause", appErr.Err.Error())
+		}
+		if principal, ok := PrincipalFrom(c); ok {
+			attrs = append(attrs,
+				logging.FieldUserID, principal.UserID.String(),
+				logging.FieldRole, string(principal.Role))
+		}
+		LoggerFrom(c).Info("cross-entry access rejected", attrs...)
+	case apperr.CodeAccountDisabled:
+		LoggerFrom(c).Info("session rejected: account disabled",
+			"entry", entry.PathPrefix, "path", c.Request.URL.Path)
+	case apperr.CodeAuthRequired:
+		// Only an INVALID session is logged, not a request that simply carried no
+		// cookie: an anonymous probe of a protected route is not worth a line, and
+		// logging it would let anybody fill the log from the internet.
+		if appErr.Err != nil {
 			LoggerFrom(c).Info("session rejected: invalid session",
 				"entry", entry.PathPrefix, "path", c.Request.URL.Path)
-			RespondError(c, apperr.New(apperr.CodeAuthRequired))
-
-		default:
-			// Database failure and friends: an internal error, and the cookie is
-			// deliberately left alone — clearing it would log the user out because
-			// of a transient outage.
-			RespondError(c, err)
 		}
 	}
 }

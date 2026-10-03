@@ -10,8 +10,10 @@ import {
   makeClassroomStudent,
   makeOpenClassroom,
 } from '../../__tests__/fixtures'
+import { installFakeRealtimeSocket, makeRoomClosedEvent } from '../../__tests__/realtime-fixtures'
 import { routes } from '../../router'
 import { useClassroomsStore } from '../../stores/classrooms'
+import { useRealtimeStore } from '../../stores/realtime'
 import ClassroomDetailView from '../ClassroomDetailView.vue'
 
 /**
@@ -338,5 +340,31 @@ describe('课堂详情页', () => {
 
     expect(store.current).toBeNull()
     expect(store.students).toEqual([])
+  })
+
+  it('§49：另一个标签页关掉课堂时，本页跟着变成"未开启"并给出说明', async () => {
+    getClassroomMock.mockResolvedValue(makeOpenClassroom({ id: 'room-1', name: 'C++ 算法训练' }))
+    const { wrapper } = await mountView()
+    expect(wrapper.find('[data-testid="detail-status"]').text()).toContain('已开启')
+
+    const socket = installFakeRealtimeSocket()
+    const realtime = useRealtimeStore()
+    realtime.start()
+    socket.open()
+    // 事件**同步**写进 store（DOM 要等一次渲染；HTTP 快照这时还没回来，
+    // 所以这个状态只可能来自实时事件，§47）。
+    socket.emit(makeRoomClosedEvent({ classroomId: 'room-1' }))
+    expect(useClassroomsStore().current?.status).toBe('CLOSED')
+
+    // 快照随后收敛：真实后端在课堂关闭后返回的也是 CLOSED。
+    getClassroomMock.mockResolvedValue(makeClassroom({ id: 'room-1', status: 'CLOSED' }))
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="detail-status"]').text()).toContain('未开启')
+    const notice = wrapper.find('[data-testid="detail-realtime-notice"]')
+    expect(notice.exists()).toBe(true)
+    expect(notice.text()).toContain('其他页面')
+    // 关闭后按钮回到"开启课堂"（老师可以再开一节，§8：那是新的 Run）。
+    expect(wrapper.find('[data-testid="detail-toggle"]').text()).toContain('开启课堂')
   })
 })

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { AppButton, AppCard, AppEmptyState, ProtectedRouteGate, StatusDot } from '@classwatch/ui'
+import { computed } from 'vue'
 import { RouterLink } from 'vue-router'
 import {
   canEnterClassroom,
@@ -7,8 +8,10 @@ import {
   classroomStatusTone,
 } from '../lib/classroom-status'
 import { formatTimeOfDay } from '../lib/format'
+import { describeRealtimeStatus } from '../lib/realtime-status'
 import { describeStudentClassroomError } from '../lib/student-classroom-error'
 import { useClassroomsStore } from '../stores/classrooms'
+import { useRealtimeStore } from '../stores/realtime'
 
 /**
  * 我的课堂（§14；docs/frontend/student.md §2）。
@@ -21,8 +24,12 @@ import { useClassroomsStore } from '../stores/classrooms'
  *    然后去找老师——而实际上只是还没到开课时间（docs/frontend/student.md §2.3）。
  * 3. **不显示任何关于其他学生的信息**。§26 要求学生之间完全隔离：没有"班级人数"、
  *    没有名单、没有"谁在线"。DTO 里根本没有这些字段，界面也不许旁敲侧击地补出来。
+ *
+ * Phase 8 起列表还能**自己变**：老师开课时服务端推 `ROOM_OPENED`，卡片上的
+ * 「进入课堂」会自动变可用（§47/§48），学生不必再刷新页面去等一个可能已经过期的状态。
  */
 const store = useClassroomsStore()
+const realtime = useRealtimeStore()
 
 /**
  * 进入页面就刷新一次。
@@ -32,6 +39,19 @@ const store = useClassroomsStore()
  * 点进 PreJoin，只会得到一次"老师尚未开启本课堂"。
  */
 void store.fetchList()
+
+/**
+ * 实时通道状态（§47）：只在**没连上**时显示。
+ *
+ * 连上时什么都不说——列表能自己更新是正常状态，不需要一行常驻的"已连接"占地方；
+ * 没连上时必须说，因为这一页的时效性全部建立在实时事件之上（兜底只有手动刷新）。
+ */
+const realtimeDisplay = computed(() =>
+  describeRealtimeStatus(realtime.state, {
+    authFailed: realtime.authFailed,
+    wasConnected: realtime.wasConnected,
+  }),
+)
 </script>
 
 <template>
@@ -40,6 +60,16 @@ void store.fetchList()
       <h1 class="text-2xl font-semibold tracking-tight">我的课堂</h1>
       <p class="max-w-2xl text-sm leading-relaxed text-ink-muted">
         这里只显示老师把你加入的课堂。进入课堂需要共享整个电脑屏幕，请先确认你已经准备好。
+      </p>
+      <!-- 通道没连上时才出现：老师开课的推送收不到，列表就不会自己更新。 -->
+      <p
+        v-if="realtime.started && realtime.state !== 'open'"
+        class="flex flex-wrap items-center gap-x-2 text-xs leading-relaxed text-ink-muted"
+        data-testid="classrooms-realtime"
+        :data-realtime-state="realtime.state"
+      >
+        <StatusDot :status="realtimeDisplay.tone" :label="realtimeDisplay.label" />
+        <span v-if="realtimeDisplay.hint">{{ realtimeDisplay.hint }}</span>
       </p>
     </header>
 

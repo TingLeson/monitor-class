@@ -4,12 +4,23 @@ import { createPinia, setActivePinia, type Pinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   installFakeMonitorRoom,
+  installFakeVisibility,
   makeDisconnectedStudent,
+  makeLeftStudent,
   makeMonitorStudent,
   makeNotJoinedStudent,
   makeRoomClosedStudent,
   makeScreenLostStudent,
 } from '../../__tests__/monitor-fixtures.ts'
+import {
+  makeCameraChangedEvent,
+  makeRoomClosedEvent,
+  makeScreenLostEvent,
+  makeScreenRestoredEvent,
+  makeStudentOfflineEvent,
+  makeStudentOnlineEvent,
+} from '../../__tests__/realtime-fixtures.ts'
+import { MONITOR_DEGRADED_POLL_MS, MONITOR_FALLBACK_POLL_MS } from '../../lib/monitor-status.ts'
 import { useMonitorStore } from '../monitor.ts'
 
 /**
@@ -23,7 +34,9 @@ import { useMonitorStore } from '../monitor.ts'
  * 4. 画质：网格 low、Focus high、退出 Focus 回 low（§30 / §52）；
  * 5. 页面不可见时停掉全部下行，回到页面再恢复；
  * 6. 媒体失败有重试，且重试会重新申请凭据并重建订阅；
- * 7. 业务状态只来自 monitor DTO（§51）——断线不清空数据、不靠 participant 推断在线。
+ * 7. 业务状态只来自 monitor DTO（§51）——断线不清空数据、不靠 participant 推断在线；
+ * 8. Phase 8 起快照之外还有**实时事件增量**（§47）：上线/下线/屏幕中断与恢复，
+ *    以及"事件里出现名单外的人要忽略 + 记日志，绝不凭空造卡片"。
  */
 
 const { getMonitorMock, requestMediaTokenMock } = vi.hoisted(() => ({
@@ -627,18 +640,225 @@ describe('监督 store', () => {
     expect(harness.current().disconnectCalls).toBe(1)
   })
 
-  it('§49 风格的低频轮询：10 秒拉一次 monitor（Phase 8 由 WebSocket 取代）', async () => {
+  it('§47：实时通道正常时兜底快照放宽到 60 秒（事件才是主路径）', async () => {
     vi.useFakeTimers()
     installFakeMonitorRoom()
     const store = useMonitorStore(pinia)
     await store.load('room-1')
+    store.setRealtimeState('open')
     const initialCalls = getMonitorMock.mock.calls.length
 
-    await vi.advanceTimersByTimeAsync(10_000)
-    expect(getMonitorMock.mock.calls.length).toBe(initialCalls + 1)
+    await vi.advanceTimersByTimeAsync(MONITOR_DEGRADED_POLL_MS)
+    expect(getMonitorMock.mock.calls.length).toBe(initialCalls)
 
-    await vi.advanceTimersByTimeAsync(20_000)
-    expect(getMonitorMock.mock.calls.length).toBe(initialCalls + 3)
+    await vi.advanceTimersByTimeAsync(MONITOR_FALLBACK_POLL_MS - MONITOR_DEGRADED_POLL_MS)
+    expect(getMonitorMock.mock.calls.length).toBe(initialCalls + 1)
+  })
+
+  it('§47：实时通道断开时兜底收紧到 20 秒（这段窗口里快照是唯一的信息来源）', async () => {
+    vi.useFakeTimers()
+    installFakeMonitorRoom()
+    const store = useMonitorStore(pinia)
+    await store.load('room-1')
+    store.setRealtimeState('open')
+    const initialCalls = getMonitorMock.mock.calls.length
+
+    store.setRealtimeState('closed')
+    await vi.advanceTimersByTimeAsync(MONITOR_DEGRADED_POLL_MS)
+
+    expect(getMonitorMock.mock.calls.length).toBe(initialCalls + 1)
+  })
+
+  /* -------------------------------------------------------------------- */
+  /* §47：实时事件增量                                                     */
+  /* -------------------------------------------------------------------- */
+
+  it('§47 STUDENT_ONLINE：未进入的学生变成在线，计数 + 视口内立刻订阅', async () => {
+    const harness = installFakeMonitorRoom({ participants: ['session-new'] })
+    getMonitorMock.mockResolvedValue([
+      makeNotJoinedStudent({ studentId: 'student-new', displayName: '张三', sessionId: null }),
+    ])
+    const store = useMonitorStore(pinia)
+    // 卡片从一开始就在视口里（未进入的学生也有卡片，DOM 层的可见性与他是否在线无关）。
+    markVisible(store, 'student-new')
+    await store.load('room-1')
+    // 未进入 → 没有订阅可言。
+    expect(store.enteredCount).toBe(0)
+    expect(store.badgeOf(store.students[0]!).label).toBe('未进入')
+
+    store.applyRealtimeEvent(
+      makeStudentOnlineEvent({
+        studentId: 'student-new',
+        displayName: '张三',
+        sessionId: 'session-new',
+      }),
+    )
+    await flushPromises()
+
+    expect(store.enteredCount).toBe(1)
+    expect(store.students[0]?.sessionStatus).toBe('ONLINE')
+    expect(store.badgeOf(store.students[0]!).emoji).toBe('🟢')
+    // §21 的不变量：ONLINE ⇒ 屏幕在发布。不设它会让刚进来的学生显示成"屏幕中断"。
+    expect(store.students[0]?.screen.active).toBe(true)
+    // 卡片本来就在视口里（可见性早就报过）→ 协调器在事件到达后直接把它订上。
+    expect(harness.current().subscribeCalls).toEqual(['session-new'])
+  })
+
+  it('§47 STUDENT_OFFLINE：卡片转为已离开并释放订阅（不留下一条永远不会有画面的下行）', async () => {
+    const harness = installFakeMonitorRoom()
+    installFakeVisibility()
+    const store = useMonitorStore(pinia)
+    markVisible(store, 'student-1')
+    await store.load('room-1')
+    expect(store.subscribedCount).toBe(1)
+
+    store.applyRealtimeEvent(
+      makeStudentOfflineEvent({ studentId: 'student-1', sessionId: 'session-1', reason: 'LEFT' }),
+    )
+    await flushPromises()
+
+    expect(store.students[0]?.sessionStatus).toBe('LEFT')
+    expect(store.students[0]?.screen.active).toBe(false)
+    expect(store.badgeOf(store.students[0]!).emoji).toBe('⚫')
+    expect(store.enteredCount).toBe(0)
+    expect(store.subscribedCount).toBe(0)
+    expect(harness.current().unsubscribeCalls).toEqual(['session-1'])
+  })
+
+  it('§47 STUDENT_OFFLINE 的三种原因映射到三种状态（断线 ≠ 离开）', async () => {
+    installFakeMonitorRoom()
+    installFakeVisibility()
+    const store = useMonitorStore(pinia)
+    await store.load('room-1')
+
+    store.applyRealtimeEvent(makeStudentOfflineEvent({ reason: 'DISCONNECTED' }))
+    expect(store.students[0]?.sessionStatus).toBe('DISCONNECTED')
+    expect(store.badgeOf(store.students[0]!).label).toBe('已断开')
+
+    store.applyRealtimeEvent(makeStudentOfflineEvent({ reason: 'ROOM_CLOSED' }))
+    expect(store.students[0]?.sessionStatus).toBe('ROOM_CLOSED')
+    expect(store.badgeOf(store.students[0]!).label).toBe('已离开')
+  })
+
+  it('§22/§47 SCREEN_LOST 与 SCREEN_RESTORED：徽章跟着变，恢复后视口内重新订阅', async () => {
+    const harness = installFakeMonitorRoom()
+    installFakeVisibility()
+    const store = useMonitorStore(pinia)
+    markVisible(store, 'student-1')
+    await store.load('room-1')
+    expect(store.subscribedCount).toBe(1)
+
+    store.applyRealtimeEvent(makeScreenLostEvent())
+    await flushPromises()
+
+    expect(store.badgeOf(store.students[0]!).emoji).toBe('🔴')
+    expect(store.tileStateOf(store.students[0]!)).toBe('SCREEN_LOST')
+    expect(store.subscribedCount).toBe(0)
+    expect(harness.current().unsubscribeCalls).toEqual(['session-1'])
+
+    // 学生重新共享 → 服务端说恢复了 → 协调器把画面订回来（他还在视口里）。
+    store.applyRealtimeEvent(makeScreenRestoredEvent())
+    await flushPromises()
+
+    expect(store.badgeOf(store.students[0]!).emoji).toBe('🟢')
+    expect(store.enteredCount).toBe(1)
+    expect(harness.current().subscribeCalls).toEqual(['session-1', 'session-1'])
+  })
+
+  it('§47：名单外的学生事件被忽略并记日志，绝不凭空造卡片（缺的字段没人能补）', async () => {
+    vi.useFakeTimers()
+    installFakeMonitorRoom()
+    const store = useMonitorStore(pinia)
+    await store.load('room-1')
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const callsBefore = getMonitorMock.mock.calls.length
+
+    store.applyRealtimeEvent(
+      makeStudentOnlineEvent({ studentId: 'ghost', displayName: '陌生人', sessionId: 's-ghost' }),
+    )
+
+    // 没有新卡片，也没有任何"用事件拼出来的"状态。
+    expect(store.students).toHaveLength(1)
+    expect(store.students[0]?.studentId).toBe('student-1')
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(String(warn.mock.calls[0]?.[0])).toContain('STUDENT_ONLINE')
+    // 名单只有快照说了算：安排一次（合并的）快照刷新，而不是就地编一行。
+    await vi.advanceTimersByTimeAsync(500)
+    expect(getMonitorMock.mock.calls.length).toBe(callsBefore + 1)
+  })
+
+  it('§47：CAMERA_CHANGED 更新卡片上的摄像头事实（Phase 9 的挂点，本 Phase 不做画面）', async () => {
+    installFakeMonitorRoom()
+    installFakeVisibility()
+    const store = useMonitorStore(pinia)
+    await store.load('room-1')
+
+    store.applyRealtimeEvent(makeCameraChangedEvent({ active: true }))
+
+    expect(store.students[0]?.camera.active).toBe(true)
+    // 摄像头不参与屏幕订阅决策（§52 只管 screen）。
+    expect(store.subscribedCount).toBe(0)
+  })
+
+  it('§49 ROOM_CLOSED：标记课堂结束、主动释放媒体、并把最终状态取回来', async () => {
+    vi.useFakeTimers()
+    const harness = installFakeMonitorRoom()
+    installFakeVisibility()
+    const store = useMonitorStore(pinia)
+    markVisible(store, 'student-1')
+    await store.load('room-1')
+    expect(harness.current().connectCalls).toBe(1)
+
+    store.applyRealtimeEvent(makeRoomClosedEvent({ classroomId: 'room-1' }))
+
+    expect(store.classroomClosed).toBe(true)
+    // 主动断开：等服务端终止房间会先在界面上弹一句"无法看到学生画面"，
+    // 而那是关课的正常结果，不是故障。
+    expect(store.mediaConnected).toBe(false)
+    expect(store.subscribedCount).toBe(0)
+    expect(harness.current().disconnectCalls).toBe(1)
+    expect(store.mediaError).toBeNull()
+
+    // 事件载荷里没有每个学生的最终状态 → 合并一次快照刷新。
+    getMonitorMock.mockResolvedValue([makeRoomClosedStudent({ studentId: 'student-1' })])
+    await vi.advanceTimersByTimeAsync(500)
+    expect(store.students[0]?.sessionStatus).toBe('ROOM_CLOSED')
+  })
+
+  it('§47：事件之前发出、之后才回来的快照不会把事件结论改回去', async () => {
+    vi.useFakeTimers()
+    installFakeMonitorRoom()
+    const store = useMonitorStore(pinia)
+    await store.load('room-1')
+
+    // 第一份快照取的是"事件之前"的时刻（学生还在线）——真实场景里，
+    // WS 重连后立刻补快照，服务端随即把排队的事件推过来。
+    getMonitorMock.mockResolvedValueOnce([makeMonitorStudent({ studentId: 'student-1' })])
+    getMonitorMock.mockResolvedValue([makeLeftStudent({ studentId: 'student-1' })])
+
+    const pending = store.refresh()
+    store.applyRealtimeEvent(
+      makeStudentOfflineEvent({ studentId: 'student-1', sessionId: 'session-1', reason: 'LEFT' }),
+    )
+    await pending
+
+    // 过期快照被丢弃：这一刻状态仍然是事件带来的"已离开"。
+    expect(store.students[0]?.sessionStatus).toBe('LEFT')
+
+    // 丢弃后安排的合并刷新会取到新的答案。
+    await vi.advanceTimersByTimeAsync(500)
+    expect(store.students[0]?.sessionStatus).toBe('LEFT')
+  })
+
+  it('§49：别间课堂的 ROOM_CLOSED 不影响本页', async () => {
+    installFakeMonitorRoom()
+    const store = useMonitorStore(pinia)
+    await store.load('room-1')
+
+    store.applyRealtimeEvent(makeRoomClosedEvent({ classroomId: 'other-room' }))
+
+    expect(store.classroomClosed).toBe(false)
+    expect(store.mediaConnected).toBe(true)
   })
 
   it('stop：停止轮询、断开媒体、清空状态（离开页面不留连接，也不留下次进入的可见性）', async () => {

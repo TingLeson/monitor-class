@@ -1,12 +1,15 @@
-# 状态机（Classroom / ClassroomRun）
+# 状态机（Classroom / ClassroomRun / StudentSession）
 
-> 本文档描述 **Phase 3 已实现**的课堂状态机，以及 **Phase 8 才会实现**的 StudentSession 状态机。
-> 文中每一处"未实现"都显式标注，不描述尚未写完的行为。
+> 本文档描述 **Phase 3 已实现**的课堂状态机（Classroom / ClassroomRun），以及 **Phase 8 已实现**的
+> StudentSession 状态机。文中每一处"未实现"都显式标注，不描述尚未写完的行为。
 >
 > 状态机的权威在 **PostgreSQL + 后端服务**（任务书 §33）：任何前端路由守卫、LiveKit Room 的
 > 有无、Redis 里的短期缓存，都不是状态来源。本文列出的每条规则都能在
-> `services/api/migrations/0004…0006`、`internal/classroom/` 与 `internal/httpapi/teacher_classrooms.go`
-> 中找到对应实现与注释。
+> `services/api/migrations/0004…0008`、`internal/classroom/`、`internal/session/` 与
+> `internal/httpapi/` 中找到对应实现与注释。
+>
+> 相关文档：[数据库设计](schema.md)、[控制面](../architecture/control-plane.md)、
+> [实时事件流](../architecture/realtime-flow.md)。
 
 ---
 
@@ -166,29 +169,126 @@ sequenceDiagram
 
 ---
 
-## 5. StudentSession 状态机（**Phase 8 实现，此处只说明边界**）
+## 5. StudentSession 状态机（**Phase 8 已实现**）
 
-`student_sessions` 表属于 Phase 8（任务书 §12/§50/§74），Phase 3 **没有**创建它，也**没有**任何
-读写它的代码。本节的目的是把"关课时谁负责通知学生"这件事的归属写清楚，避免后来者把它塞进 Phase 3 的
-关课事务里。
+`student_sessions`（迁移 `0007`）与 `session_events`（迁移 `0008`）属于 Phase 6/8
+（任务书 §12/§13/§45/§74）。本节是**已实现行为**的完整描述。
 
-Phase 8 将补上：
+### 5.1 它是什么
 
-- **表**（`docs/database/schema.md` §4.5）：`student_sessions` 与 `session_events`，
-  其中部分唯一索引 `student_sessions_active_idx (classroom_run_id, student_id) WHERE status IN
-  ('CONNECTING','ONLINE','SCREEN_LOST','DISCONNECTED')` 保证"同一学生在同一 Run 最多一条活跃会话"（§50：
-  新连接取代旧连接，而不是出现三个"张三"）。
-- **状态集合**：`CONNECTING → ONLINE → SCREEN_LOST / DISCONNECTED → ONLINE（重连）`，
-  以及两个终结态 `LEFT`（学生主动离开）、`ROOM_CLOSED`（老师关课导致）。
-- **关课时的动作**（§49）：`close` 事务提交后，把该 Run 下所有活跃会话置为 `ROOM_CLOSED` 并写入
-  `session_events`，然后广播 `ROOM_CLOSED`。Phase 3 的关课代码里为此留了注释接缝，但**没有**空函数占位。
-- **开课时的动作**（§47/§48）：广播 `ROOM_OPENED`，学生首页据此自动更新。
+一个学生**在一次 ClassroomRun 中**的实际课堂连接（§12）。它不是登录会话（§41，见
+`auth/sessionstore`）：登录会话认证一个浏览器，StudentSession 记录"这个浏览器正在（或曾经在）
+这一节课的媒体房间里"。两者都是 UUID，但只有前者是凭据。
 
-在 Phase 8 落地之前，系统的正确行为是：
+```mermaid
+stateDiagram-v2
+    [*] --> CONNECTING : join（SESSION_CREATED）
+    CONNECTING --> CONNECTING : participant_joined（PARTICIPANT_CONNECTED，仅首次）
+    CONNECTING --> ONLINE : track_published(SCREEN_SHARE)（SCREEN_PUBLISHED）
+    DISCONNECTED --> ONLINE : track_published(SCREEN_SHARE)（SCREEN_PUBLISHED）
+    ONLINE --> SCREEN_LOST : track_unpublished(SCREEN_SHARE)（SCREEN_LOST）
+    SCREEN_LOST --> ONLINE : track_published(SCREEN_SHARE)（SCREEN_RESTORED）
+    CONNECTING --> DISCONNECTED : participant_left / aborted（CONNECTION_LOST）
+    ONLINE --> DISCONNECTED : participant_left / aborted（CONNECTION_LOST）
+    SCREEN_LOST --> DISCONNECTED : participant_left / aborted（CONNECTION_LOST）
+    DISCONNECTED --> CONNECTING : participant_joined（CONNECTION_RESTORED）
+    CONNECTING --> LEFT : 学生 leave（STUDENT_LEFT）
+    ONLINE --> LEFT : 学生 leave（STUDENT_LEFT）
+    SCREEN_LOST --> LEFT : 学生 leave（STUDENT_LEFT）
+    DISCONNECTED --> LEFT : 学生 leave（STUDENT_LEFT）
+    CONNECTING --> ROOM_CLOSED : close / room_finished（ROOM_CLOSED）
+    ONLINE --> ROOM_CLOSED : close / room_finished（ROOM_CLOSED）
+    SCREEN_LOST --> ROOM_CLOSED : close / room_finished（ROOM_CLOSED）
+    DISCONNECTED --> ROOM_CLOSED : close / room_finished（ROOM_CLOSED）
+    LEFT --> [*] : 终态
+    ROOM_CLOSED --> [*] : 终态
+```
 
-- 关课 = 控制面状态变更 + Run 结束。此时**没有**任何学生连接需要清理（媒体接入是 Phase 6）。
-- 任何"LiveKit 房间里还有人"的事实**不代表**课堂还开着（§33）：控制面已经说 CLOSED，前端必须以
-  控制面为唯一依据。
+`PRE_JOIN` **不存在于数据库**（§12）：它属于浏览器（§16 的 screen gate）。把它写进表里等于
+记录了一次还没人尝试过的媒体连接。
+
+### 5.2 允许的迁移
+
+| # | 迁移 | 触发者 | 副作用（同一事务内） | 为什么允许 |
+| --- | --- | --- | --- | --- |
+| 1 | `∅ → CONNECTING` | 学生 `POST /student/classrooms/:id/join` | 插入 `student_sessions`（`livekit_identity = id`），写 `SESSION_CREATED` 事件 | 学生**请求**进入课堂；token 已签发，连接可能成功也可能失败。这是唯一诚实的初始状态 |
+| 2 | `CONNECTING → CONNECTING` | webhook `participant_joined` | 写 `connected_at`（`COALESCE`，只写第一次）+ `PARTICIPANT_CONNECTED` | 记录"这个人到过房间"，但**不**改状态：§21/§45 规定 ONLINE 必须由 screen track 证明 |
+| 3 | `CONNECTING/DISCONNECTED → ONLINE` | webhook `track_published`（`source=SCREEN_SHARE`） | `connected_at`、`screen_started_at`（都只写第一次）+ `SCREEN_PUBLISHED` | §45：**只有服务端观测到屏幕轨道**才叫在线。这是全系统唯一能把会话推进到 ONLINE 的迁移 |
+| 4 | `ONLINE → SCREEN_LOST` | webhook `track_unpublished`（`source=SCREEN_SHARE`） | `screen_lost_at = now()`（覆盖）+ `SCREEN_LOST` | §22：人还在房间，被监督的画面没了。老师必须看到"屏幕共享已停止 + 时间" |
+| 5 | `SCREEN_LOST → ONLINE` | webhook `track_published`（`source=SCREEN_SHARE`） | `screen_started_at`（若为空则写）+ `SCREEN_RESTORED` | §22：学生重新共享整个屏幕后恢复；`SCREEN_RESTORED` 回答"他修好了吗" |
+| 6 | `CONNECTING/ONLINE/SCREEN_LOST → DISCONNECTED` | webhook `participant_left` / `participant_connection_aborted` | `CONNECTION_LOST` 事件 + `STUDENT_OFFLINE(DISCONNECTED)` | §45：媒体连接断了。仍然是**活跃**状态（§50），重连复用同一行 |
+| 7 | `DISCONNECTED → CONNECTING` | webhook `participant_joined` | `CONNECTION_RESTORED` 事件 | 人回到房间但还没共享屏幕。留在 DISCONNECTED 会让墙上写着"已断开"而人明明在房间里 |
+| 8 | `CONNECTING/ONLINE/SCREEN_LOST/DISCONNECTED → LEFT` | 学生 `POST /student/sessions/:id/leave` | `left_at`（`COALESCE`，只写第一次）+ `STUDENT_LEFT` + `STUDENT_OFFLINE(LEFT)` | §43/§50：离开是学生的决定。**终态** |
+| 9 | 任意活跃态 → `ROOM_CLOSED` | 老师 `close`（提交后）／webhook `room_finished` | 批量更新 + 每行一条 `ROOM_CLOSED` + `STUDENT_OFFLINE(ROOM_CLOSED)` + 一次 `ROOM_CLOSED` 广播 | §49：老师结束了这节课。**终态** |
+| 10 | 重复投递同一 webhook | LiveKit（至少一次投递） | **无**（CAS 守卫不匹配） | 幂等：重复事件不产生第二次迁移，也不写第二条事件 |
+| 11 | `LEFT`/`ROOM_CLOSED` 上收到任何 webhook | LiveKit（迟到事件） | **无** | 终态不可逆（§74）。见 5.4 |
+
+### 5.3 不允许的迁移，以及为什么
+
+| 被拒绝的操作 | 结果 | 为什么不允许 |
+| --- | --- | --- |
+| 客户端声明 `ONLINE` | 没有这个接口 | §45/§46：客户端只能"快 UX"，权威观测来自 LiveKit webhook。学生端**不存在**"上报我的状态"的端点，所以没有可撒谎的对象 |
+| `track_published(CAMERA/MICROPHONE)` → `ONLINE` | 无变化（记 Debug 日志） | §21：ONLINE 的含义是"正在共享屏幕"。摄像头/麦克风是 Phase 9/10 的能力，它们各自有 `CAMERA_CHANGED`/`MIC_CHANGED` 消息 |
+| `participant_joined` → `ONLINE` | 无变化 | 同上：进房间不等于在被监督 |
+| `track_unpublished` 在非 `ONLINE` 状态 → `SCREEN_LOST` | 无变化 | 没有屏幕可丢。若允许，**乱序**到达的 unpublish 会让会话永久停在 SCREEN_LOST（见 5.4） |
+| `LEFT`/`ROOM_CLOSED` → 任何其它状态 | 无变化 | 终态：离开与关课是已经发生的决定。允许复活会让"这节课谁在线"永远无法回答 |
+| 非本人调用 `leave`（改别人的会话） | 404 `SESSION_NOT_FOUND` | §58：`student_id` 是 WHERE 的一部分，"不是我的"和"不存在"给同一个答案 |
+| 同一 `(run, student)` 出现第二条活跃会话 | 数据库拒绝（部分唯一索引） | §50：新连接取代旧连接，而不是墙上出现两个"张三" |
+| 直接 DELETE 会话行 | 无此 API；`session_events.session_id` 为 `ON DELETE CASCADE` | 历史不可删（schema §1）。关课/离开是状态，不是删除 |
+
+### 5.4 幂等与乱序：为什么每条规则都是 CAS
+
+LiveKit webhook 是**至少一次投递、且不保证顺序**的（§45）。因此本状态机的每条写入都是
+"带前置状态的更新"（compare-and-set），而不是"读出来判断再写回去"：
+
+```sql
+UPDATE student_sessions
+   SET status = $3, ...
+ WHERE id = $1
+   AND status = ANY($2::text[])       -- 前置状态守卫
+   AND (NOT $7 OR connected_at IS NULL)
+RETURNING ...
+```
+
+| 场景 | 结果 | 机制 |
+| --- | --- | --- |
+| 同一 `track_published` 到达两次 | 第二次匹配 0 行 → 状态不变、**不写第二条事件、不再广播** | `ONLINE` 不在 `From` 集合里 |
+| `track_unpublished` 早于 `track_published` | 第一次什么也不做（会话还是 CONNECTING）；随后 `track_published` 正确进入 ONLINE | `From = {ONLINE}` |
+| `participant_left` 早于 `track_published` | 会话变 DISCONNECTED；迟到的 publication 让它回到 ONLINE | §45：屏幕轨道**证明人在场**；这是有意的，不是 bug |
+| 迟到事件在 `LEFT`/`ROOM_CLOSED` 之后 | 什么也不做 | 终态从不出现在任何 `From` 集合里 |
+| `close` 与 `room_finished` 竞态 | 先到的把活跃会话置 `ROOM_CLOSED`，后到的匹配 0 行 | 两者共用同一个批量语句 |
+| 重复 `join` / 重复 `leave` | 复用同一行 / `STUDENT_LEFT` 只写一次 | 部分唯一索引 + `NOT EXISTS (session_id, type)` 守卫 |
+
+`participant_joined` 是唯一的"状态不变但仍要记录"的迁移，它的守卫是 `connected_at IS NULL`
+—— 状态没变，CAS 无法区分首次与重复，时间戳可以。
+
+事件行与状态更新**在同一事务内**写入：状态变了而事件丢了，等于墙上出现了没人能解释的变化。
+
+### 5.5 身份映射（webhook 怎么找到会话）
+
+```text
+学生 identity = student_sessions.id  = livekit_identity（数据库 CHECK 强制相等，§44）
+老师 identity = 登录会话 UUID（**不落库**，因为老师不是监督对象）
+
+webhook 的查找语句：
+  student_sessions ss JOIN classroom_runs r ON r.id = ss.classroom_run_id
+  WHERE r.livekit_room_name = $1 AND ss.livekit_identity = $2
+```
+
+- 查不到 → **记日志 + 200，不写任何状态**。老师自己的 participant 就是这种情况，
+  另一个部署的房间、过期房间也是。回 4xx 会让 LiveKit 无限重试一个永远不会成功的事件。
+- 房间条件不能省：没有它，上周房间的重放事件可以改这周会话的状态。
+
+### 5.6 不变式与它们的数据库落点
+
+| 不变式 | 落点 |
+| --- | --- |
+| `status ∈ {CONNECTING, ONLINE, SCREEN_LOST, DISCONNECTED, LEFT, ROOM_CLOSED}` | `CHECK student_sessions_status_valid` |
+| `livekit_identity = id` | `CHECK student_sessions_identity_is_id` |
+| 同一 `(run, student)` 最多一条活跃会话 | 部分唯一索引 `student_sessions_active_idx`（排除两个终态） |
+| `session_events.type` 属于 §13 的 15 种 | `CHECK session_events_type_check` |
+| 事件只追加、不修改 | 没有任何 UPDATE/DELETE 路径；`session_id` 为 `ON DELETE CASCADE` |
+| 时间戳只由控制面写、只由服务端观测驱动 | `connected_at`/`screen_started_at` 用 `COALESCE` 只写第一次；`screen_lost_at` 覆盖；全部来自 webhook 或 REST，永不来自客户端声明 |
 
 ---
 
@@ -206,3 +306,16 @@ Phase 8 将补上：
 | 一个课堂最多一条 OPEN Run | `TestOneOpenRunPerClassroomIndex` |
 | owner 必须是 TEACHER | `TestOwnerTriggerRejectsNonTeachers` |
 | 房间名不透明、每次不同 | `TestLivekitRoomNameIsUniqueAndOpaqueForEveryRun` |
+
+Phase 8（StudentSession，§5）：
+
+| 规则 | 测试 |
+| --- | --- |
+| 只有 `track_published(SCREEN_SHARE)` 能让会话 ONLINE | `internal/session/processor_test.go` `TestScreenPublishedIsWhatMakesASessionOnline` |
+| 重复投递只迁移一次、只写一条事件 | `processor_test.go` `TestScreenPublishedTwiceTransitionsOnce`、`internal/session/events_integration_test.go` |
+| 乱序（unpublished 早于 published）不产生错误状态 | `processor_test.go` `TestUnpublishedBeforePublishedLeavesTheSessionInTheRightState` |
+| 终态不被迟到事件改回 | `processor_test.go` `TestLateEventsCannotResurrectATerminalSession` |
+| `participant_joined` 不产生 ONLINE，且只记一次 | `processor_test.go` `TestParticipantJoinedRecordsTheArrivalWithoutGoingOnline`、`TestParticipantJoinedTwiceRecordsOneEvent` |
+| 未知 identity / 未知事件 → 200 且不写状态 | `processor_test.go`、`internal/httpapi/runtime_state_integration_test.go` |
+| 关课时会话批量转 ROOM_CLOSED，`room_finished` 幂等 | `internal/classroom/runtime_hooks_test.go`、`runtime_state_integration_test.go` |
+| `session_events` 的 CHECK / jsonb / 迁移幂等 | `internal/session/events_integration_test.go` |

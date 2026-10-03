@@ -207,6 +207,14 @@ type RosterEntry struct {
 	DisplayName string
 	// Session is the student's session in this run, or nil when there is none.
 	Session *StudentSession
+	// LastEventAt is when the newest `session_events` row of that session was written,
+	// or nil when the session has no events yet (or no session at all).
+	//
+	// WHY it lives on the ENTRY and not on StudentSession: it is an extra column of the
+	// monitoring query, not a property of the session row, and putting it on the struct
+	// every other query returns would mean a field that is nil in every context except
+	// one — which is exactly the kind of half-populated field a later reader trusts.
+	LastEventAt *time.Time
 }
 
 // Sentinel errors, mapped to the API error codes of §58 in internal/httpapi.

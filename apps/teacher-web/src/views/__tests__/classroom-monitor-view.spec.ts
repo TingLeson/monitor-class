@@ -14,7 +14,15 @@ import {
   makeRoomClosedStudent,
   makeScreenLostStudent,
 } from '../../__tests__/monitor-fixtures.ts'
+import {
+  installFakeRealtimeSocket,
+  makeRoomClosedEvent,
+  makeScreenLostEvent,
+  makeStudentOfflineEvent,
+  makeStudentOnlineEvent,
+} from '../../__tests__/realtime-fixtures.ts'
 import { useMonitorStore } from '../../stores/monitor.ts'
+import { useRealtimeStore } from '../../stores/realtime.ts'
 import { routes } from '../../router'
 import ClassroomMonitorView from '../ClassroomMonitorView.vue'
 
@@ -563,5 +571,179 @@ describe('课堂监督墙', () => {
 
     expect(router.currentRoute.value.fullPath).toBe('/teacher/classrooms/room-1/monitor')
     expect(wrapper.find('[data-testid="monitor-focus"]').exists()).toBe(true)
+  })
+
+  /* -------------------------------------------------------------------- */
+  /* §47：实时事件驱动的监督墙                                             */
+  /* -------------------------------------------------------------------- */
+
+  it('§47：实时事件到达时卡片与计数当场变化（不必等下一次快照）', async () => {
+    installFakeMonitorRoom({ participants: ['session-1'] })
+    const visibility = installFakeVisibility()
+    getMonitorMock.mockResolvedValue([makeMonitorStudent()])
+    const { wrapper } = await mountView()
+
+    const socket = installFakeRealtimeSocket()
+    const realtime = useRealtimeStore(pinia)
+    realtime.start()
+    socket.open()
+    await flushPromises()
+
+    expect(tileOf(wrapper, 'student-1').find('[data-testid="tile-badge"]').text()).toContain('正常')
+
+    socket.emit(makeScreenLostEvent({ studentId: 'student-1', sessionId: 'session-1' }))
+    await flushPromises()
+
+    const badge = tileOf(wrapper, 'student-1').find('[data-testid="tile-badge"]')
+    expect(badge.text()).toContain('屏幕中断')
+    expect(tileOf(wrapper, 'student-1').attributes('data-tile-state')).toBe('SCREEN_LOST')
+    // 订阅被释放（§52：断了的卡片不留一条永远不会有画面的下行）。
+    expect(visibility.visible.has('student-1')).toBe(true)
+  })
+
+  it('§47：新上线的学生在视口里会被订阅（复用 Phase 7 的订阅协调器）', async () => {
+    const harness = installFakeMonitorRoom({ participants: ['session-new'] })
+    installFakeVisibility()
+    getMonitorMock.mockResolvedValue([
+      makeNotJoinedStudent({ studentId: 'student-new', displayName: '张三', sessionId: null }),
+    ])
+    const { wrapper } = await mountView()
+    // 首屏：未进入 → 没有订阅。
+    expect(harness.current().subscribeCalls).toEqual([])
+
+    const socket = installFakeRealtimeSocket()
+    const realtime = useRealtimeStore(pinia)
+    realtime.start()
+    socket.open()
+    await flushPromises()
+
+    socket.emit(
+      makeStudentOnlineEvent({
+        studentId: 'student-new',
+        displayName: '张三',
+        sessionId: 'session-new',
+      }),
+    )
+    await flushPromises()
+
+    expect(harness.current().subscribeCalls).toEqual(['session-new'])
+    expect(tileOf(wrapper, 'student-new').find('[data-testid="tile-badge"]').text()).toContain(
+      '正常',
+    )
+    expect(wrapper.find('[data-testid="monitor-entered-count"]').text()).toContain('已进入 1')
+  })
+
+  it('§47：学生下线时订阅被释放（画面不会停在最后一帧）', async () => {
+    const harness = installFakeMonitorRoom({ participants: ['session-1'] })
+    installFakeVisibility()
+    const { wrapper } = await mountView()
+    expect(harness.current().subscribeCalls).toEqual(['session-1'])
+
+    const socket = installFakeRealtimeSocket()
+    const realtime = useRealtimeStore(pinia)
+    realtime.start()
+    socket.open()
+    await flushPromises()
+
+    socket.emit(
+      makeStudentOfflineEvent({ studentId: 'student-1', sessionId: 'session-1', reason: 'LEFT' }),
+    )
+    await flushPromises()
+
+    expect(harness.current().unsubscribeCalls).toEqual(['session-1'])
+    expect(tileOf(wrapper, 'student-1').find('[data-testid="tile-badge"]').text()).toContain(
+      '已离开',
+    )
+  })
+
+  it('§47：实时状态没连上时顶部明确提示"可能不是最新"，并给重新加载', async () => {
+    installFakeMonitorRoom()
+    installFakeVisibility()
+    const { wrapper } = await mountView()
+    expect(wrapper.find('[data-testid="monitor-realtime-status"]').exists()).toBe(false)
+
+    const socket = installFakeRealtimeSocket()
+    const realtime = useRealtimeStore(pinia)
+    realtime.start()
+    await flushPromises()
+
+    const banner = wrapper.find('[data-testid="monitor-realtime-status"]')
+    expect(banner.exists()).toBe(true)
+    expect(banner.text()).toContain('正在连接实时状态')
+
+    socket.open()
+    await flushPromises()
+    expect(wrapper.find('[data-testid="monitor-realtime-status"]').exists()).toBe(false)
+
+    socket.close()
+    await flushPromises()
+    const degraded = wrapper.find('[data-testid="monitor-realtime-status"]')
+    expect(degraded.text()).toContain('重连')
+    expect(degraded.text()).toContain('可能不是最新')
+  })
+
+  it('§47：WS 断开时兜底轮询收紧到 20 秒（这段窗口里快照是唯一来源）', async () => {
+    vi.useFakeTimers()
+    installFakeMonitorRoom()
+    installFakeVisibility()
+    await mountView()
+    const socket = installFakeRealtimeSocket()
+    const realtime = useRealtimeStore(pinia)
+    realtime.start()
+    socket.open()
+    await vi.advanceTimersByTimeAsync(0)
+    const callsAfterOpen = getMonitorMock.mock.calls.length
+
+    socket.close()
+    await vi.advanceTimersByTimeAsync(20_000)
+
+    expect(getMonitorMock.mock.calls.length).toBeGreaterThan(callsAfterOpen)
+  })
+
+  it('§49：ROOM_CLOSED 时页面说明"课堂已经结束"，并且不再显示媒体错误', async () => {
+    installFakeMonitorRoom()
+    installFakeVisibility()
+    const { wrapper } = await mountView()
+
+    const socket = installFakeRealtimeSocket()
+    const realtime = useRealtimeStore(pinia)
+    realtime.start()
+    socket.open()
+    await flushPromises()
+
+    socket.emit(makeRoomClosedEvent({ classroomId: 'room-1' }))
+    await flushPromises()
+
+    const notice = wrapper.find('[data-testid="monitor-classroom-closed"]')
+    expect(notice.exists()).toBe(true)
+    expect(notice.text()).toContain('本课堂已经结束')
+    // 关课导致的媒体释放是正常结果，不该被渲染成"无法看到学生画面"的故障。
+    expect(wrapper.find('[data-testid="monitor-media-error"]').exists()).toBe(false)
+  })
+
+  it('§47：自动重连放弃后给出「重试实时连接」（服务端恢复后不必刷新整页）', async () => {
+    vi.useFakeTimers()
+    installFakeMonitorRoom()
+    installFakeVisibility()
+    const { wrapper } = await mountView()
+    const socket = installFakeRealtimeSocket()
+    const realtime = useRealtimeStore(pinia)
+    realtime.start()
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      socket.current().serverClose()
+      await vi.advanceTimersByTimeAsync(30_000)
+    }
+    expect(realtime.authFailed).toBe(true)
+    await vi.advanceTimersByTimeAsync(0)
+
+    const retry = wrapper.find('[data-testid="monitor-realtime-retry"]')
+    expect(retry.exists()).toBe(true)
+    const socketsBefore = socket.sockets.length
+
+    await retry.trigger('click')
+
+    expect(socket.sockets.length).toBe(socketsBefore + 1)
+    expect(realtime.authFailed).toBe(false)
   })
 })

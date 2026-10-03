@@ -4,8 +4,10 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { describeConnectionQuality } from '../lib/connection-quality'
 import { describeSessionPhase } from '../lib/media-session-state.ts'
+import { describeRealtimeStatus } from '../lib/realtime-status.ts'
 import { describeScreenGateState } from '../lib/screen-capture-messages'
 import { useMediaSessionStore } from '../stores/media-session.ts'
+import { useRealtimeStore } from '../stores/realtime.ts'
 import { useScreenShareStore } from '../stores/screen-share'
 
 /**
@@ -22,8 +24,11 @@ import { useScreenShareStore } from '../stores/screen-share'
  * 3. **在共享中断时给出一条恢复路径**（§22）：提示 + 「重新共享整个屏幕」，
  *    重新走一遍**完整**的 Gate（含 displaySurface 检查），然后发布新轨道。
  *    这里**不**重新 join——会话还在，只是轨道没了；重连是媒体链路的另一条路径。
- * 4. **在课堂被老师关闭时收尾**（§49）：断开媒体、停止捕获、回课堂列表。
- *    Phase 6 还没有 WebSocket，只能用低频轮询发现这件事（见 store 的说明）。
+ * 4. **在课堂被老师关闭时收尾**（§49）：收到 `ROOM_CLOSED`（§47 的实时事件）立刻
+ *    断开媒体、停止捕获、回课堂列表。这里还保留了低频兜底轮询（见 store）：
+ *    实时通道断线期间，学生仍必须能发现课堂已经关闭。
+ * 5. **如实显示实时通道状态**（§47）：连不上时明说"正在重连 / 可能不是最新"。
+ *    这一页显示的是"老师能不能看到我"，界面假装一切正常是这里最不能犯的错。
  *
  * 刷新页面的行为是刻意设计的：token 只存在内存里，刷新即丢失。页面因此显示
  * 「会话信息已丢失」并给回列表的入口——而不是拿一个过期的 token 去反复重连，
@@ -33,6 +38,7 @@ const route = useRoute()
 const router = useRouter()
 const session = useMediaSessionStore()
 const screenShare = useScreenShareStore()
+const realtime = useRealtimeStore()
 
 /**
  * 老师关闭课堂后自动回列表的延迟。
@@ -58,6 +64,19 @@ const qualityDisplay = computed(() => describeConnectionQuality(session.quality)
 
 /** §56 的「当前状态：…」：已进入课堂 / 连接中… / ⚠ 已停止屏幕共享。 */
 const phaseDisplay = computed(() => describeSessionPhase(session.phase))
+
+/**
+ * 实时通道状态（§47）。
+ *
+ * 这一行不是装饰：它回答的是"我现在看到的课堂状态有多新"。断了就必须说出来，
+ * 因为兜底轮询最多要 30–60 秒才会发现"老师关了课堂"。
+ */
+const realtimeDisplay = computed(() =>
+  describeRealtimeStatus(realtime.state, {
+    authFailed: realtime.authFailed,
+    wasConnected: realtime.wasConnected,
+  }),
+)
 
 /**
  * Gate / 能力自检的说明（重新共享失败时要就地显示原因）。
@@ -233,12 +252,23 @@ watch(sessionId, (next) => {
       <!-- §56 的状态面板：只有状态指示，**没有**自己的画面预览。 -->
       <AppCard data-testid="session-status-panel">
         <div class="space-y-5">
+          <!--
+            屏幕状态有三种，不是两种：本地 publish 成功但服务端还没确认（§46）时，
+            说"正在共享整个屏幕"是在替老师那边打包票。等待确认要说出来。
+          -->
           <p
-            v-if="session.isOnline"
+            v-if="session.isOnline && !session.awaitingScreenRestore"
             class="text-base font-medium"
             data-testid="screen-sharing-status"
           >
             🖥 正在共享整个屏幕
+          </p>
+          <p
+            v-else-if="session.isOnline"
+            class="text-base font-medium text-ink-muted"
+            data-testid="screen-restore-pending"
+          >
+            🖥 已重新共享，正在等待课堂确认…
           </p>
           <p
             v-else-if="session.isScreenLost"
@@ -288,6 +318,35 @@ watch(sessionId, (next) => {
           >
             网络不稳定，正在自动重连…
           </p>
+
+          <!--
+            实时通道状态（§47）。放在状态面板的最下面一行，措辞中性：
+            通道抖动是常态，学生正在共享整块屏幕，这里不该出现吓人的红色告警；
+            但也**不能**什么都不说——见 realtimeDisplay 的说明。
+          -->
+          <div
+            class="space-y-2 border-t border-border-subtle pt-4 text-xs leading-relaxed text-ink-muted"
+            data-testid="realtime-status"
+            :data-realtime-state="realtime.state"
+          >
+            <p class="flex flex-wrap items-center gap-x-2">
+              <StatusDot :status="realtimeDisplay.tone" :label="realtimeDisplay.label" />
+              <span v-if="realtimeDisplay.hint">{{ realtimeDisplay.hint }}</span>
+            </p>
+            <!--
+              自动重连已经停止（连续多次连不上）时才给按钮：
+              不然这个按钮会变成一个"点了也没用"的装饰。
+            -->
+            <AppButton
+              v-if="realtime.authFailed"
+              size="sm"
+              variant="secondary"
+              data-testid="realtime-retry"
+              @click="realtime.restart()"
+            >
+              重试实时连接
+            </AppButton>
+          </div>
         </div>
       </AppCard>
 
@@ -301,6 +360,17 @@ watch(sessionId, (next) => {
           <h2 class="text-base font-medium">⚠ 已停止屏幕共享</h2>
           <p class="text-sm leading-relaxed text-ink-muted">
             当前课堂要求持续共享整个屏幕。重新共享时会重新检查你选择的是不是整块显示器。
+          </p>
+          <!--
+            服务端判定丢失、而本地这条轨道可能还活着（§46 的双通道本来就可能不同步）。
+            这时要把"以课堂侧为准"说出来，否则学生看着系统的共享提示会以为界面坏了。
+          -->
+          <p
+            v-if="session.screenLostByServer"
+            class="text-sm leading-relaxed text-ink-muted"
+            data-testid="screen-lost-server-notice"
+          >
+            课堂侧已经确认没有收到你的屏幕画面，请重新共享一次。
           </p>
         </div>
 

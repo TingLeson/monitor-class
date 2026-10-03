@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { AppShell, ProtectedRouteGate } from '@classwatch/ui'
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { RouterView, useRoute, useRouter } from 'vue-router'
+import { useRealtimeStore } from './stores/realtime'
 import { useSessionStore } from './stores/session'
 
 /**
@@ -12,9 +13,34 @@ import { useSessionStore } from './stores/session'
  * 把教师界面渲染给学生。渲染的只有后端返回的 displayName。
  */
 const session = useSessionStore()
+const realtime = useRealtimeStore()
 const route = useRoute()
 const router = useRouter()
 const logoutPending = ref(false)
+
+/**
+ * 实时通道跟随登录态（§47）。
+ *
+ * WHY 放在根组件而不是某个页面里：
+ * - 一个入口只需要**一条**连接。放在页面里，学生从列表进课堂就会关掉再开一次，
+ *   每次导航都有一段"收不到事件"的空窗；
+ * - 未登录时不连（那是一条注定被拒的连接），登出后必须关（那是一条已经不被授权的通道）。
+ *
+ * `immediate: true` 让首帧就对齐：已经在登录态时立即开始连接，而不是等状态变化。
+ */
+watch(
+  () => session.isAuthenticated,
+  (authenticated) => {
+    if (authenticated) realtime.start()
+    else realtime.stop()
+  },
+  { immediate: true },
+)
+
+/** 根组件卸载（页面关闭、HMR 重建）时不留悬挂的连接。 */
+onBeforeUnmount(() => {
+  realtime.stop()
+})
 
 /**
  * 只在"需要登录、但会话尚未确认"时显示加载态。

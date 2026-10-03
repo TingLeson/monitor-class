@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import { describeConnectionQuality } from '../connection-quality.ts'
 import {
-  CLASSROOM_STATUS_POLL_MS,
+  CLASSROOM_DEGRADED_POLL_MS,
+  CLASSROOM_FALLBACK_POLL_MS,
+  classroomFallbackPollMs,
   describeMediaFailure,
   describeSessionPhase,
   type MediaFailureKind,
@@ -67,8 +69,15 @@ describe('会话阶段词表', () => {
   })
 })
 
-describe('课堂状态轮询间隔', () => {
-  it('是低频轮询：不低于 10 秒（Phase 8 会用 WebSocket 取代它，§47/§49）', () => {
-    expect(CLASSROOM_STATUS_POLL_MS).toBeGreaterThanOrEqual(10_000)
+describe('课堂状态兜底轮询间隔（§47/§49）', () => {
+  it('实时通道正常时是低频兜底（≥ 60 秒），绝不退化成"事实上的轮询"', () => {
+    expect(CLASSROOM_FALLBACK_POLL_MS).toBeGreaterThanOrEqual(60_000)
+    expect(classroomFallbackPollMs('open')).toBe(CLASSROOM_FALLBACK_POLL_MS)
+  })
+
+  it('实时通道断开时收紧：这段时间里轮询是唯一能发现"课堂已关闭"的手段', () => {
+    expect(CLASSROOM_DEGRADED_POLL_MS).toBeLessThan(CLASSROOM_FALLBACK_POLL_MS)
+    expect(classroomFallbackPollMs('connecting')).toBe(CLASSROOM_DEGRADED_POLL_MS)
+    expect(classroomFallbackPollMs('closed')).toBe(CLASSROOM_DEGRADED_POLL_MS)
   })
 })

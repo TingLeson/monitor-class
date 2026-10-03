@@ -384,6 +384,20 @@ async function confirmRemove(): Promise<void> {
         </div>
       </header>
 
+      <!--
+        实时事件提示（§47/§49）：课堂在**别的标签页**里被关掉了。
+        只把徽章改成"未开启"太安静——老师会以为自己点错了或页面坏了。
+        注意这里用的是 store 的字段，因为它必须与详情数据一起被清掉（切换课堂时）。
+      -->
+      <AppAlert v-if="store.realtimeNotice" tone="info" data-testid="detail-realtime-notice">
+        {{ store.realtimeNotice }}
+        <template #actions>
+          <AppButton variant="ghost" size="sm" @click="store.clearRealtimeNotice()"
+            >知道了</AppButton
+          >
+        </template>
+      </AppAlert>
+
       <AppAlert v-if="toggleNotice" tone="info" data-testid="detail-toggle-notice">
         {{ toggleNotice }}
         <template #actions>

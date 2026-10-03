@@ -184,7 +184,8 @@ func (p *Postgres) ListRosterByRun(ctx context.Context, classroomID, runID uuid.
 		return nil, errors.New("session: repository is not connected")
 	}
 	query := `
-		SELECT cs.student_id, u.display_name,` + sessionColumns("s.") + `
+		SELECT cs.student_id, u.display_name,` + sessionColumns("s.") + `,
+		       (SELECT max(e.created_at) FROM session_events e WHERE e.session_id = s.id)
 		FROM classroom_students cs
 		JOIN users u ON u.id = cs.student_id
 		LEFT JOIN LATERAL (
@@ -221,14 +222,20 @@ func (p *Postgres) ListRosterByRun(ctx context.Context, classroomID, runID uuid.
 			leftAt      *time.Time
 			createdAt   *time.Time
 			updatedAt   *time.Time
+			lastEvent   *time.Time
 		)
 		if err := rows.Scan(
 			&entry.StudentID, &entry.DisplayName,
 			&sessionID, &runID, &studentID, &identity, &status,
 			&connectedAt, &screenStart, &screenLost, &leftAt, &createdAt, &updatedAt,
+			&lastEvent,
 		); err != nil {
 			return nil, err
 		}
+		// The newest event of this session (§13/§74). NULL for a student with no session
+		// and for a session that has no events yet, which is the honest answer in both
+		// cases: "no recorded change".
+		entry.LastEventAt = lastEvent
 		// Every NOT NULL half of the joined session is required before a session is
 		// reported. A partial row would mean the LEFT JOIN matched something that is not a
 		// session, and inventing the missing values would be worse than reporting the

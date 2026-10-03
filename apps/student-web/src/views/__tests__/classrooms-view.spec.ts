@@ -4,8 +4,14 @@ import { createPinia, setActivePinia } from 'pinia'
 import { createMemoryHistory, createRouter, type Router } from 'vue-router'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { makeOpenStudentClassroom, makeStudentClassroom } from '../../__tests__/fixtures'
+import {
+  installFakeRealtimeSocket,
+  makeRoomClosedEvent,
+  makeRoomOpenedEvent,
+} from '../../__tests__/realtime-fixtures'
 import { formatTimeOfDay } from '../../lib/format'
 import { routes } from '../../router'
+import { useRealtimeStore } from '../../stores/realtime'
 import ClassroomsView from '../ClassroomsView.vue'
 
 /**
@@ -128,5 +134,63 @@ describe('我的课堂列表页', () => {
 
     expect(wrapper.text()).toContain('正在加载你的课堂')
     expect(wrapper.find('[data-testid="classrooms-empty"]').exists()).toBe(false)
+  })
+
+  it('§47/§48：老师开课的实时事件让「进入课堂」当场变可用（不必刷新页面）', async () => {
+    const { wrapper } = await mountView()
+    // 关闭状态下的按钮是"可见但禁用"（§14），链接才是"真的能进"。
+    const before = wrapper
+      .find('[data-testid="classroom-card-room-closed"]')
+      .find('[data-testid="enter-room-closed"]')
+    expect(before.element.tagName).toBe('BUTTON')
+
+    const realtime = useRealtimeStore()
+    const socket = installFakeRealtimeSocket()
+    realtime.start()
+    socket.open()
+    socket.emit(makeRoomOpenedEvent({ classroomId: 'room-closed', runId: 'run-9' }))
+    await flushPromises()
+
+    const card = wrapper.find('[data-testid="classroom-card-room-closed"]')
+    expect(card.text()).toContain('已开启')
+    const enter = card.find('[data-testid="enter-room-closed"]')
+    expect(enter.exists()).toBe(true)
+    expect(enter.attributes('href')).toBe('/student/classrooms/room-closed')
+  })
+
+  it('§47/§49：课堂被关闭的实时事件让「进入课堂」当场消失', async () => {
+    const { wrapper } = await mountView()
+    expect(wrapper.find('[data-testid="enter-room-open"]').exists()).toBe(true)
+
+    const realtime = useRealtimeStore()
+    const socket = installFakeRealtimeSocket()
+    realtime.start()
+    socket.open()
+    socket.emit(makeRoomClosedEvent({ classroomId: 'room-open' }))
+    await flushPromises()
+
+    const card = wrapper.find('[data-testid="classroom-card-room-open"]')
+    expect(card.text()).toContain('未开启')
+    // 变回禁用按钮（而不是消失）：课堂仍然在列表里，只是现在进不去。
+    const enter = card.find('[data-testid="enter-room-open"]')
+    expect(enter.element.tagName).toBe('BUTTON')
+    expect(enter.text()).toBe('暂不可进入')
+  })
+
+  it('§47：实时通道没连上时说一句，连上后这句话消失（连不上不能假装一切正常）', async () => {
+    const { wrapper } = await mountView()
+    const hint = wrapper.find('[data-testid="classrooms-realtime"]')
+    // 还没启动通道：不该出现任何"连接失败"的噪音。
+    expect(hint.exists()).toBe(false)
+
+    const realtime = useRealtimeStore()
+    const socket = installFakeRealtimeSocket()
+    realtime.start()
+    await flushPromises()
+    expect(wrapper.find('[data-testid="classrooms-realtime"]').text()).toContain('正在连接')
+
+    socket.open()
+    await flushPromises()
+    expect(wrapper.find('[data-testid="classrooms-realtime"]').exists()).toBe(false)
   })
 })

@@ -52,11 +52,33 @@ type Deps struct {
 	// cannot record a session, and an endpoint that issued media tokens without one
 	// would produce participants nobody can supervise.
 	Session SessionService
+	// Webhook is the LiveKit webhook endpoint of §45: signature verification plus the
+	// state machine that consumes the verified event. Both halves must be present for
+	// the route to exist — a verifier without a processor would accept events and drop
+	// them, and a processor without a verifier would apply unauthenticated input.
+	//
+	// The endpoint is mounted OUTSIDE /api/v1 on purpose: the per-IP limiter lives on
+	// that group, and LiveKit's delivery must not be throttled by (or counted against)
+	// a browser's budget. The signature is its authentication (§63).
+	Webhook *WebhookDeps
+	// Socket is the business WebSocket layer of §47 (/ws/student, /ws/teacher). A nil
+	// value means the routes are not registered: a deployment without a hub cannot serve
+	// a socket, and answering 404 is more honest than upgrading into nothing.
+	Socket SocketService
 	// Limiter protects /api/v1 and, more strictly, the login endpoints. A nil
 	// value installs no rate limiting at all, which is only appropriate in tests:
 	// §2.2/§63 make it mandatory in every real deployment, and main always wires
 	// a Redis-backed limiter with an in-memory fallback.
 	Limiter ratelimit.Limiter
+}
+
+// WebhookDeps bundles the two collaborators of the LiveKit webhook endpoint.
+//
+// They travel together because the endpoint is meaningless without both: the verifier
+// proves the caller is LiveKit, the processor applies what LiveKit observed.
+type WebhookDeps struct {
+	Verifier  LiveKitVerifier
+	Processor MediaEventProcessor
 }
 
 // NewRouter builds the fully configured HTTP handler.
@@ -152,6 +174,19 @@ func NewRouter(deps Deps) *gin.Engine {
 	registerAdminRoutes(v1, deps, entries)
 	registerTeacherRoutes(v1, deps, entries)
 	registerStudentRoutes(v1, deps, entries)
+
+	// Phase 8's two surfaces, both deliberately OUTSIDE /api/v1:
+	//
+	//   - The LiveKit webhook (§45) is called by LiveKit's infrastructure, not by a
+	//     browser. It authenticates with a signature over the request body and must not
+	//     be behind the per-IP API limiter: LiveKit Cloud delivers from a small pool of
+	//     egress addresses, so an IP budget would throttle every school at once and could
+	//     drop state transitions. Signature verification is the defense (§63).
+	//   - The business WebSocket endpoints (§47) are long-lived connections, not API
+	//     calls. They authenticate with the same session cookie as everything else, and
+	//     they must not consume (or be cut off by) an API request budget mid-lesson.
+	registerWebhookRoute(router, deps, resolver)
+	registerSocketRoutes(router, deps, entries)
 
 	// Unknown routes and methods must go through the same error envelope as a
 	// handler failure. gin's defaults are bare text ("404 page not found"), which

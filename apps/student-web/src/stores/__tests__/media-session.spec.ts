@@ -4,7 +4,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { makeFakeCapture } from '../../__tests__/screen-fixtures'
 import { installFakePublisherRoom, makeJoinResponse } from '../../__tests__/media-fixtures'
 import { makeOpenStudentClassroom, makeStudentClassroom } from '../../__tests__/fixtures'
-import { CLASSROOM_STATUS_POLL_MS } from '../../lib/media-session-state.ts'
+import {
+  makeRoomClosedEvent,
+  makeScreenLostEvent,
+  makeScreenRestoredEvent,
+} from '../../__tests__/realtime-fixtures.ts'
+import {
+  CLASSROOM_DEGRADED_POLL_MS,
+  CLASSROOM_FALLBACK_POLL_MS,
+} from '../../lib/media-session-state.ts'
 
 /**
  * 课堂会话 store 测试（§20 / §21 / §22 / §43 / §49 / §52）。
@@ -15,7 +23,9 @@ import { CLASSROOM_STATUS_POLL_MS } from '../../lib/media-session-state.ts'
  * 2. 轨道 ended 之后**不能** republish 同一条轨道，只能进 SCREEN_LOST 等学生重新共享；
  * 3. 重新共享**不重新 join**（会话还在，只是轨道没了）；
  * 4. 重试走的是**重新 join**（旧 token 是短时凭据，复用它只会再失败一次）；
- * 5. 课堂被关闭由**轮询**发现，并立刻断开媒体、停止捕获（§49）。
+ * 5. 课堂被关闭：**实时事件**（§47）负责快，低频兜底轮询负责"通道断了也不漏"（§49）；
+ * 6. 屏幕丢失的**双通道**（§46）：本地 `onended` 是快速反馈，服务端事件是权威，
+ *    两者不能互相打架，重新共享成功后要等服务端确认才算恢复正常。
  */
 
 const { joinClassroomMock, leaveSessionMock, getClassroomMock } = vi.hoisted(() => ({
@@ -200,6 +210,99 @@ describe('课堂会话 store', () => {
     expect(joinClassroomMock).not.toHaveBeenCalled()
   })
 
+  /* -------------------------------------------------------------------- */
+  /* §46 双通道：本地 onended（快）与服务端事件（权威）                     */
+  /* -------------------------------------------------------------------- */
+
+  it('§46：服务端说 SCREEN_LOST、本地还在共享 → 以服务端为准，提示重新共享（不杀掉本地轨道）', async () => {
+    installFakePublisherRoom()
+    const { store, capture } = await startSession()
+    expect(store.phase).toBe('online')
+
+    store.applyRealtimeEvent(makeScreenLostEvent('session-1'))
+
+    // 界面不再说"正在共享整个屏幕"——老师那边什么都没有。
+    expect(store.phase).toBe('screen-lost')
+    expect(store.isScreenLost).toBe(true)
+    expect(store.screenLostByServer).toBe(true)
+    // 本地轨道**不**被静默杀掉：停止共享是不可逆的用户可见动作，
+    // 不该由一条可能迟到的事件替学生决定；学生点"重新共享"时它会被正常释放。
+    expect(capture.track.readyState).toBe('live')
+  })
+
+  it('§46：本地重新共享成功 ≠ 恢复正常显示，要等服务端 SCREEN_RESTORED', async () => {
+    installFakePublisherRoom()
+    const { store } = await startSession()
+
+    store.applyRealtimeEvent(makeScreenLostEvent('session-1'))
+    const fresh = makeFakeCapture()
+    await store.publishCapture(fresh)
+
+    // 本地 publish 成功了，但课堂侧还没确认：界面停在"等待确认"。
+    expect(store.phase).toBe('online')
+    expect(store.awaitingScreenRestore).toBe(true)
+
+    store.applyRealtimeEvent(makeScreenRestoredEvent('session-1'))
+
+    expect(store.awaitingScreenRestore).toBe(false)
+    expect(store.screenLostByServer).toBe(false)
+    expect(store.isOnline).toBe(true)
+  })
+
+  it('§46：本地 onended 先发现、服务端事件后到 → 两者不打架（同一种状态）', async () => {
+    installFakePublisherRoom()
+    const { store, capture } = await startSession()
+
+    capture.emitEnded()
+    await Promise.resolve()
+    expect(store.phase).toBe('screen-lost')
+
+    // 服务端随后也判定丢失：状态不变，只是把"权威来源"标记上。
+    store.applyRealtimeEvent(makeScreenLostEvent('session-1'))
+
+    expect(store.phase).toBe('screen-lost')
+    expect(store.screenLostByServer).toBe(true)
+    expect(store.awaitingScreenRestore).toBe(false)
+
+    // 重新共享后依然要等服务端确认。
+    const fresh = makeFakeCapture()
+    await store.publishCapture(fresh)
+    expect(store.awaitingScreenRestore).toBe(true)
+
+    store.applyRealtimeEvent(makeScreenRestoredEvent('session-1'))
+    expect(store.phase).toBe('online')
+  })
+
+  it('§46：服务端说恢复、而我这边没有活着的轨道 → 绝不假装在共享（§21）', async () => {
+    installFakePublisherRoom()
+    const { store, capture } = await startSession()
+
+    capture.emitEnded()
+    await Promise.resolve()
+    expect(store.phase).toBe('screen-lost')
+
+    store.applyRealtimeEvent(makeScreenLostEvent('session-1'))
+    store.applyRealtimeEvent(makeScreenRestoredEvent('session-1'))
+
+    // 没有轨道就是没有轨道：服务端的"恢复"说的不是我这台机器。
+    expect(store.phase).toBe('screen-lost')
+    expect(store.screenLostByServer).toBe(false)
+  })
+
+  it('§50：旧会话的 SCREEN_LOST 被忽略（重连后 sessionId 已经换了）', async () => {
+    installFakePublisherRoom()
+    const { store } = await startSession()
+    joinClassroomMock.mockResolvedValue(makeJoinResponse({ sessionId: 'session-2' }))
+
+    await store.retry()
+    expect(store.sessionId).toBe('session-2')
+
+    store.applyRealtimeEvent(makeScreenLostEvent('session-1'))
+
+    expect(store.phase).toBe('online')
+    expect(store.screenLostByServer).toBe(false)
+  })
+
   it('重新共享后再断：新轨道的 ended 同样被监听（监听要跟着轨道走）', async () => {
     installFakePublisherRoom()
     const { store, capture } = await startSession()
@@ -328,14 +431,16 @@ describe('课堂会话 store', () => {
     expect(store.phase).toBe('left')
   })
 
-  it('§49 轮询：课堂变成 CLOSED → 断开媒体 + 停止捕获 + closed 状态', async () => {
+  it('§47+§49：收到 ROOM_CLOSED 立刻断开媒体、停止捕获、进入 closed（不依赖轮询）', async () => {
     vi.useFakeTimers()
     const harness = installFakePublisherRoom()
     const { store, capture } = await startSession()
     expect(store.phase).toBe('online')
+    // 关键前提：快照一直说"课堂还开着"。状态只能来自实时事件。
+    getClassroomMock.mockClear()
+    getClassroomMock.mockResolvedValue(OPEN)
 
-    getClassroomMock.mockResolvedValue(makeStudentClassroom({ id: 'room-open', status: 'CLOSED' }))
-    await vi.advanceTimersByTimeAsync(CLASSROOM_STATUS_POLL_MS)
+    store.applyRealtimeEvent(makeRoomClosedEvent({ classroomId: 'room-open' }))
 
     expect(store.phase).toBe('closed')
     expect(store.isClosedByTeacher).toBe(true)
@@ -343,15 +448,75 @@ describe('课堂会话 store', () => {
     expect(capture.track.readyState).toBe('ended')
     // 老师关课堂时后端已经把会话标记成 ROOM_CLOSED（§49），不再调 leave。
     expect(leaveSessionMock).not.toHaveBeenCalled()
+
+    // 事件路径不依赖轮询：时间推过去也不该再有人去打后端。
+    const callsAfterEvent = getClassroomMock.mock.calls.length
+    await vi.advanceTimersByTimeAsync(CLASSROOM_DEGRADED_POLL_MS * 2)
+    expect(getClassroomMock.mock.calls.length).toBe(callsAfterEvent)
   })
 
-  it('§49 轮询：一次网络失败不改变课堂状态（抖动不等于课堂关了）', async () => {
+  it('§26：别间课堂的 ROOM_CLOSED 与我无关（不要顺手关掉自己的课堂）', async () => {
+    vi.useFakeTimers()
+    installFakePublisherRoom()
+    const { store, capture } = await startSession()
+
+    store.applyRealtimeEvent(makeRoomClosedEvent({ classroomId: 'other-room' }))
+
+    expect(store.phase).toBe('online')
+    expect(capture.track.readyState).toBe('live')
+  })
+
+  it('§49 兜底轮询：课堂变成 CLOSED → 断开媒体 + 停止捕获 + closed 状态', async () => {
+    vi.useFakeTimers()
+    const harness = installFakePublisherRoom()
+    const { store, capture } = await startSession()
+    expect(store.phase).toBe('online')
+
+    getClassroomMock.mockResolvedValue(makeStudentClassroom({ id: 'room-open', status: 'CLOSED' }))
+    // 实时通道没连上（默认 closed）→ 兜底间隔收紧到 30 秒。
+    await vi.advanceTimersByTimeAsync(CLASSROOM_DEGRADED_POLL_MS)
+
+    expect(store.phase).toBe('closed')
+    expect(store.isClosedByTeacher).toBe(true)
+    expect(harness.current().disconnectCalls).toBe(1)
+    expect(capture.track.readyState).toBe('ended')
+    expect(leaveSessionMock).not.toHaveBeenCalled()
+  })
+
+  it('§47：实时通道正常时兜底放宽到 60 秒（事件已经是主路径，轮询只防漏）', async () => {
+    vi.useFakeTimers()
+    installFakePublisherRoom()
+    const { store } = await startSession()
+    store.setRealtimeState('open')
+    getClassroomMock.mockClear()
+
+    await vi.advanceTimersByTimeAsync(CLASSROOM_DEGRADED_POLL_MS)
+    expect(getClassroomMock).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(CLASSROOM_FALLBACK_POLL_MS - CLASSROOM_DEGRADED_POLL_MS)
+    expect(getClassroomMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('§47：实时通道断开后兜底立刻收紧（这段窗口里轮询是唯一的发现途径）', async () => {
+    vi.useFakeTimers()
+    installFakePublisherRoom()
+    const { store } = await startSession()
+    store.setRealtimeState('open')
+    getClassroomMock.mockClear()
+
+    store.setRealtimeState('closed')
+    await vi.advanceTimersByTimeAsync(CLASSROOM_DEGRADED_POLL_MS)
+
+    expect(getClassroomMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('§49 兜底轮询：一次网络失败不改变课堂状态（抖动不等于课堂关了）', async () => {
     vi.useFakeTimers()
     installFakePublisherRoom()
     const { store, capture } = await startSession()
 
     getClassroomMock.mockRejectedValue(new ApiError({ code: 'NETWORK_ERROR', status: 0 }))
-    await vi.advanceTimersByTimeAsync(CLASSROOM_STATUS_POLL_MS)
+    await vi.advanceTimersByTimeAsync(CLASSROOM_DEGRADED_POLL_MS)
 
     expect(store.phase).toBe('online')
     expect(capture.track.readyState).toBe('live')
@@ -364,7 +529,7 @@ describe('课堂会话 store', () => {
     await store.leave()
 
     getClassroomMock.mockClear()
-    await vi.advanceTimersByTimeAsync(CLASSROOM_STATUS_POLL_MS * 3)
+    await vi.advanceTimersByTimeAsync(CLASSROOM_DEGRADED_POLL_MS * 3)
 
     expect(getClassroomMock).not.toHaveBeenCalled()
   })
@@ -389,7 +554,7 @@ describe('课堂会话 store', () => {
 
     store.reset()
     getClassroomMock.mockClear()
-    await vi.advanceTimersByTimeAsync(CLASSROOM_STATUS_POLL_MS * 2)
+    await vi.advanceTimersByTimeAsync(CLASSROOM_DEGRADED_POLL_MS * 2)
 
     expect(store.phase).toBe('idle')
     expect(store.sessionId).toBeNull()

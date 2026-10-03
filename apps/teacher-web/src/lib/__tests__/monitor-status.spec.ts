@@ -10,6 +10,9 @@ import {
   makeScreenLostStudent,
 } from '../../__tests__/monitor-fixtures.ts'
 import {
+  MONITOR_DEGRADED_POLL_MS,
+  MONITOR_FALLBACK_POLL_MS,
+  monitorFallbackPollMs,
   TILE_BODY_HINT,
   TILE_BODY_TEXT,
   deriveMonitorTileState,
@@ -210,5 +213,18 @@ describe('连接提示（§29 页脚 / §30 网络行）', () => {
       expect(describeConnectionHint(quality)).not.toBe('')
       expect(describeNetworkLevel(quality)).not.toBe('')
     }
+  })
+})
+
+describe('监督快照的兜底间隔（§47/§51）', () => {
+  it('实时通道正常时是低频兜底（≥ 60 秒），不让事件驱动退化成轮询', () => {
+    expect(MONITOR_FALLBACK_POLL_MS).toBeGreaterThanOrEqual(60_000)
+    expect(monitorFallbackPollMs('open')).toBe(MONITOR_FALLBACK_POLL_MS)
+  })
+
+  it('实时通道断开时收紧：这段窗口里快照是监督墙唯一的信息来源', () => {
+    expect(MONITOR_DEGRADED_POLL_MS).toBeLessThan(MONITOR_FALLBACK_POLL_MS)
+    expect(monitorFallbackPollMs('connecting')).toBe(MONITOR_DEGRADED_POLL_MS)
+    expect(monitorFallbackPollMs('closed')).toBe(MONITOR_DEGRADED_POLL_MS)
   })
 })

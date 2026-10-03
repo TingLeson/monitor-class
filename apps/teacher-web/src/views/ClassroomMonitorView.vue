@@ -13,8 +13,10 @@ import { RouterLink, useRoute } from 'vue-router'
 import MonitorFocusPanel from '../components/MonitorFocusPanel.vue'
 import MonitorTile from '../components/MonitorTile.vue'
 import { describeClassroomError } from '../lib/classroom-error.ts'
+import { describeRealtimeStatus } from '../lib/realtime-status.ts'
 import { useClassroomsStore } from '../stores/classrooms.ts'
 import { useMonitorStore } from '../stores/monitor.ts'
+import { useRealtimeStore } from '../stores/realtime.ts'
 
 /**
  * 课堂监督墙（§29 / §30 / §51 / §52 / §73）—— Phase 7。
@@ -24,18 +26,35 @@ import { useMonitorStore } from '../stores/monitor.ts'
  * 2. **看得动**：点开某个学生进入 Focus 大画面（§30），Esc 回来；
  * 3. **看得起**：只订阅视口里的画面、网格低画质、Focus 高画质、切走标签页就停（§52）。
  *
- * 数据来自两路，合成卡片时界线必须清楚（§51）：
- * - `GET /teacher/classrooms/:id/monitor`（每 10 秒）：谁在上课、屏幕是否中断 —— 业务状态；
+ * 数据来自三路，合成卡片时界线必须清楚（§51）：
+ * - `GET /teacher/classrooms/:id/monitor`：**首屏快照 + 兜底**（60 秒 / 断线时 20 秒）
+ *   —— 谁在上课、屏幕是否中断，以及**名单的权威**；
+ * - `/ws/teacher` 的实时事件（§47）：上线/下线/屏幕中断/恢复的**增量**，
+ *   让徽章与计数在事件发生的那一刻就变，而不是等下一次快照；
  * - LiveKit 手动订阅：画面有没有到 —— 媒体状态。
  *
  * 刻意**不做**的（都属于后续 Phase，提前做会变成要推翻重写的假实现）：
  * - 摄像头画中画（§29 的 CAM 角标）、Focus 里的摄像头预览 → Phase 9；
- * - 私密语音（§31）→ Phase 10（按钮已就位但**禁用**并写明原因）；
- * - WebSocket 实时事件（§47）→ Phase 8；本 Phase 仍用 10 秒轮询，见 store 的说明。
+ * - 私密语音（§31）→ Phase 10（按钮已就位但**禁用**并写明原因）。
  */
 const route = useRoute()
 const classrooms = useClassroomsStore()
 const monitor = useMonitorStore()
+const realtime = useRealtimeStore()
+
+/**
+ * 实时状态提示（§47）：只在**没连上**时出现。
+ *
+ * 为什么必须有：监督墙的整个价值是"老师看到的就是现在发生的"。通道断了而界面
+ * 什么都不说，老师会继续把陈旧的画面与徽章当成现状来做判断（§51 的整个 DTO
+ * 设计就是为了防这件事）。措辞保持中性并给出动作（重新加载）。
+ */
+const realtimeDisplay = computed(() =>
+  describeRealtimeStatus(realtime.state, {
+    authFailed: realtime.authFailed,
+    wasConnected: realtime.wasConnected,
+  }),
+)
 
 const classroomId = computed(() => String(route.params.id ?? ''))
 
@@ -178,8 +197,22 @@ const nobodyEntered = computed(() => monitor.rosterCount > 0 && monitor.enteredC
       媒体面失败：给明确提示 + 重试入口，绝不白屏。
       业务状态（谁在上课）与媒体状态是两件事，所以这里的提示**不**影响下面的卡片列表。
     -->
+    <!--
+      课堂结束（§49）：说清楚"画面没了是因为课结束了"，而不是让老师对着一屏
+      灰卡片猜是不是系统坏了。媒体是**主动**释放的（见 store），所以这里
+      也不会同时出现下面那条媒体失败告警。
+    -->
     <AppAlert
-      v-if="monitor.mediaError"
+      v-if="monitor.classroomClosed"
+      tone="info"
+      title="本课堂已经结束"
+      data-testid="monitor-classroom-closed"
+    >
+      老师已关闭本课堂，学生端的课堂同步结束，画面已经释放。重新开启课堂后，学生需要重新进入。
+    </AppAlert>
+
+    <AppAlert
+      v-if="monitor.mediaError && !monitor.classroomClosed"
       tone="danger"
       title="无法看到学生画面"
       data-testid="monitor-media-error"
@@ -188,6 +221,30 @@ const nobodyEntered = computed(() => monitor.rosterCount > 0 && monitor.enteredC
       <div class="mt-3">
         <AppButton size="sm" data-testid="monitor-media-retry" @click="monitor.retryMedia()">
           重试连接
+        </AppButton>
+      </div>
+    </AppAlert>
+
+    <!-- 实时通道没连上：状态可能不是最新。连上时这一条不出现。 -->
+    <AppAlert
+      v-if="realtime.started && realtime.state !== 'open'"
+      :tone="realtimeDisplay.tone === 'warning' ? 'danger' : 'info'"
+      :title="realtimeDisplay.label"
+      data-testid="monitor-realtime-status"
+      :data-realtime-state="realtime.state"
+    >
+      {{ realtimeDisplay.hint }}
+      <div class="mt-3 flex flex-wrap gap-2">
+        <AppButton size="sm" variant="secondary" @click="monitor.refresh()">重新加载</AppButton>
+        <!-- 自动重连已停止时（连续多次连不上）才出现，见 realtime store 的 restart()。 -->
+        <AppButton
+          v-if="realtime.authFailed"
+          size="sm"
+          variant="secondary"
+          data-testid="monitor-realtime-retry"
+          @click="realtime.restart()"
+        >
+          重试实时连接
         </AppButton>
       </div>
     </AppAlert>

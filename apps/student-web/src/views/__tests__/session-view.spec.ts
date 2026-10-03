@@ -10,7 +10,13 @@ import {
   type MediaDevicesStub,
   type FakeTrack,
 } from '../../__tests__/screen-fixtures'
-import { CLASSROOM_STATUS_POLL_MS } from '../../lib/media-session-state.ts'
+import {
+  installFakeRealtimeSocket,
+  makeRoomClosedEvent,
+  makeScreenLostEvent,
+} from '../../__tests__/realtime-fixtures.ts'
+import { CLASSROOM_DEGRADED_POLL_MS } from '../../lib/media-session-state.ts'
+import { useRealtimeStore } from '../../stores/realtime.ts'
 import { requestEntireScreen, type ScreenCapture } from '../../lib/screen-capture'
 import { routes } from '../../router'
 import SessionView from '../SessionView.vue'
@@ -253,7 +259,7 @@ describe('课堂会话页', () => {
     const { wrapper, router, devices } = await mountSession()
 
     getClassroomMock.mockResolvedValue(makeStudentClassroom({ id: 'room-open', status: 'CLOSED' }))
-    await vi.advanceTimersByTimeAsync(CLASSROOM_STATUS_POLL_MS)
+    await vi.advanceTimersByTimeAsync(CLASSROOM_DEGRADED_POLL_MS)
     await flushPromises()
 
     const notice = wrapper.find('[data-testid="classroom-closed-notice"]')
@@ -300,5 +306,101 @@ describe('课堂会话页', () => {
 
     expect(wrapper.find('[data-testid="session-reconnecting"]').exists()).toBe(true)
     expect(wrapper.find('[data-testid="session-phase"]').text()).toContain('已进入课堂')
+  })
+
+  /* -------------------------------------------------------------------- */
+  /* §47：实时通道                                                     */
+  /* -------------------------------------------------------------------- */
+
+  it('§47：ROOM_CLOSED 在页面里立刻生效（提示 + 断开 + 停止捕获 + 退回列表）', async () => {
+    vi.useFakeTimers()
+    const harness = installFakePublisherRoom()
+    const { wrapper, router, devices } = await mountSession()
+    const realtime = useRealtimeStore()
+    const socket = installFakeRealtimeSocket()
+    realtime.start()
+    socket.open()
+
+    // 快照一直说"课堂还开着"：这次的关闭只可能来自实时事件。
+    getClassroomMock.mockResolvedValue(OPEN)
+    socket.emit(makeRoomClosedEvent({ classroomId: 'room-open' }))
+    await flushPromises()
+
+    const notice = wrapper.find('[data-testid="classroom-closed-notice"]')
+    expect(notice.exists()).toBe(true)
+    expect(notice.text()).toContain('老师已经关闭本课堂')
+    expect(harness.current().disconnectCalls).toBe(1)
+    expect(trackOf(devices).readyState).toBe('ended')
+
+    await vi.advanceTimersByTimeAsync(4000)
+    await flushPromises()
+    expect(router.currentRoute.value.name).toBe('student-classrooms')
+  })
+
+  it('§47：会话页显示实时通道状态，连不上时明说而不是假装正常', async () => {
+    installFakePublisherRoom()
+    const { wrapper } = await mountSession()
+    const realtime = useRealtimeStore()
+    const socket = installFakeRealtimeSocket()
+    realtime.start()
+    // 模板重渲染是异步的：不 flush 就读 DOM，看到的会是上一帧。
+    await flushPromises()
+
+    const line = wrapper.find('[data-testid="realtime-status"]')
+    expect(line.exists()).toBe(true)
+    expect(line.text()).toContain('正在连接实时通道')
+
+    socket.open()
+    await flushPromises()
+    expect(wrapper.find('[data-testid="realtime-status"]').text()).toContain('实时通道已连接')
+
+    // 断线后客户端立刻进入退避重连：文案要说"正在重连"，并说明兜底仍在跑。
+    socket.close()
+    await flushPromises()
+    const closedLine = wrapper.find('[data-testid="realtime-status"]')
+    expect(closedLine.text()).toContain('正在重连')
+    expect(closedLine.text()).toContain('定期刷新')
+  })
+
+  it('§46：服务端说屏幕丢了 → 页面提示"课堂侧已确认"，重新共享后等确认', async () => {
+    vi.useFakeTimers()
+    installFakePublisherRoom()
+    const { wrapper } = await mountSession()
+    const realtime = useRealtimeStore()
+    const socket = installFakeRealtimeSocket()
+    realtime.start()
+    socket.open()
+
+    socket.emit(makeScreenLostEvent('session-1'))
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="screen-lost-status"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="screen-lost-server-notice"]').text()).toContain('课堂侧')
+  })
+
+  it('§47：自动重连放弃后给出「重试实时连接」，点一下真的重新连（不必刷新页面）', async () => {
+    installFakePublisherRoom()
+    const { wrapper } = await mountSession()
+    const realtime = useRealtimeStore()
+    const socket = installFakeRealtimeSocket()
+    realtime.start()
+    vi.useFakeTimers()
+
+    // 连续三次连开都没开起来 → 客户端判定握手被拒并停止自动重连。
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      socket.current().serverClose()
+      await vi.advanceTimersByTimeAsync(30_000)
+    }
+    expect(realtime.authFailed).toBe(true)
+    await flushPromises()
+
+    const retry = wrapper.find('[data-testid="realtime-retry"]')
+    expect(retry.exists()).toBe(true)
+    const socketsBefore = socket.sockets.length
+
+    await retry.trigger('click')
+
+    expect(socket.sockets.length).toBe(socketsBefore + 1)
+    expect(realtime.authFailed).toBe(false)
   })
 })

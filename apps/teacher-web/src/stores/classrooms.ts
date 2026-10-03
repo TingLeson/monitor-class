@@ -4,6 +4,7 @@ import type {
   ClassroomRunResponse,
   ClassroomStudent,
   CreateClassroomRequest,
+  RealtimeEvent,
   RejectedClassroomStudent,
   UpdateClassroomRequest,
 } from '@classwatch/shared-types'
@@ -102,6 +103,26 @@ export const useClassroomsStore = defineStore('teacher-classrooms', () => {
     rejected: RejectedClassroomStudent[]
   } | null>(null)
 
+  /**
+   * 实时事件带来的提示（§47 / §49）。
+   *
+   * 目前只有一种：**本课堂被关闭**。为什么要有它——老师在详情页看着
+   * "已开启"，而课堂其实已经在另一个标签页里被关掉了；只把徽章改成"未开启"
+   * 太安静，老师会以为是自己点错了或者页面出了问题。一句说明 + 一个明确的现状
+   * 才是诚实。切课堂 / 重新加载时清零。
+   */
+  const realtimeNotice = ref<string | null>(null)
+
+  /**
+   * 已应用的事件数量（§47）。
+   *
+   * WHY 需要它：快照请求是异步的。一份在事件到达**之前**发出、在事件之后才回来的
+   * 响应反映的是更早的时刻——用它覆盖状态，就会把"课堂已经关了"这个刚收到的结论
+   * 又改回"已开启"（详情页的徽章与开关按钮会跟着错一次）。因此快照回来时对一下代数，
+   * 对不上就丢弃并重取。
+   */
+  let eventGeneration = 0
+
   /** 请求序号：后发出的请求结果必须覆盖先发出的（快速切换课堂、重复刷新）。 */
   let listSeq = 0
   let detailSeq = 0
@@ -157,9 +178,15 @@ export const useClassroomsStore = defineStore('teacher-classrooms', () => {
 
     loading.value = true
     error.value = null
+    const generation = eventGeneration
     try {
       const classrooms = await listClassrooms({ signal: controller.signal })
       if (seq !== listSeq) return
+      if (generation !== eventGeneration) {
+        // 见 eventGeneration 的说明：事件在飞行期间到达，这份快照已经过期。
+        void fetchList()
+        return
+      }
       items.value = classrooms
       hasLoaded.value = true
       // 详情页头部显示的是同一个课堂，列表拿到的更新鲜的状态要同步过去
@@ -188,8 +215,14 @@ export const useClassroomsStore = defineStore('teacher-classrooms', () => {
     currentLoading.value = true
     currentError.value = null
     try {
+      const generation = eventGeneration
       const classroom = await getClassroom(id)
       if (seq !== detailSeq) return
+      if (generation !== eventGeneration) {
+        // 见 eventGeneration 的说明：事件在飞行期间到达，这份快照已经过期。
+        void fetchDetail(id)
+        return
+      }
       current.value = classroom
       applyClassroom(classroom)
     } catch (cause) {
@@ -339,6 +372,54 @@ export const useClassroomsStore = defineStore('teacher-classrooms', () => {
   }
 
   /**
+   * 实时事件 → 课堂状态（§47 / §49）。
+   *
+   * 冻结契约里老师端只收 `ROOM_CLOSED`（`ROOM_OPENED` 只发给学生）。这里只改
+   * "课堂是否开着"这一个事实，其余字段继续以 HTTP 快照为准——事件里没有
+   * `name` / `studentCount`，凭事件拼一个 DTO 就是造假数据（§80）。
+   *
+   * 真实场景：老师在标签页 A 关掉了课堂，标签页 B 的详情页 / 列表要跟着变。
+   */
+  function applyRealtimeEvent(event: RealtimeEvent): void {
+    if (event.type !== 'ROOM_CLOSED') return
+    const classroomId = event.data.classroomId
+    const close = (classroom: Classroom): Classroom => ({
+      ...classroom,
+      status: 'CLOSED',
+      // §49 的第 4 步：课堂关闭后 current_run_id 置空。
+      currentRun: null,
+    })
+
+    if (current.value?.id === classroomId && current.value.status === 'OPEN') {
+      realtimeNotice.value = '本课堂已在其他页面被关闭，学生那边的课堂也已经结束。'
+    }
+    if (items.value.some((item) => item.id === classroomId)) {
+      items.value = items.value.map((item) => (item.id === classroomId ? close(item) : item))
+    }
+    if (current.value?.id === classroomId) {
+      current.value = close(current.value)
+    }
+    eventGeneration += 1
+  }
+
+  /**
+   * 实时通道重连成功后的补课（§47）。
+   *
+   * 断线期间的事件是**永久丢失**的：不重新取快照，老师会一直看着断线前的状态。
+   * 只刷新"确实加载过的"东西（列表加载过才刷列表），避免在没有打开过页面时白发请求。
+   */
+  async function resyncAfterRealtimeReconnect(): Promise<void> {
+    if (hasLoaded.value) await fetchList()
+    const id = current.value?.id
+    if (id !== undefined) await fetchDetail(id)
+  }
+
+  /** 清掉实时事件留下的提示（重新加载 / 切换课堂时调用）。 */
+  function clearRealtimeNotice(): void {
+    realtimeNotice.value = null
+  }
+
+  /**
    * 清空详情与名单（切换课堂、离开页面时调用）。
    *
    * WHY 必须连同在飞行中的响应一起作废：只是把 ref 置空的话，上一个课堂的
@@ -356,6 +437,7 @@ export const useClassroomsStore = defineStore('teacher-classrooms', () => {
     studentsLoaded.value = false
     studentsLoading.value = false
     lastAddResult.value = null
+    realtimeNotice.value = null
   }
 
   /** 消费掉批量添加的结果提示（老师关闭提示或重新提交时调用）。 */
@@ -364,6 +446,7 @@ export const useClassroomsStore = defineStore('teacher-classrooms', () => {
   }
 
   return {
+    realtimeNotice,
     items,
     total,
     openCount,
@@ -393,6 +476,9 @@ export const useClassroomsStore = defineStore('teacher-classrooms', () => {
     addStudents,
     removeStudent,
     clearDetail,
+    applyRealtimeEvent,
+    resyncAfterRealtimeReconnect,
+    clearRealtimeNotice,
     clearAddResult,
   }
 })

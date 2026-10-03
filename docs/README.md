@@ -18,7 +18,8 @@
 | [frontend/admin.md](frontend/admin.md) | 管理端页面、账号列表与筛选、创建规则（为什么没有管理员选项/学生无密码框）、启停用与重置密码的取舍 | Phase 2 |
 | [frontend/teacher.md](frontend/teacher.md) | 老师端页面、课堂列表与状态、创建/编辑、学生名单（按账号添加与部分成功）、开关课堂的交互约束 | Phase 3 起（Phase 7 扩展） |
 | [frontend/student.md](frontend/student.md) | 学生端页面、我的课堂卡片、PreJoin 与隐私告知（§57 原文）、学生间隔离在各层的落点、错误码行为 | Phase 4 起（Phase 5/6 扩展） |
-| [database/state-machines.md](database/state-machines.md) | Classroom / ClassroomRun 状态机：允许的迁移、触发者、副作用、为什么禁止反向与跳变、并发与幂等 | Phase 3 |
+| [architecture/realtime-flow.md](architecture/realtime-flow.md) | 实时事件数据流：为什么业务消息不走 DataChannel、webhook 与客户端事件的双通道分工、状态迁移的幂等/乱序/终态规则、WS 鉴权与作用域隔离、失败与重连语义、进程内 hub → Redis 的演进接缝 | Phase 8 |
+| [database/state-machines.md](database/state-machines.md) | Classroom / ClassroomRun / StudentSession 状态机：允许的迁移、触发者、副作用、为什么禁止反向与跳变、并发、幂等与乱序处理 | Phase 3 起（Phase 8 补全） |
 | [architecture/control-plane.md](architecture/control-plane.md) | 控制面边界与 Source of Truth、请求链中的授权位置、开课/关课事务与并发分析、错误码契约、Phase 6/8 接缝 | Phase 3 |
 | [media/webrtc-basics.md](media/webrtc-basics.md) | Track/Source、为什么课堂是 1 上行 N 下行、`autoSubscribe=false` 的理由、客户端与服务端各自能证明什么 | Phase 6 |
 | [media/livekit-architecture.md](media/livekit-architecture.md) | Room/Participant/Track、Token 权限位逐字段依据、identity 为什么必须 opaque、Room 生命周期、Cloud 与本地容器两种模式 | Phase 6 |
@@ -30,8 +31,7 @@
 | 文档 | 内容 | Phase |
 | --- | --- | --- |
 | `labs/browser-screen-capture.md` | Screen Capture API、MediaStream/Track、`displaySurface`、浏览器隐私边界 | 5 |
-| `architecture/media-plane.md` | 媒体面边界、Webhook 作为唯一权威观测、`ONLINE` 判定权 | 8 |
-| `architecture/realtime-flow.md` | WebSocket 业务事件流、与 DataChannel 的分工 | 8 |
+| `architecture/media-plane.md` | 媒体面边界的完整论述（当前要点已分布在 overview / control-plane / realtime-flow 中） | 待定 |
 | `media/private-audio.md` | 老师私密语音状态机、订阅权限切换、学生未授权麦克风时的行为 | 10 |
 | `deployment/local.md` | 本地环境细节（与 setup.md 互链） | 0/11 |
 | `deployment/production.md` | HTTPS、TURN/TLS、反代、限流、指标、多网络测试 | 11 |

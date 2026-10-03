@@ -253,6 +253,25 @@ func (c *Client) ObserveRoom(ctx context.Context, roomName string) (map[string]P
 	}
 	resp, err := c.rooms.ListParticipants(ctx, &livekit.ListParticipantsRequest{Room: roomName})
 	if err != nil {
+		if isRoomNotFound(err) {
+			// A room that does not exist has nobody in it, which is an OBSERVATION and
+			// not a failure.
+			//
+			// WHY this matters more than it looks (Phase 8 fix for a Phase 7 report
+			// item): the teacher's console polls the monitor every few seconds, and
+			// before the first student joins there is no LiveKit room at all — so the
+			// naive version of this function turned "the room has not been created yet"
+			// into a Warn on every poll. That trains operators to ignore the level, and
+			// it makes a real media-plane outage indistinguishable from an empty
+			// classroom. An empty map is also the honest answer for the state machine:
+			// nobody is connected, so a session that claims ONLINE is not.
+			//
+			// The distinction is preserved where it matters: a genuine failure (the API
+			// key was rotated, LiveKit is down, the network is broken) still returns an
+			// error, and the monitor then reports connection=UNKNOWN instead of
+			// inventing a disconnect (§33).
+			return map[string]ParticipantTracks{}, nil
+		}
 		return nil, fmt.Errorf("livekit: list participants: %w", err)
 	}
 	observed := make(map[string]ParticipantTracks, len(resp.GetParticipants()))
@@ -433,6 +452,21 @@ func isNotFound(err error) bool {
 		func(err twirp.Error) bool { return err.Code() == twirp.NotFound },
 		func(code codes.Code) bool { return code == codes.NotFound },
 		"not found", "does not exist",
+	)
+}
+
+// isRoomNotFound recognises "there is no such room" from ListParticipants.
+//
+// It is deliberately narrower than isNotFound: the message fallback mentions the room,
+// so an unrelated NotFound (a track, a participant, a future endpoint) cannot be read as
+// "the classroom is empty". The code check is the primary rule — LiveKit answers this
+// condition with NotFound — and the text is the fallback for a transport that expresses
+// it differently.
+func isRoomNotFound(err error) bool {
+	return matchesServerError(err,
+		func(err twirp.Error) bool { return err.Code() == twirp.NotFound },
+		func(code codes.Code) bool { return code == codes.NotFound },
+		"room not found", "no such room", "room does not exist",
 	)
 }
 

@@ -87,6 +87,31 @@ export type {
   StudentSessionStatus,
 } from './session'
 
+export {
+  REALTIME_EVENT_TYPES,
+  REALTIME_PING_TYPE,
+  REALTIME_PONG_TYPE,
+  STUDENT_OFFLINE_REASONS,
+  isRealtimeEvent,
+  isRealtimeEventType,
+  isStudentOfflineReason,
+} from './realtime'
+export type {
+  DeviceActiveChangedData,
+  PrivateTalkData,
+  RealtimeEvent,
+  RealtimeEventDataMap,
+  RealtimeEventType,
+  RoomClosedData,
+  RoomOpenedData,
+  ScreenStateData,
+  StudentOfflineData,
+  StudentOfflineReason,
+  StudentOnlineData,
+  StudentScreenStateData,
+  TeacherScreenStateData,
+} from './realtime'
+
 export { CONNECTION_QUALITIES, MONITOR_TILE_STATES, isConnectionQuality } from './monitor'
 export type {
   ConnectionQuality,

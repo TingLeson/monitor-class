@@ -1,5 +1,5 @@
 import { ApiError, isApiError } from '@classwatch/api-client'
-import type { StudentClassroom } from '@classwatch/shared-types'
+import type { RealtimeEvent, StudentClassroom } from '@classwatch/shared-types'
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { getClassroom, listClassrooms } from '../lib/student-classrooms-api.ts'
@@ -113,6 +113,56 @@ export const useClassroomsStore = defineStore('student-classrooms', () => {
   }
 
   /**
+   * 实时事件 → 列表与详情（§47 / §48 / §49）。
+   *
+   * Phase 8 之前，学生要看到"老师开课了"只能靠自己刷新页面；现在服务端在开课/
+   * 关课时直接推 `ROOM_OPENED` / `ROOM_CLOSED`，于是列表上的「进入课堂」会自己变可用。
+   *
+   * 三条边界：
+   *
+   * 1. **只改事件能证明的那部分**。事件里有 `runId` / `openedAt`（正好是列表卡片
+   *    "本次开始于"要显示的 `currentRun`），于是状态与 Run 一起更新；
+   *    课堂名之类字段不进事件的处理逻辑——快照仍然是那些字段的权威。
+   * 2. **不在列表里的课堂直接忽略**。服务端只会推学生被授权的课堂（§14/§26），
+   *    所以出现陌生 id 只可能是竞态（刚被移出名单）。此时**不能凭空造一张卡片**：
+   *    那会让一个已经没有权限的学生看到课堂信息。
+   * 3. **详情页的 `current` 也要同步**：学生从列表点进 PreJoin 时看到的是详情，
+   *    只更新列表会让两处自相矛盾（列表说可进入、详情说未开启）。
+   */
+  function applyRealtimeEvent(event: RealtimeEvent): void {
+    if (event.type === 'ROOM_OPENED') {
+      const { classroomId, runId, openedAt } = event.data
+      patchClassroom(classroomId, (classroom) => ({
+        ...classroom,
+        status: 'OPEN',
+        currentRun: { id: runId, openedAt },
+      }))
+      return
+    }
+    if (event.type === 'ROOM_CLOSED') {
+      const { classroomId } = event.data
+      patchClassroom(classroomId, (classroom) => ({
+        ...classroom,
+        status: 'CLOSED',
+        currentRun: null,
+      }))
+    }
+  }
+
+  /** 把"课堂是否开着"这一个事实同时写进列表与详情（不在列表里的 id 什么也不做）。 */
+  function patchClassroom(
+    classroomId: string,
+    patch: (classroom: StudentClassroom) => StudentClassroom,
+  ): void {
+    if (items.value.some((item) => item.id === classroomId)) {
+      items.value = items.value.map((item) => (item.id === classroomId ? patch(item) : item))
+    }
+    if (current.value?.id === classroomId) {
+      current.value = patch(current.value)
+    }
+  }
+
+  /**
    * 清空详情（`:id` 变化、离开页面时调用）。
    *
    * WHY 必须连同在飞行中的响应一起作废：只把 ref 置空的话，上一个课堂的响应
@@ -138,5 +188,6 @@ export const useClassroomsStore = defineStore('student-classrooms', () => {
     fetchList,
     fetchDetail,
     clearDetail,
+    applyRealtimeEvent,
   }
 })

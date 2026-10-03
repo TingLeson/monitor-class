@@ -26,6 +26,11 @@ type Service struct {
 	classrooms Directory
 	media      MediaPlane
 	cfg        Config
+	// lifecycle is the runtime event path of §74 (the session_events log and the
+	// WebSocket messages). It is optional on purpose: the join and leave endpoints are
+	// correct without it, and a deployment with no realtime layer must not lose the
+	// ability to record a session — it only loses the messages.
+	lifecycle LifecycleEvents
 }
 
 // NewService wires the service. media may be nil in a degraded deployment (the API
@@ -34,6 +39,18 @@ type Service struct {
 // plane, which is the honest answer for a process that cannot talk to LiveKit.
 func NewService(repo Repository, classrooms Directory, mediaPlane MediaPlane, cfg Config) *Service {
 	return &Service{repo: repo, classrooms: classrooms, media: mediaPlane, cfg: cfg}
+}
+
+// WithLifecycleEvents attaches the runtime event path (§13/§74).
+//
+// WHY a setter rather than a constructor argument: every existing caller and test keeps
+// working without a hub, and "no event layer" is a state the code has to handle anyway
+// (an API booted with STARTUP_REQUIRE_DEPENDENCIES=false has a database but no media
+// plane). The alternative — a nil interface argument in every test — would hide that
+// state instead of making it visible at the one wiring site that matters.
+func (s *Service) WithLifecycleEvents(events LifecycleEvents) *Service {
+	s.lifecycle = events
+	return s
 }
 
 // Capture is the diagnostic block the student frontend submits with a join (§43).
@@ -178,6 +195,22 @@ func (s *Service) Join(ctx context.Context, in JoinInput) (*JoinResult, error) {
 		"token_ttl_seconds", int(s.cfg.TokenTTL.Seconds()),
 	)
 
+	// §13: entering a lesson is an event. It is recorded once per session row, so a
+	// double-clicked join or a reload that reused the row does not grow the log. A
+	// failure here is logged and ignored: the student is already in (the row and the
+	// token exist), and failing the endpoint over an audit row would be the wrong trade.
+	if s.lifecycle != nil {
+		if err := s.lifecycle.SessionCreated(ctx, created); err != nil {
+			logging.FromContext(ctx).Warn("session created event could not be recorded",
+				"action", "session_event_failed",
+				logging.FieldSessionID, created.ID.String(),
+				"event_type", string(EventSessionCreated),
+				"error", err,
+				"consequence", "the join succeeded; only the event log is incomplete",
+			)
+		}
+	}
+
 	return &JoinResult{Session: created, LiveKitURL: s.cfg.LiveKitURL, Token: token}, nil
 }
 
@@ -213,6 +246,22 @@ func (s *Service) Leave(ctx context.Context, sessionID, studentID uuid.UUID) (*S
 		logging.FieldSessionID, left.ID.String(),
 		"session_status", string(left.Status),
 	)
+
+	// §13/§47: leaving is an event, and the teacher's console must learn about it
+	// without waiting for the next poll. The event row is the idempotency key of the
+	// message (see Processor.SessionLeft), so a retried leave produces neither a second
+	// row nor a second STUDENT_OFFLINE.
+	if s.lifecycle != nil {
+		if err := s.lifecycle.SessionLeft(ctx, left); err != nil {
+			logging.FromContext(ctx).Warn("student left event could not be recorded",
+				"action", "session_event_failed",
+				logging.FieldSessionID, left.ID.String(),
+				"event_type", string(EventStudentLeft),
+				"error", err,
+				"consequence", "the leave succeeded; only the event log and the console message are missing",
+			)
+		}
+	}
 
 	s.removeParticipant(ctx, left)
 	return left, nil
@@ -688,7 +737,7 @@ func monitorStudentOf(entry RosterEntry, present bool, tracks media.ParticipantT
 	student.SessionID = &sessionID
 	student.Status = &status
 	student.JoinedAt = session.ConnectedAt
-	student.LastEventAt = lastEventAt(session)
+	student.LastEventAt = lastEventAt(entry, session)
 	if session.Status.Terminal() || !present {
 		return student
 	}
@@ -701,13 +750,19 @@ func monitorStudentOf(entry RosterEntry, present bool, tracks media.ParticipantT
 	return student
 }
 
-// lastEventAt is the timestamp of the most recent recorded change to a session.
+// lastEventAt is the timestamp of the most recent RECORDED event of a session.
 //
-// Phase 6 has no event table (§13 is Phase 8), so `updated_at` is the honest
-// approximation: it moves exactly when the session changes. Phase 8 replaces this one
-// function body with a lookup of the newest session_events row, and the DTO does not
-// change — which is why the field is named after the event and not after the column.
-func lastEventAt(session StudentSession) *time.Time {
+// Phase 8 answers this from `session_events` (the newest row, read by the roster query),
+// which is what the field was always named after. `updated_at` remains the fallback for
+// a session that has no event rows yet — a session created by an older build, or one
+// whose join happened while the event layer was unavailable. Falling back is right:
+// `updated_at` moves exactly when the session changes, so it is never a WRONG answer,
+// only a coarser one, and a null here would make the wall render "never" for a student
+// who is plainly online.
+func lastEventAt(entry RosterEntry, session StudentSession) *time.Time {
+	if entry.LastEventAt != nil {
+		return entry.LastEventAt
+	}
 	updated := session.UpdatedAt
 	if updated.IsZero() {
 		return nil
@@ -740,7 +795,7 @@ func unobservedView(roster []RosterEntry) *MonitorView {
 			student.SessionID = &sessionID
 			student.Status = &status
 			student.JoinedAt = session.ConnectedAt
-			student.LastEventAt = lastEventAt(session)
+			student.LastEventAt = lastEventAt(entry, session)
 			student.ScreenActive = !session.Status.Terminal() && session.Status == StatusOnline
 		}
 		view = append(view, student)

@@ -1,4 +1,5 @@
-import type { StudentClassroom } from '@classwatch/shared-types'
+import type { RealtimeConnectionState } from '@classwatch/api-client'
+import type { RealtimeEvent, StudentClassroom } from '@classwatch/shared-types'
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import {
@@ -8,7 +9,7 @@ import {
   type ScreenPublisherRoom,
 } from '../lib/media/media-room.ts'
 import {
-  CLASSROOM_STATUS_POLL_MS,
+  classroomFallbackPollMs,
   describeMediaFailure,
   type MediaFailure,
   type MediaFailureKind,
@@ -66,9 +67,13 @@ export interface PrepareInput {
  * 3. **轨道丢失绝不 republish 同一条轨道**（§22）。`ended` 之后那条 track 已经死了，
  *    再 publish 只会得到一个静默失败或一条永远没有画面的轨道；正确做法是进入
  *    `screen-lost` 提示态，等学生重新共享一条**新**轨道。
- * 4. **业务状态与媒体状态分开**（§51 的同一条原则用在学生端）：老师是否关了课堂
- *    由后端（低频轮询）说了算，媒体连接是否还在由 LiveKit 说了算，两者在
- *    `phase` 这一层合成，谁都不去假装对方。
+ * 4. **服务端权威、客户端快速反馈**（§46）。`track.onended` 让界面**立刻**反应，
+ *    而 `SCREEN_LOST` / `SCREEN_RESTORED` 事件才是"老师那边到底看到了什么"的答案。
+ *    两者都写进下面这一份状态：服务端说丢了，本地即便还握着一条轨道也不再显示
+ *    "正在共享"（见 `handleServerScreenLost`）；学生重新共享成功后，界面停在
+ *    "等待课堂确认"，直到服务端说 `SCREEN_RESTORED` 才算恢复正常。
+ * 5. **课堂是否开着以 WebSocket 事件为主、低频轮询兜底**（§47/§49）：
+ *    事件负责快，轮询负责"通道断了也不漏"（见 `syncPollTimer`）。
  */
 export const useMediaSessionStore = defineStore('student-media-session', () => {
   /* ---------------------------------------------------------------------- */
@@ -78,7 +83,7 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
   const phase = ref<MediaSessionPhase>('idle')
   /** 当前会话 id；join / retry 之后可能变化（§50：后端可以取代旧连接）。 */
   const sessionId = ref<string | null>(null)
-  /** 课堂详情（名称 + 状态）。轮询会刷新它，§49 的"老师已关闭"就来自这里。 */
+  /** 课堂详情（名称 + 状态）。轮询与事件都会刷新它，§49 的"老师已关闭"就来自这里。 */
   const classroom = ref<StudentClassroom | null>(null)
   const quality = ref<ConnectionQualityLevel>('unknown')
   const failure = ref<MediaFailure | null>(null)
@@ -86,6 +91,16 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
   const busy = ref(false)
   /** LiveKit 正在自动重连（§52）；界面据此显示"正在重连"，不改 phase。 */
   const reconnecting = ref(false)
+  /**
+   * 服务端是否已经判定"屏幕丢失"、并且还没收到 `SCREEN_RESTORED`（§46）。
+   *
+   * 与 `phase === 'screen-lost'` **不是**同一件事：学生重新共享成功后 phase 会回到
+   * online，但服务端还没确认；这段时间界面必须说"等待课堂确认"，而不是
+   * 一口咬定"正在共享整个屏幕"——老师那边可能什么都没收到。
+   */
+  const screenLostByServer = ref(false)
+  /** 实时通道状态，只用来决定兜底轮询的频率（见 syncPollTimer）。 */
+  const realtimeState = ref<RealtimeConnectionState>('closed')
 
   /* ---------------------------------------------------------------------- */
   /* 只存在于内存的私有内容（绝不进 state，见文件头第 1 点）                  */
@@ -107,8 +122,10 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
   /** 房间事件与轨道 ended 的取消订阅函数；退出时必须逐个调用。 */
   let roomUnsubscribers: (() => void)[] = []
   let unsubscribeEnded: (() => void) | null = null
-  /** 课堂状态轮询定时器（§49 的临时手段，Phase 8 会被 WebSocket 取代）。 */
+  /** 课堂状态**兜底**轮询定时器（实时通道断了的时候它是唯一的发现途径，§47/§49）。 */
   let pollTimer: ReturnType<typeof setInterval> | null = null
+  /** 当前定时器用的间隔，用来判断"通道状态变了要不要重建定时器"。 */
+  let pollIntervalMs = 0
   /** 轮询序号：晚发出的响应才能写状态，避免乱序覆盖。 */
   let pollSeq = 0
   /** leave 只上报一次（离开按钮 + 组件卸载可能都会触发）。 */
@@ -124,6 +141,15 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
   const hasFailure = computed(() => failure.value !== null)
   /** 界面是否需要显示"重试进入课堂"（媒体失败；屏幕丢失走另一条恢复路径）。 */
   const canRetry = computed(() => phase.value === 'media-error')
+  /**
+   * 本地已经重新共享、但服务端还没确认（§46）。
+   *
+   * 这是"不能撒谎"最典型的一处：publish 在本地成功只说明**我们**发出去了，
+   * 老师那边有没有收到要以服务端的 `SCREEN_RESTORED` 为准。
+   */
+  const awaitingScreenRestore = computed(
+    () => screenLostByServer.value && (phase.value === 'online' || phase.value === 'connecting'),
+  )
 
   /* ---------------------------------------------------------------------- */
   /* 内部工具                                                                */
@@ -178,11 +204,12 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     capture = null
   }
 
-  /** 停掉课堂状态轮询（幂等）。 */
+  /** 停掉课堂状态兜底轮询（幂等）。 */
   function stopClassroomWatch(): void {
     if (pollTimer === null) return
     clearInterval(pollTimer)
     pollTimer = null
+    pollIntervalMs = 0
   }
 
   /**
@@ -242,6 +269,7 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     classroom.value = null
     failure.value = null
     quality.value = 'unknown'
+    screenLostByServer.value = false
     leaveReported = false
     phase.value = 'prepared'
   }
@@ -473,8 +501,89 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
   }
 
   /* ---------------------------------------------------------------------- */
-  /* 课堂状态轮询（§49 学生侧，Phase 8 会被 WebSocket 取代）                  */
+  /* 课堂状态：实时事件为主（§47），低频兜底轮询为辅（§49）                    */
   /* ---------------------------------------------------------------------- */
+
+  /**
+   * 实时通道状态变化（由 realtime store 转达）。
+   *
+   * 唯一用途是**兜底轮询的频率**：通道开着时 60 秒足够，断了就必须收紧，
+   * 否则"老师关了课堂"可能被拖到一个很晚的时刻才被发现（见 classroomFallbackPollMs）。
+   */
+  function setRealtimeState(next: RealtimeConnectionState): void {
+    if (realtimeState.value === next) return
+    realtimeState.value = next
+    syncPollTimer()
+  }
+
+  /**
+   * 实时事件 → 会话状态（§46 / §49）。
+   *
+   * 只处理"发给学生本人"的三类事件；其余类型根本不进这里（见 realtime store 的路由）。
+   */
+  function applyRealtimeEvent(event: RealtimeEvent): void {
+    switch (event.type) {
+      case 'ROOM_CLOSED':
+        /**
+         * 只认自己这间课堂。服务端按 §26 只会推授权课堂，出现别的 id 说明本地
+         * 已经不在那间课堂里了（例如刚离开），此时什么都不要做。
+         */
+        if (classroomId === null || event.data.classroomId !== classroomId) return
+        if (phase.value === 'left' || phase.value === 'idle' || phase.value === 'no-session') return
+        applyClassroomClosed()
+        break
+      case 'SCREEN_LOST':
+        if (!isCurrentSession(event.data.sessionId)) return
+        handleServerScreenLost()
+        break
+      case 'SCREEN_RESTORED':
+        if (!isCurrentSession(event.data.sessionId)) return
+        handleServerScreenRestored()
+        break
+      default:
+        break
+    }
+  }
+
+  /**
+   * 事件是不是在说我**当前**这个会话。
+   *
+   * WHY 必须比 sessionId：`retry()` 会重新 join，后端可能给出新的 session（§50
+   * "新连接取代旧连接"）。那时旧会话的 SCREEN_LOST 会晚到，拿它去改新会话的状态
+   * 就是一次纯粹的误报。
+   */
+  function isCurrentSession(eventSessionId: string): boolean {
+    return sessionId.value !== null && sessionId.value === eventSessionId
+  }
+
+  /**
+   * 服务端判定屏幕丢失（§46 的权威通道）。
+   *
+   * - 本地可能还在共享（webhook 与浏览器之间本来就可能不同步）：**界面以服务端为准**，
+   *   立刻停止显示"正在共享整个屏幕"，并提示重新共享；
+   * - 但**不主动杀掉**本地那条轨道：它可能还在发布（服务端漏报），而且停止共享是
+   *   一个不可逆的用户可见动作，不应该由一条可能迟到的事件替学生决定。
+   *   学生点"重新共享"时，旧轨道会在发布新轨道的那一步被正常释放。
+   */
+  function handleServerScreenLost(): void {
+    screenLostByServer.value = true
+    if (phase.value === 'online' || phase.value === 'connecting') {
+      phase.value = 'screen-lost'
+    }
+  }
+
+  /**
+   * 服务端确认屏幕恢复（§46）。
+   *
+   * 只有在**本地确实握着一条活轨道**时才回到"正常显示"：服务端说恢复了、
+   * 而我这边没有轨道，那说明恢复的是别的东西（或本地刚释放过），
+   * 此时显示"正在共享"就是撒谎（§21 的不变量）。
+   */
+  function handleServerScreenRestored(): void {
+    screenLostByServer.value = false
+    if (capture === null) return
+    if (phase.value === 'screen-lost') phase.value = 'online'
+  }
 
   /**
    * 老师关闭课堂时的收尾（§49 的学生侧那一半）。
@@ -487,13 +596,14 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     stopClassroomWatch()
     phase.value = 'closed'
     failure.value = null
+    screenLostByServer.value = false
     void teardownRoom()
     releaseCapture()
     credentials = null
   }
 
   /**
-   * 拉一次课堂详情。
+   * 拉一次课堂详情（兜底轮询与"实时通道刚恢复"都会调它）。
    *
    * 失败**不改变**课堂状态：一次网络抖动不等于"课堂关了"，据此断开学生的共享
    * 才是真的错误。等下一次轮询即可。
@@ -501,11 +611,16 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
   async function refreshClassroom(): Promise<void> {
     const id = classroomId
     if (id === null) return
-    if (phase.value === 'left' || phase.value === 'closed') return
+    if (isSessionFinished()) return
     const seq = ++pollSeq
     try {
       const next = await getClassroom(id)
       if (seq !== pollSeq) return
+      /**
+       * 请求飞行期间实时事件已经把课堂关掉了（§47 的事件比这次快照新）：
+       * 这份快照反映的是关课之前的时刻，写进去只会让"课堂已结束"与详情数据打架。
+       */
+      if (isSessionFinished()) return
       classroom.value = next
       if (next.status === 'CLOSED') applyClassroomClosed()
     } catch {
@@ -513,14 +628,39 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     }
   }
 
-  /** 开始低频轮询（见 media-session-state.ts 对间隔的说明）。 */
+  /** 会话是否已经结束（老师关课或学生离开）；结束后一切快照都不再改状态。 */
+  function isSessionFinished(): boolean {
+    return phase.value === 'closed' || phase.value === 'left'
+  }
+
+  /**
+   * 开始兜底轮询。
+   *
+   * 先立刻拉一次：课堂名要马上显示，而且"老师刚关了课堂"不必等满一个周期。
+   * 之后由 `syncPollTimer()` 按实时通道状态决定间隔。
+   */
   function startClassroomWatch(): void {
-    if (classroomId === null || pollTimer !== null) return
-    // 先立刻拉一次：课堂名要马上显示，而且"老师刚关了课堂"不必等满一个周期。
+    if (classroomId === null) return
     void refreshClassroom()
+    pollIntervalMs = 0
+    syncPollTimer()
+  }
+
+  /**
+   * 按当前实时通道状态重建兜底定时器（幂等：间隔没变就什么都不做）。
+   *
+   * WHY 两档：通道正常时轮询只是兜底（60 秒），通道断开时它是**唯一**能发现
+   * "课堂已关闭"的手段，必须收紧（30 秒）。
+   */
+  function syncPollTimer(): void {
+    if (classroomId === null) return
+    const interval = classroomFallbackPollMs(realtimeState.value)
+    if (pollTimer !== null && pollIntervalMs === interval) return
+    if (pollTimer !== null) clearInterval(pollTimer)
+    pollIntervalMs = interval
     pollTimer = setInterval(() => {
       void refreshClassroom()
-    }, CLASSROOM_STATUS_POLL_MS)
+    }, interval)
   }
 
   /* ---------------------------------------------------------------------- */
@@ -542,6 +682,7 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     classroomId = null
     failure.value = null
     reconnecting.value = false
+    screenLostByServer.value = false
   }
 
   /**
@@ -590,6 +731,7 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     failure.value = null
     busy.value = false
     reconnecting.value = false
+    screenLostByServer.value = false
     leaveReported = false
     phase.value = 'idle'
   }
@@ -602,6 +744,8 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     failure,
     busy,
     reconnecting,
+    screenLostByServer,
+    realtimeState,
     isOnline,
     isScreenLost,
     isConnecting,
@@ -609,6 +753,7 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     hasNoSession,
     hasFailure,
     canRetry,
+    awaitingScreenRestore,
     prepare,
     begin,
     publishCapture,
@@ -616,6 +761,8 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     refreshClassroom,
     startClassroomWatch,
     stopClassroomWatch,
+    setRealtimeState,
+    applyRealtimeEvent,
     leave,
     releaseNow,
     reset,

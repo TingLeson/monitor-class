@@ -1,4 +1,25 @@
 import type { ConnectionQuality, MonitorStudent, MonitorTileState } from '@classwatch/shared-types'
+import type { RealtimeConnectionState } from '@classwatch/api-client'
+
+/**
+ * 监督快照的**兜底**刷新间隔（§47 / §51）。
+ *
+ * Phase 8 起监督墙的主路径是 `/ws/teacher` 的实时事件；`GET monitor` 退回三个
+ * 不可替代的位置：首屏快照、**名单的权威**（学生被加入课堂不发事件）、以及漏事件时的兜底。
+ *
+ * 两档的理由：
+ * - 实时通道正常（60 秒）：事件已经覆盖了"谁上线/下线/屏幕断了"，快照只是防漏。
+ *   频率必须低，否则等于把事件驱动又做回了轮询；
+ * - 实时通道断开（20 秒）：这段时间里监督墙**只有**快照，老师的判断完全建立在它上面。
+ *   20 秒是"看不出明显延迟"与"不打爆后端"之间的折中（一个班几十人，老师端只有一两个）。
+ */
+export const MONITOR_FALLBACK_POLL_MS = 60_000
+export const MONITOR_DEGRADED_POLL_MS = 20_000
+
+/** 按实时通道状态挑一个兜底间隔（`open` 以外的一切都按降级处理）。 */
+export function monitorFallbackPollMs(realtime: RealtimeConnectionState): number {
+  return realtime === 'open' ? MONITOR_FALLBACK_POLL_MS : MONITOR_DEGRADED_POLL_MS
+}
 
 /**
  * 监督卡片的状态映射（§12 / §22 / §29 / §30 / §51）。

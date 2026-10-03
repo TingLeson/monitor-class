@@ -1,5 +1,13 @@
-import { ApiError, isApiError } from '@classwatch/api-client'
-import type { MonitorStudent, MonitorTileState } from '@classwatch/shared-types'
+import { ApiError, isApiError, type RealtimeConnectionState } from '@classwatch/api-client'
+import type {
+  MonitorStudent,
+  MonitorTileState,
+  RealtimeEvent,
+  ScreenStateData,
+  StudentOfflineReason,
+  StudentSessionStatus,
+  TeacherScreenStateData,
+} from '@classwatch/shared-types'
 import { defineStore } from 'pinia'
 import { computed, markRaw, ref, shallowRef } from 'vue'
 import {
@@ -12,6 +20,7 @@ import {
 import {
   deriveMonitorTileState,
   isStudentEntered,
+  monitorFallbackPollMs,
   shouldSubscribeScreen,
   type MonitorBadge,
   type MonitorMediaState,
@@ -25,14 +34,14 @@ import { getMonitor, requestMediaToken } from '../lib/teacher-monitor-api.ts'
  * 它把两路**完全不同**的信息合成监督墙需要的形状：
  *
  * ```text
- * GET /monitor（业务状态，每 10 秒刷新）        LiveKit（媒体事实，事件驱动）
- *        ↓                                              ↓
- *   students: MonitorStudent[]              mediaStates / subscriptions
- *        └──────────────────┬───────────────────────────┘
- *                     Monitor Card（视图）
+ * GET /monitor（首屏快照 + 兜底）        /ws/teacher（事件增量）      LiveKit（媒体事实）
+ *        ↓                                   ↓                            ↓
+ *   students: MonitorStudent[] ──────────────┘                mediaStates / subscriptions
+ *        └──────────────────────────┬───────────────────────────────────┘
+ *                              Monitor Card（视图）
  * ```
  *
- * 七条纪律：
+ * 八条纪律：
  *
  * 1. **业务状态只用 DTO**（§51）。`students` 只会被 monitor 响应整体替换，
  *    绝不因为"房间里还有这个 participant"就把某个学生标成在线。
@@ -42,16 +51,22 @@ import { getMonitor, requestMediaToken } from '../lib/teacher-monitor-api.ts'
  * 3. **凭据只存内存**（§44）：`credentials` 是闭包变量，不进响应式 state。
  * 4. **断线是可恢复的失败**：媒体连接断开 → `mediaError` + 重试入口（重新申请
  *    media-token）；而不是把整页变成空白。
- * 5. **轮询间隔 10 秒**（任务书 §Phase 6/7），理由与 §49 学生侧相同：老师关不关课堂、
- *    学生断没断是低频事件。Phase 8 接入 WebSocket 后这个定时器整体删除（§47）。
+ * 5. **事件增量更新，快照兜底**（§47 / §51）。Phase 8 起"谁上线了、谁的屏幕断了"
+ *    由 `/ws/teacher` 推过来，`GET monitor` 退回它真正不可替代的位置：
+ *    首屏快照 + **名单的权威**（新学生被加入课堂不会发事件）+ 兜底。
+ *    兜底间隔分两档：通道正常 60 秒（只是防漏），通道断开 20 秒（这段时间里
+ *    快照是唯一的信息来源，见 monitorFallbackPollMs）。
  * 6. **一次只跑一轮协调**：三路输入都会触发协调，交错执行会让"该订的集合"在两次
  *    await 之间变化（重复退订、把刚订好的又退掉）。串行化 + 合并重跑是最省心的写法。
- * 7. **Focus 放在 store 而不是视图**：它不是纯视图开关，而是直接决定订阅画质
+ * 7. **事件不得凭空造数据**（§80）。事件只更新**已经在名单里**的学生：
+ *    载荷里没有 `connection`、`joinedAt` 这些字段，靠默认值补出来就是假数据；
+ *    真正的新增学生一律走快照刷新（名单只有后端说了算）。
+ * 8. **Focus 放在 store 而不是视图**：它不是纯视图开关，而是直接决定订阅画质
  *    （§30 的"Focus 优先较高画质"）。放在视图里，画质决策就会分裂成两处。
  */
 export const useMonitorStore = defineStore('teacher-monitor', () => {
-  /** 轮询间隔：见文件头第 5 点。 */
-  const MONITOR_POLL_MS = 10_000
+  /** 兜底快照的合并窗口：一次事件风暴（10 个人同时进来）只换一次请求。 */
+  const SNAPSHOT_REFRESH_DEBOUNCE_MS = 500
 
   /**
    * 网格卡片的画质档（§52）。
@@ -110,6 +125,22 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
   /** 页面是否处于不可见状态（老师切到了别的标签页）。 */
   const pageHidden = ref(false)
 
+  /**
+   * 实时通道状态（由 realtime store 转达）。
+   *
+   * 只用来决定兜底快照的频率；界面上的那句提示读的是 realtime store 本身。
+   */
+  const realtimeState = ref<RealtimeConnectionState>('closed')
+
+  /**
+   * 本课堂是否已经收到 `ROOM_CLOSED`（§49）。
+   *
+   * 单独一个字段而不是从学生状态推断：课堂结束与"学生都离开了"是两件事，
+   * 界面在课堂结束时还要额外说明"画面已经释放，不需要重试媒体"。
+   * 页面重新进入（load）时清零。
+   */
+  const classroomClosed = ref(false)
+
   /* ---------------------------------------------------------------------- */
   /* 只在内存里的私有内容                                                    */
   /* ---------------------------------------------------------------------- */
@@ -132,6 +163,19 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
    */
   const visibleStudentIds = new Set<string>()
   let pollTimer: ReturnType<typeof setInterval> | null = null
+  /** 当前兜底定时器的间隔，用来判断"通道状态变了要不要重建定时器"。 */
+  let pollIntervalMs = 0
+  /** 合并事件风暴用的快照刷新定时器（见 scheduleSnapshotRefresh）。 */
+  let snapshotTimer: ReturnType<typeof setTimeout> | null = null
+  /**
+   * 已应用的事件数量。
+   *
+   * WHY 需要它：快照请求是**异步**的，一份在事件到达**之前**发出、在事件之后才回来的
+   * 响应，反映的是更早的时刻。用它去覆盖状态，就会把刚收到的事件结论（"这个人已经
+   * 下线了"）又改回旧的，老师看到的状态回滚一次（§51 最忌讳的那种"界面撒谎"）。
+   * `refresh()` 因此记住发起时的代数，回来时对不上就丢弃并安排重取。
+   */
+  let eventGeneration = 0
   let currentClassroomId: string | null = null
   /** 请求序号：晚发出的响应才能写状态。 */
   let loadSeq = 0
@@ -259,7 +303,8 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
         // 学生还在不在课堂上不是 LiveKit 能回答的问题（§51）。
         mediaConnected.value = false
         mediaError.value = '与课堂的媒体连接已经中断。请重试；重试会重新申请一次媒体凭据。'
-        if (currentClassroomId !== null) stopPolling()
+        // 刻意**不**停掉兜底快照：画面断了不代表"谁在上课"这件事不再重要，
+        // 而且它与媒体面完全独立（§33 的 Control Plane / Media Plane 分离）。
       }),
     )
   }
@@ -474,17 +519,58 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
     if (pollTimer === null) return
     clearInterval(pollTimer)
     pollTimer = null
+    pollIntervalMs = 0
   }
 
   function startPolling(): void {
-    if (pollTimer !== null || currentClassroomId === null) return
-    /**
-     * 页面隐藏时**继续**轮询：一次 GET /monitor 的成本可以忽略，而它让老师切回来时
-     * 看到的人数、徽章都是新的（订阅是另一回事，见 desiredSubscriptions）。
-     */
+    if (currentClassroomId === null) return
+    pollIntervalMs = 0
+    syncPollTimer()
+  }
+
+  /**
+   * 按实时通道状态重建兜底定时器（幂等：间隔没变就什么都不做）。
+   *
+   * 页面隐藏时**继续**轮询：一次 GET /monitor 的成本可以忽略，而它让老师切回来时
+   * 看到的人数、徽章都是新的（订阅是另一回事，见 desiredSubscriptions）。
+   */
+  function syncPollTimer(): void {
+    if (currentClassroomId === null) return
+    const interval = monitorFallbackPollMs(realtimeState.value)
+    if (pollTimer !== null && pollIntervalMs === interval) return
+    if (pollTimer !== null) clearInterval(pollTimer)
+    pollIntervalMs = interval
     pollTimer = setInterval(() => {
       void refresh()
-    }, MONITOR_POLL_MS)
+    }, interval)
+  }
+
+  /**
+   * 实时通道状态变化（由 realtime store 转达）。
+   *
+   * 通道断了 → 收紧兜底频率：这段时间里快照是唯一的信息来源，
+   * 60 秒一次的"监督数据"对正在盯屏的老师来说太旧了（见 monitorFallbackPollMs）。
+   */
+  function setRealtimeState(next: RealtimeConnectionState): void {
+    if (realtimeState.value === next) return
+    realtimeState.value = next
+    if (pollTimer !== null) syncPollTimer()
+  }
+
+  /**
+   * 安排一次（合并的）快照刷新。
+   *
+   * WHY 需要它：事件载荷是**增量**的，有几类情况只有快照能回答——
+   * 事件里出现了名单外的学生（可能刚被加入课堂）、课堂刚刚关闭（最终状态）。
+   * 直接每个事件都 refresh 会在"30 个人陆续进来"时打出 30 个请求，
+   * 所以合并到一个窗口里（最后一次事件之后 500ms 才发）。
+   */
+  function scheduleSnapshotRefresh(): void {
+    if (snapshotTimer !== null) return
+    snapshotTimer = setTimeout(() => {
+      snapshotTimer = null
+      void refresh()
+    }, SNAPSHOT_REFRESH_DEBOUNCE_MS)
   }
 
   /** 拉一次 monitor 数据并重新协调订阅（轮询与"重试"按钮共用）。 */
@@ -494,8 +580,17 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
     const seq = ++loadSeq
     loading.value = true
     try {
+      const generation = eventGeneration
       const next = await getMonitor(classroomId)
       if (seq !== loadSeq) return
+      if (generation !== eventGeneration) {
+        /**
+         * 这份快照是在某条事件之前取的：丢弃它，并重取一次。
+         * 丢弃的代价只是一次多余的请求，覆盖的代价是老师看着一个已经变化的状态做判断。
+         */
+        scheduleSnapshotRefresh()
+        return
+      }
       students.value = next
       loaded.value = true
       error.value = null
@@ -525,6 +620,180 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
     }
   }
 
+  /* ---------------------------------------------------------------------- */
+  /* 实时事件 → 业务状态增量（§47 / §51）                                     */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * 应用一条实时事件。
+   *
+   * 三条纪律，每一条都对应一次"界面撒谎"的风险：
+   *
+   * 1. **只改事件能证明的字段**。事件载荷里没有 `connection` / `joinedAt`，
+   *    就不去动它们——用默认值补出来的"正常"是假数据（§80）。
+   * 2. **名单外的学生一律忽略并记日志**，绝不凭空造一张卡片（§26/§47：
+   *    学生的存在与否只有快照说了算）。同时安排一次快照刷新，
+   *    因为"事件里有这个人、名单里没有"最常见的原因就是名单刚刚变了。
+   * 3. **订阅变化必须走协调器**（§52）：事件只改业务状态，之后调
+   *    `reconcileSubscriptions()` 让"该订谁"重新收敛。绕过协调器直接订阅/退订，
+   *    就会与可见性、Focus、页面隐藏三路输入打架。
+   */
+  function applyRealtimeEvent(event: RealtimeEvent): void {
+    switch (event.type) {
+      case 'ROOM_CLOSED':
+        if (event.data.classroomId !== currentClassroomId) return
+        onClassroomClosed()
+        return
+      case 'STUDENT_ONLINE': {
+        const { studentId, sessionId, displayName } = event.data
+        const changed = updateStudent(studentId, sessionId, 'STUDENT_ONLINE', (student) => ({
+          ...student,
+          displayName,
+          sessionId,
+          sessionStatus: 'ONLINE',
+          /**
+           * §21 的不变量：ONLINE ⇒ Screen Track 存在且在发布；§45 也要求后端
+           * 只在 `track_published(source=SCREEN_SHARE)` 之后才把会话标成 ONLINE。
+           * 因此这里把 screen.active 一起置真——不这样做的话，一个刚进入课堂的
+           * 学生会瞬间显示成 🔴「屏幕中断」，那是对老师最严重的一种谎报。
+           */
+          screen: { active: true },
+        }))
+        if (changed) void reconcileSubscriptions()
+        return
+      }
+      case 'STUDENT_OFFLINE': {
+        const { studentId, sessionId, reason } = event.data
+        const changed = updateStudent(studentId, sessionId, 'STUDENT_OFFLINE', (student) => ({
+          ...student,
+          sessionStatus: offlineStatus(reason),
+          screen: { active: false },
+          camera: { active: false },
+          microphone: { active: false },
+        }))
+        // 下线即释放订阅：协调计划会发现这个人不再满足 shouldSubscribeScreen（§52）。
+        if (changed) void reconcileSubscriptions()
+        return
+      }
+      case 'SCREEN_LOST': {
+        const data = teacherScreenData(event.data)
+        if (data === null) return
+        const { studentId, sessionId } = data
+        const changed = updateStudent(studentId, sessionId, 'SCREEN_LOST', (student) => ({
+          ...student,
+          sessionStatus: 'SCREEN_LOST',
+          screen: { active: false },
+        }))
+        if (changed) void reconcileSubscriptions()
+        return
+      }
+      case 'SCREEN_RESTORED': {
+        const data = teacherScreenData(event.data)
+        if (data === null) return
+        const { studentId, sessionId } = data
+        const changed = updateStudent(studentId, sessionId, 'SCREEN_RESTORED', (student) => ({
+          ...student,
+          sessionStatus: 'ONLINE',
+          screen: { active: true },
+        }))
+        // 恢复后如果这张卡片在视口里（或正好是 Focus），协调器会把它订回来。
+        if (changed) void reconcileSubscriptions()
+        return
+      }
+      case 'CAMERA_CHANGED': {
+        const { studentId, sessionId, active } = event.data
+        // Phase 9 才会有这个事件；这里把 DTO 里真实存在的字段更新掉，不做别的。
+        updateStudent(studentId, sessionId, 'CAMERA_CHANGED', (student) => ({
+          ...student,
+          camera: { active },
+        }))
+        return
+      }
+      case 'MIC_CHANGED': {
+        const { studentId, sessionId, active } = event.data
+        updateStudent(studentId, sessionId, 'MIC_CHANGED', (student) => ({
+          ...student,
+          microphone: { active },
+        }))
+        return
+      }
+      default:
+        // PRIVATE_TALK_* 属于 Phase 10（§31）：本 Phase 只定义类型，不处理。
+        return
+    }
+  }
+
+  /**
+   * 屏幕类事件在老师端**一定**带 `studentId`（§47 按角色给不同的 data 形状）。
+   * 不带就说明这条载荷其实是发给学生本人的，老师端没有任何可做的事——
+   * 宁可忽略，也不要用 `sessionId` 冒充 `studentId` 去猜一个人。
+   */
+  function teacherScreenData(data: ScreenStateData): TeacherScreenStateData | null {
+    return 'studentId' in data ? data : null
+  }
+
+  /**
+   * 事件 → 名单里的那一行。
+   *
+   * WHY 先按 sessionId 找、再按 studentId 找：`sessionId` 就是媒体层的 identity（§44），
+   * 屏幕类事件天然带着它；而 `STUDENT_ONLINE` 可能带来一个**新的** sessionId
+   * （学生重连后后端新建了 Session，§50），此时只能靠 studentId 认出是同一个人。
+   *
+   * 返回是否真的改动了名单——没改动时不必跑一遍订阅协调。
+   */
+  function updateStudent(
+    studentId: string,
+    sessionId: string,
+    eventLabel: string,
+    patch: (student: MonitorStudent) => MonitorStudent,
+  ): boolean {
+    const index = students.value.findIndex(
+      (student) => student.sessionId === sessionId || student.studentId === studentId,
+    )
+    if (index < 0) {
+      /**
+       * 名单里没有这个人：**忽略并记日志**，绝不凭空造卡片（§47）。
+       * 日志里只带事件类型，不带姓名/会话 id（§59 的日志纪律）。
+       * 同时安排一次快照刷新——"事件里有人、名单里没有"通常意味着名单变了，
+       * 而名单的权威只有 `GET monitor`。
+       */
+      console.warn(`[monitor] 忽略名单外学生的实时事件：${eventLabel}`)
+      scheduleSnapshotRefresh()
+      return false
+    }
+    students.value = students.value.map((student, current) =>
+      current === index ? patch(student) : student,
+    )
+    eventGeneration += 1
+    return true
+  }
+
+  /**
+   * 课堂被老师关闭（§49 的老师侧）。
+   *
+   * 媒体必须**主动**释放：LiveKit 房间会被服务端终止，等着它自己断会先在界面上
+   * 弹一句"无法看到学生画面"，而那是关课的正常结果，不是故障。
+   * 随后补一次快照，把每个学生的最终状态（ROOM_CLOSED）取回来。
+   */
+  function onClassroomClosed(): void {
+    classroomClosed.value = true
+    eventGeneration += 1
+    void teardownMedia()
+    scheduleSnapshotRefresh()
+  }
+
+  /** §12 的离线原因 → 会话状态（两者一一对应，不做额外推断）。 */
+  function offlineStatus(reason: StudentOfflineReason): StudentSessionStatus {
+    switch (reason) {
+      case 'DISCONNECTED':
+        return 'DISCONNECTED'
+      case 'LEFT':
+        return 'LEFT'
+      case 'ROOM_CLOSED':
+        return 'ROOM_CLOSED'
+    }
+  }
+
   function isFocusedStudent(student: MonitorStudent): boolean {
     return student.studentId === focusedStudentId.value
   }
@@ -537,6 +806,7 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
    */
   async function load(classroomId: string): Promise<void> {
     currentClassroomId = classroomId
+    classroomClosed.value = false
     await ensureMediaConnected(classroomId)
     await refresh()
     startPolling()
@@ -582,6 +852,10 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
    */
   async function stop(): Promise<void> {
     stopPolling()
+    if (snapshotTimer !== null) {
+      clearTimeout(snapshotTimer)
+      snapshotTimer = null
+    }
     await teardownMedia()
     currentClassroomId = null
     students.value = []
@@ -591,6 +865,7 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
     loading.value = false
     focusedStudentId.value = null
     pageHidden.value = false
+    classroomClosed.value = false
     visibleStudentIds.clear()
   }
 
@@ -611,6 +886,8 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
     focusedStudentId,
     focusedStudent,
     pageHidden,
+    realtimeState,
+    classroomClosed,
     badgeOf,
     tileStateOf,
     mediaStateOf,
@@ -619,6 +896,8 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
     setStudentVisible,
     setFocusedStudent,
     setPageHidden,
+    setRealtimeState,
+    applyRealtimeEvent,
     load,
     refresh,
     retryMedia,

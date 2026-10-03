@@ -13,6 +13,8 @@
  * 一个刷新就会归零。
  */
 
+import type { RealtimeConnectionState } from '@classwatch/api-client'
+
 /**
  * 前端会话阶段。
  *
@@ -107,15 +109,22 @@ export function describeSessionPhase(phase: MediaSessionPhase): SessionPhaseDisp
 }
 
 /**
- * 课堂状态轮询间隔（§49 学生侧）。
+ * 课堂状态的**兜底轮询**间隔（§49 学生侧；Phase 8 起实时通道才是主路径）。
  *
- * 15 秒的理由：老师关课堂是**低频**事件，学生晚 15 秒看到提示完全可以接受；
- * 而更短（例如 3 秒）会让每个在线学生每秒都在打后端——一个 30 人的班就是
- * 每秒 10 个请求，只为了一个几分钟才发生一次的事件。
+ * WHY 还要留轮询：WebSocket 会断（网络切换、服务端重启、代理超时）。断线期间
+ * 学生必须仍然能发现"老师已经关闭本课堂"——否则他会一直共享着一块没人看的屏幕，
+ * 而这是本系统里学生侧最糟糕的状态。§47 的实时通道是**快**，兜底轮询负责**不漏**。
  *
- * WHY 用轮询而不是"更好的办法"：Phase 6 还没有 WebSocket（§47 的 Business
- * Realtime 属 Phase 8）。这里刻意做成**可替换的一层**（`startClassroomWatch` /
- * `stopClassroomWatch`），Phase 8 接入 WebSocket 后整个定时器会被删掉，
- * 而不是"再加一条推送路径"。
+ * 两档而不是一档：
+ * - 实时通道正常时 60 秒一次：事件已经覆盖了几乎所有情况，轮询只用来兜住
+ *   "服务端漏发/事件丢失"这种罕见情况，频率必须足够低才不会变成事实上的轮询系统；
+ * - 实时通道断开时收紧到 30 秒：这段时间里**只有**轮询能发现关课，
+ *   60 秒的延迟对"还在被共享屏幕"的学生来说太久了。
  */
-export const CLASSROOM_STATUS_POLL_MS = 15_000
+export const CLASSROOM_FALLBACK_POLL_MS = 60_000
+export const CLASSROOM_DEGRADED_POLL_MS = 30_000
+
+/** 按实时通道状态挑一个兜底间隔（`open` 以外的一切都按降级处理）。 */
+export function classroomFallbackPollMs(realtime: RealtimeConnectionState): number {
+  return realtime === 'open' ? CLASSROOM_FALLBACK_POLL_MS : CLASSROOM_DEGRADED_POLL_MS
+}
