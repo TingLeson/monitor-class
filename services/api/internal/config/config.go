@@ -230,11 +230,13 @@ type Config struct {
 	// WSMaxConnectionsPerIP caps CONCURRENT business sockets per client address.
 	//
 	// WHY a concurrency cap in addition to a handshake rate limit: one browser
-	// open on one classroom needs one socket, and a legitimate classroom is not
-	// behind one NAT address — but a school is. A rate limit alone still allows an
-	// attacker (or a broken reconnect loop) to accumulate thousands of
-	// simultaneously open sockets, each with a goroutine and a writer queue. The
-	// cap bounds the resource; the rate limit bounds the churn.
+	// open on one classroom needs one socket, and a **whole classroom usually sits
+	// behind one NAT address** (measured in Phase 12: 30 students + 1 teacher shared
+	// one public IP). A rate limit alone still allows an attacker (or a broken
+	// reconnect loop) to accumulate thousands of simultaneously open sockets, each
+	// with a goroutine and a writer queue. The cap bounds the resource; the rate
+	// limit bounds the churn. See docs/development/performance-test.md §9 for why
+	// this must eventually be counted per account rather than per address.
 	WSMaxConnectionsPerIP int
 
 	// Windows of the pre-existing limiters. They are configuration because
@@ -443,7 +445,15 @@ const (
 	defaultRateLimitMediaToken    = 20
 	defaultRateLimitJoin          = 60
 	defaultRateLimitWSHandshake   = 60
-	defaultWSMaxConnectionsPerIP  = 16
+	// Phase 12 压测把这个默认值从 16 提到 64。
+	//
+	// WHY：一间教室（甚至一所学校）通常只有**一个 NAT 出口**，30~60 个学生共享一个公网 IP。
+	// 按 IP 计数 16 条并发，等价于"第 17 个进教室的学生连不上实时通道"——
+	// 实测 20 条并发里 16 成功 4 被 429。上限的作用是防止单地址堆积成千上万条 socket
+	// （每条一个 goroutine + 写队列），64 仍然把资源绑得很紧，而一个班不再被误伤。
+	// 真正的粒度问题（老师与全班挤同一个桶）留给"按账号计数 + IP 只做粗粒度防洪"，
+	// 已记入 docs/development/performance-test.md §9。
+	defaultWSMaxConnectionsPerIP = 64
 )
 
 // ApplyDefaults fills every Phase 11 transport/limit field that is still zero.

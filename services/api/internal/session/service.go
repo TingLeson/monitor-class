@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -562,6 +563,30 @@ func (s *Service) Monitor(ctx context.Context, classroomID, teacherID uuid.UUID)
 		if !session.Status.Terminal() {
 			if next, changed := nextStatus(session.Status, present, tracks.ScreenShare); changed {
 				updated, err := s.repo.ApplyObservation(ctx, changeFor(session, next, tracks.ScreenShare))
+				if err != nil && isRequestGone(err) {
+					// 请求被取消（调用方放弃 / 我们自己的时间预算用完）**不是**服务端故障。
+					//
+					// WHY 单独处理，而不是像下面那样返回 500：Phase 12 压测里，一次 monitor
+					// 轮询在 30 人规模下偶尔会拖过调用方的 20s 超时，于是数据库写入拿到
+					// context canceled，而它被翻译成 INTERNAL/500 —— 错误率指标立刻被
+					// "调用方走了"污染，真正的故障会淹没在噪音里（实测 70 条）。
+					//
+					// 这一轮**不推进状态**、按数据库里的既有状态渲染：观测结果宁可不落地，
+					// 也不能让界面显示一个数据库里没有的迁移（否则老师会看到 ONLINE，
+					// 刷新一下又变回 CONNECTING）。调用方通常已经收不到这个响应了，
+					// 所以这样做的价值在于日志与指标说的是实话。
+					logging.FromContext(ctx).Warn("observation not persisted: the request is already gone",
+						"action", "monitor_observation_canceled",
+						logging.FieldUserID, session.StudentID.String(),
+						logging.FieldClassroomID, classroomID.String(),
+						logging.FieldRunID, run.ID.String(),
+						logging.FieldSessionID, session.ID.String(),
+						"would_have_been", string(next),
+						"error", err,
+					)
+					view = append(view, monitorStudentOf(entry, present, tracks))
+					continue
+				}
 				if err != nil {
 					// The observation could not be recorded. Failing the read keeps the
 					// wall from showing a transition the database does not have: the
@@ -822,6 +847,18 @@ func changeFor(session StudentSession, to Status, screen bool) ObservationChange
 //     live screen on a session that is over. A participant can linger in the room for a
 //     few seconds after a leave (the removal is best effort), and rendering that would
 //     make the wall contradict its own status.
+//
+// isRequestGone reports whether an error is the request context being canceled or
+// hitting its deadline, rather than a real failure of the operation itself.
+//
+// WHY it matters for the monitor path: the teacher's wall polls on a timer and the
+// caller gives up after its own timeout. That produces `context canceled` deep inside
+// a database write. Reporting it as a server error would make the error rate depend on
+// how patient the caller was, which is exactly backwards.
+func isRequestGone(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 func monitorStudentOf(entry RosterEntry, present bool, tracks media.ParticipantTracks) MonitorStudent {
 	student := MonitorStudent{
 		StudentID:   entry.StudentID,

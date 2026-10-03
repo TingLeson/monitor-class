@@ -1301,6 +1301,48 @@ func TestMonitorReportsTheObservedMedia(t *testing.T) {
 	}
 }
 
+// TestMonitorDoesNotTurnACanceledRequestIntoAServerError 是 Phase 12 压测发现的回归测试。
+//
+// 30 人规模下单次轮询偶尔会拖过调用方的超时，数据库写入随即拿到 context canceled。
+// 早期实现把它包装成普通错误 → 处理器回 500 INTERNAL，错误率指标立刻被"调用方走了"
+// 污染（实测 70 条，duration_ms 恰好落在 19991~20005ms）。正确行为是：本轮不推进状态，
+// 按数据库里的既有状态回答，且**不**报错。
+func TestMonitorDoesNotTurnACanceledRequestIntoAServerError(t *testing.T) {
+	h := newHarness(t)
+	session := h.repo.seed(h.runID, h.studentID, StatusConnecting, "学生 A")
+	h.media.observed[session.LiveKitIdentity] = media.ParticipantTracks{ScreenShare: true}
+	h.repo.observeErr = context.Canceled
+
+	view, err := h.service.Monitor(context.Background(), h.classroomID, h.teacherID)
+	if err != nil {
+		t.Fatalf("Monitor(): %v, want nil (a canceled request is not a server error)", err)
+	}
+	student := view.Students[0]
+	if student.Status == nil || *student.Status != StatusConnecting {
+		t.Errorf("status = %v, want CONNECTING: the unpersisted transition must not be shown", student.Status)
+	}
+	if h.repo.sessions[session.ID].Status != StatusConnecting {
+		t.Errorf("stored status = %s, want CONNECTING (nothing may be persisted)", h.repo.sessions[session.ID].Status)
+	}
+	// 无状态迁移时不会调用写路径之外的任何东西：观察仍然被读出来并如实上报连接质量。
+	if student.Connection != ConnectionGood {
+		t.Errorf("connection = %s, want GOOD from the observation", student.Connection)
+	}
+}
+
+// A deadline is the same class of event as a cancellation: our own budget ran out,
+// not the database's fault. It must be handled identically.
+func TestMonitorDoesNotTurnADeadlineIntoAServerError(t *testing.T) {
+	h := newHarness(t)
+	session := h.repo.seed(h.runID, h.studentID, StatusConnecting, "学生 A")
+	h.media.observed[session.LiveKitIdentity] = media.ParticipantTracks{ScreenShare: true}
+	h.repo.observeErr = context.DeadlineExceeded
+
+	if _, err := h.service.Monitor(context.Background(), h.classroomID, h.teacherID); err != nil {
+		t.Fatalf("Monitor(): %v, want nil for a deadline that is our own budget", err)
+	}
+}
+
 // TestMonitorWithoutAParticipantIsNotOnline is the "no fake participant" acceptance
 // rule: a session whose participant was never seen is CONNECTING or DISCONNECTED, and
 // never ONLINE.
