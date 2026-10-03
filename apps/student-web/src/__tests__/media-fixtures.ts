@@ -28,7 +28,11 @@ export interface FakePublisherRoom {
   readonly connectCalls: number
   /** 发布过的屏幕轨道，按顺序排列。 */
   readonly publishedTracks: MediaStreamTrack[]
+  /** 发布过的摄像头轨道（§24）。与屏幕**分开记**：两条轨道必须独立开关。 */
+  readonly publishedCameraTracks: MediaStreamTrack[]
   readonly unpublishCalls: number
+  /** 撤下摄像头的次数（断言"关闭 = unpublish + stop"里的前一半）。 */
+  readonly unpublishCameraCalls: number
   readonly disconnectCalls: number
   /**
    * 让接下来的 connect / publish 失败。
@@ -38,6 +42,8 @@ export interface FakePublisherRoom {
    */
   connectError: Error | null
   publishError: Error | null
+  /** 发布摄像头时的失败开关（与屏幕分开：摄像头失败不能污染屏幕那条路径）。 */
+  publishCameraError: Error | null
   emitQuality(quality: ConnectionQualityLevel): void
   emitDisconnected(reason?: MediaDisconnectReason): void
   emitReconnecting(): void
@@ -53,6 +59,7 @@ export interface PublisherRoomHarness {
   readonly flags: {
     connectError: Error | null
     publishError: Error | null
+    publishCameraError: Error | null
     /**
      * 让 publish 在"成功"的同时把轨道结束掉。
      *
@@ -79,6 +86,7 @@ export function installFakePublisherRoom(
   const flags = {
     connectError: options.connectError ?? null,
     publishError: options.publishError ?? null,
+    publishCameraError: null as Error | null,
     endTrackOnPublish: false,
   }
 
@@ -104,6 +112,7 @@ export function installFakePublisherRoom(
 function makeFakePublisherRoom(flags: {
   connectError: Error | null
   publishError: Error | null
+  publishCameraError: Error | null
   endTrackOnPublish: boolean
 }): FakePublisherRoom {
   const qualityListeners: ((quality: ConnectionQualityLevel) => void)[] = []
@@ -112,8 +121,10 @@ function makeFakePublisherRoom(flags: {
   const reconnectedListeners: (() => void)[] = []
 
   const publishedTracks: MediaStreamTrack[] = []
+  const publishedCameraTracks: MediaStreamTrack[] = []
   let connectCalls = 0
   let unpublishCalls = 0
+  let unpublishCameraCalls = 0
   let disconnectCalls = 0
   let quality: ConnectionQualityLevel = 'good'
 
@@ -132,6 +143,15 @@ function makeFakePublisherRoom(flags: {
       },
       unpublishScreenTrack(): Promise<void> {
         unpublishCalls += 1
+        return Promise.resolve()
+      },
+      publishCameraTrack(track: MediaStreamTrack): Promise<void> {
+        if (flags.publishCameraError) return Promise.reject(flags.publishCameraError)
+        publishedCameraTracks.push(track)
+        return Promise.resolve()
+      },
+      unpublishCameraTrack(): Promise<void> {
+        unpublishCameraCalls += 1
         return Promise.resolve()
       },
       disconnect(): Promise<void> {
@@ -160,8 +180,12 @@ function makeFakePublisherRoom(flags: {
       return connectCalls
     },
     publishedTracks,
+    publishedCameraTracks,
     get unpublishCalls() {
       return unpublishCalls
+    },
+    get unpublishCameraCalls() {
+      return unpublishCameraCalls
     },
     get disconnectCalls() {
       return disconnectCalls
@@ -177,6 +201,12 @@ function makeFakePublisherRoom(flags: {
     },
     set publishError(next: Error | null) {
       flags.publishError = next
+    },
+    get publishCameraError() {
+      return flags.publishCameraError
+    },
+    set publishCameraError(next: Error | null) {
+      flags.publishCameraError = next
     },
     emitQuality(next) {
       quality = next

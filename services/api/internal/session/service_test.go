@@ -605,9 +605,11 @@ func TestJoinRejectsNilIdentifiers(t *testing.T) {
 	}
 }
 
-// TestJoinSuccessMintsScreenOnlyToken is the §28 assertion: identity is the session
-// id, the room is the run's opaque room, and the only publishable source is the screen.
-func TestJoinSuccessMintsScreenOnlyToken(t *testing.T) {
+// TestJoinSuccessMintsScreenAndCameraToken is the §28/§75 assertion: identity is the
+// session id, the room is the run's opaque room, and the publishable sources are the
+// screen (mandatory, §21) and the camera (optional, §24) — and NOT the microphone, which
+// is Phase 10 (§76).
+func TestJoinSuccessMintsScreenAndCameraToken(t *testing.T) {
 	h := newHarness(t)
 	result := h.join(t)
 
@@ -642,7 +644,7 @@ func TestJoinSuccessMintsScreenOnlyToken(t *testing.T) {
 		t.Errorf("token ttl = %s, want %s", req.TTL, h.cfg.TokenTTL)
 	}
 	if !req.CanPublish {
-		t.Error("canPublish = false, want true (§28: a student publishes their screen)")
+		t.Error("canPublish = false, want true (§28: a student publishes their screen and camera)")
 	}
 	if !req.CanSubscribe {
 		t.Error("canSubscribe = false, want true (§28: the teacher's private audio needs it)")
@@ -650,8 +652,24 @@ func TestJoinSuccessMintsScreenOnlyToken(t *testing.T) {
 	if req.CanPublishData {
 		t.Error("canPublishData = true, want false (§47: business messages are not on the data channel)")
 	}
-	if len(req.PublishSources) != 1 || req.PublishSources[0] != media.PublishScreenShare {
-		t.Errorf("publish sources = %v, want [SCREEN_SHARE] only (§72)", req.PublishSources)
+	// The grant is asserted as an exact list, in order: §28's screen first (mandatory)
+	// and camera second (§75, optional), and NOTHING else. A missing microphone is the
+	// assertion that matters most here — it is the source Phase 10 adds together with its
+	// event path, and granting it early would let a client publish media no part of the
+	// control plane observes (§33/§76).
+	want := []media.PublishSource{media.PublishScreenShare, media.PublishCamera}
+	if len(req.PublishSources) != len(want) {
+		t.Fatalf("publish sources = %v, want exactly %v", req.PublishSources, want)
+	}
+	for i := range want {
+		if req.PublishSources[i] != want[i] {
+			t.Fatalf("publish sources = %v, want %v", req.PublishSources, want)
+		}
+	}
+	for _, source := range req.PublishSources {
+		if source == media.PublishMicrophone {
+			t.Fatal("the student token may publish a microphone: that is Phase 10 (§76)")
+		}
 	}
 }
 
@@ -921,6 +939,14 @@ func TestTeacherTokenGrantsMicrophoneOnly(t *testing.T) {
 	if len(req.PublishSources) != 1 || req.PublishSources[0] != media.PublishMicrophone {
 		t.Errorf("publish sources = %v, want [MICROPHONE] only (§27)", req.PublishSources)
 	}
+	// Phase 9 does not touch this grant: §27 gives the teacher no camera in V1, and a
+	// camera in the media room would only be a tile of the teacher on the teacher's own
+	// wall.
+	for _, source := range req.PublishSources {
+		if source == media.PublishCamera {
+			t.Fatal("the teacher token may publish a camera: §27 forbids it in V1")
+		}
+	}
 	// The room must exist before the teacher connects.
 	if len(h.media.ensureCalls) != 1 {
 		t.Errorf("EnsureRoom calls = %v, want 1", h.media.ensureCalls)
@@ -1074,8 +1100,10 @@ func TestMonitorWritesTheFirstTimestamps(t *testing.T) {
 }
 
 // TestMonitorReportsTheObservedMedia is the §51 DTO assertion: screen/camera/mic come
-// from the media plane, and Phase 6 only ever sets screen (camera and microphone are
-// observed so the fields cannot go stale).
+// from the SAME media-plane observation the state machine uses. From Phase 9 the camera
+// can be true next to any non-terminal status (§24: a camera says nothing about being
+// online), the microphone stays false until Phase 10 (§76), and the fields are read from
+// the observation rather than derived from the status, so they cannot go stale.
 func TestMonitorReportsTheObservedMedia(t *testing.T) {
 	h := newHarness(t)
 	session := h.repo.seed(h.runID, h.studentID, StatusOnline, "学生 A")

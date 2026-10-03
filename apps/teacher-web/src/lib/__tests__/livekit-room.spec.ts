@@ -331,7 +331,7 @@ describe('LiveKit 适配层（老师端）', () => {
     expect(track.detach).toHaveBeenCalledWith(element)
   })
 
-  it('参与者事件驱动订阅协调：加入/离开、屏幕轨道的发布与取消都会通知', () => {
+  it('参与者事件驱动订阅协调：加入/离开、屏幕与摄像头轨道的发布与取消都会通知', () => {
     const room = createLiveKitMonitorRoom(CREDENTIALS)
     let changes = 0
     room.onParticipantsChanged(() => {
@@ -349,27 +349,56 @@ describe('LiveKit 适配层（老师端）', () => {
     emit('trackUnpublished', makePublication('TR_screen', 'screen_share'), {
       identity: 'session-1',
     })
-    // 摄像头/麦克风事件与本 Phase 无关（§54）：不通知，免得白白重建订阅。
+    /**
+     * §24：摄像头轨道同样要通知。`CAMERA_CHANGED` 是业务事件，它到达时这条 publication
+     * 可能还没出现在老师端（webhook 比 SFU 快），所以"轨道到了"这一下必须能触发协调——
+     * 否则画中画要等下一次快照（60 秒）才出现。
+     */
     emit('trackPublished', makePublication('TR_camera', 'camera'), {
       identity: 'session-2',
       trackPublications: new Map([['TR_camera', makePublication('TR_camera', 'camera')]]),
     })
+    emit('trackUnpublished', makePublication('TR_camera', 'camera'), { identity: 'session-2' })
+    // 麦克风仍然不筛进来：音频属于 Phase 10（§54），通知了只会白白重建一轮订阅。
+    emit('trackPublished', makePublication('TR_mic', 'microphone'), {
+      identity: 'session-3',
+      trackPublications: new Map(),
+    })
 
-    expect(changes).toBe(4)
+    expect(changes).toBe(6)
   })
 
-  it('订阅上下线事件把 identity 交给调用方（卡片据此更新媒体状态）', () => {
+  it('屏幕轨道的订阅上下线事件把 identity 交给调用方（卡片据此更新媒体状态）', () => {
     const room = createLiveKitMonitorRoom(CREDENTIALS)
     const subscribed: string[] = []
     const unsubscribed: string[] = []
     room.onScreenSubscribed((identity) => subscribed.push(identity))
     room.onScreenUnsubscribed((identity) => unsubscribed.push(identity))
 
-    emit('trackSubscribed', {}, {}, { identity: 'session-1' })
-    emit('trackUnsubscribed', {}, {}, { identity: 'session-2' })
+    emit('trackSubscribed', {}, makePublication('TR_s1', 'screen_share'), { identity: 'session-1' })
+    emit('trackUnsubscribed', {}, makePublication('TR_s2', 'screen_share'), {
+      identity: 'session-2',
+    })
 
     expect(subscribed).toEqual(['session-1'])
     expect(unsubscribed).toEqual(['session-2'])
+  })
+
+  it('摄像头轨道的订阅上下线**不得**惊动屏幕监听器（§21：摄像头 optional，屏幕 mandatory）', () => {
+    // 回归测试：房间级的 TrackSubscribed/TrackUnsubscribed 对**每一条**轨道都触发，
+    // 早期实现没有按 source 过滤，于是"学生关掉摄像头"会把老师端卡片的**屏幕**订阅
+    // 一起丢掉——卡片只剩"正在订阅画面…"，而业务徽章仍是 🟢（真机复现过）。
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    const subscribed: string[] = []
+    const unsubscribed: string[] = []
+    room.onScreenSubscribed((identity) => subscribed.push(identity))
+    room.onScreenUnsubscribed((identity) => unsubscribed.push(identity))
+
+    emit('trackSubscribed', {}, makePublication('TR_cam', 'camera'), { identity: 'session-1' })
+    emit('trackUnsubscribed', {}, makePublication('TR_cam', 'camera'), { identity: 'session-1' })
+
+    expect(subscribed).toEqual([])
+    expect(unsubscribed).toEqual([])
   })
 
   it('disconnect 会取消所有订阅并断开连接', async () => {
@@ -383,6 +412,138 @@ describe('LiveKit 适配层（老师端）', () => {
     await room.disconnect()
 
     expect(screen.subscribedCalls).toEqual([true, false])
+    expect(lk.disconnectCalls).toEqual([true])
+  })
+
+  /* ------------------------------------------------------------------------ */
+  /* §24：摄像头订阅（Phase 9）                                               */
+  /* ------------------------------------------------------------------------ */
+
+  it('§24/§52：subscribeCamera 手动订阅摄像头轨道，画质固定 LOW 并挂在 setSubscribed 之后', async () => {
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    const camera = makePublication('TR_camera', 'camera')
+    joinParticipant('session-1', [camera])
+
+    const pending = room.subscribeCamera('session-1')
+
+    expect(camera.subscribedCalls).toEqual([true])
+    // VideoQuality.LOW = 0：画中画是小窗，§52 的"网格优先低分辨率"在这里更极端。
+    expect(camera.qualityCalls).toEqual([0])
+    expect(camera.droppedQualityCalls).toEqual([])
+
+    deliverTrack(camera)
+    const subscription = await pending
+    expect(subscription?.identity).toBe('session-1')
+
+    const element = { srcObject: null } as unknown as HTMLVideoElement
+    const detach = subscription?.attach(element)
+    const track = camera.track as {
+      attach: ReturnType<typeof vi.fn>
+      detach: ReturnType<typeof vi.fn>
+    }
+    expect(track.attach).toHaveBeenCalledWith(element)
+    detach?.()
+    expect(track.detach).toHaveBeenCalledWith(element)
+  })
+
+  it('§24：同一个 participant 重复订阅摄像头不会再次 setSubscribed（十秒一轮的刷新不成风暴）', async () => {
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    const camera = makePublication('TR_camera', 'camera')
+    joinParticipant('session-1', [camera])
+    const first = room.subscribeCamera('session-1')
+    deliverTrack(camera)
+    await first
+
+    const second = await room.subscribeCamera('session-1')
+
+    expect(camera.subscribedCalls).toEqual([true])
+    expect(second?.identity).toBe('session-1')
+  })
+
+  it('§24：学生没有发布摄像头 → 返回 null（界面不画小窗，也不报错）', async () => {
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    joinParticipant('session-1', [makePublication('TR_screen', 'screen_share')])
+
+    expect(await room.subscribeCamera('session-1')).toBeNull()
+    expect(await room.subscribeCamera('nobody')).toBeNull()
+  })
+
+  it('§24：摄像头与屏幕是两条独立订阅，退掉一条不影响另一条', async () => {
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    const screen = makePublication('TR_screen', 'screen_share')
+    const camera = makePublication('TR_camera', 'camera')
+    joinParticipant('session-1', [screen, camera])
+    const screenPending = room.subscribeScreen('session-1')
+    const cameraPending = room.subscribeCamera('session-1')
+    deliverTrack(screen)
+    deliverTrack(camera)
+    await screenPending
+    await cameraPending
+
+    await room.unsubscribeCamera('session-1')
+
+    expect(camera.subscribedCalls).toEqual([true, false])
+    // 屏幕那条一次都没有被碰过（Phase 9 最要盯的性质）。
+    expect(screen.subscribedCalls).toEqual([true])
+
+    // 反过来也一样：重新订上摄像头，再退掉屏幕，摄像头不受影响。
+    const cameraAgain = room.subscribeCamera('session-1')
+    await cameraAgain
+    await room.unsubscribeScreen('session-1')
+
+    expect(camera.subscribedCalls).toEqual([true, false, true])
+    expect(screen.subscribedCalls).toEqual([true, false])
+  })
+
+  it('§24：参与者离开时本地摄像头订阅被清掉，并把画面从元素上摘下来', async () => {
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    // 事件的接线在 onParticipantsChanged 里（store 就是这么装的）。
+    room.onParticipantsChanged(() => undefined)
+    const camera = makePublication('TR_camera', 'camera')
+    joinParticipant('session-1', [camera])
+    const pending = room.subscribeCamera('session-1')
+    deliverTrack(camera)
+    const subscription = await pending
+    const element = { srcObject: null } as unknown as HTMLVideoElement
+    subscription?.attach(element)
+    const track = camera.track as { detach: ReturnType<typeof vi.fn> }
+
+    emit('participantDisconnected', { identity: 'session-1' })
+
+    // 画面被摘下来，本地记录也没了——否则卡片右下角会停着最后一帧。
+    expect(track.detach).toHaveBeenCalledWith(element)
+    const again = await room.subscribeCamera('session-1')
+    expect(again).not.toBe(subscription)
+  })
+
+  it('§24：摄像头轨道被取消发布 → 本地订阅记录被清掉（学生关了摄像头）', async () => {
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    room.onParticipantsChanged(() => undefined)
+    const camera = makePublication('TR_camera', 'camera')
+    joinParticipant('session-1', [camera])
+    const pending = room.subscribeCamera('session-1')
+    deliverTrack(camera)
+    const subscription = await pending
+    const element = { srcObject: null } as unknown as HTMLVideoElement
+    subscription?.attach(element)
+    const track = camera.track as { detach: ReturnType<typeof vi.fn> }
+
+    emit('trackUnpublished', camera, { identity: 'session-1' })
+
+    expect(track.detach).toHaveBeenCalledWith(element)
+  })
+
+  it('disconnect 会把摄像头订阅一起取消（一条下行都不留）', async () => {
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    const camera = makePublication('TR_camera', 'camera')
+    joinParticipant('session-1', [camera])
+    const pending = room.subscribeCamera('session-1')
+    deliverTrack(camera)
+    await pending
+
+    await room.disconnect()
+
+    expect(camera.subscribedCalls).toEqual([true, false])
     expect(lk.disconnectCalls).toEqual([true])
   })
 })

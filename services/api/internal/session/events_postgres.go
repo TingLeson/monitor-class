@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 
@@ -177,6 +178,132 @@ func (p *Postgres) ApplyTransition(ctx context.Context, t Transition) (*Transiti
 		return nil, err
 	}
 	return result, nil
+}
+
+// ApplyTrackState appends the event row of one observed on/off state (§24/§75) unless the
+// event log already implies that state.
+//
+// # The whole idempotency rule, in one place
+//
+// The camera has no status column (see TrackStateChange), so the compare-and-set of
+// ApplyTransition is replaced by a compare-and-set over the EVENT LOG:
+//
+//	INSERT ... WHERE NOT EXISTS (<a row of this type for this publication>)
+//	              AND <the newest row of the pair is not already this state>
+//
+// Both halves are needed and they answer different deliveries:
+//
+//   - the FIRST half is the retry guard. "publish(A) → unpublish(A) → retry of publish(A)"
+//     must not turn a camera that is off back on, and the retry carries the same track sid
+//     as the publication that was already recorded and already stopped.
+//   - the SECOND half is the state guard, for deliveries that carry no track (or a track
+//     the log has never seen): a `track_unpublished` that arrives before its
+//     `track_published` describes a state the log already implies (the default is off,
+//     §24 makes the camera opt-in), so it writes nothing — and the late publication then
+//     writes CAMERA_STARTED, which is the true end state. This is the same discipline as
+//     §22's out-of-order screen unpublish.
+//
+// # Why a transaction and an advisory lock
+//
+// "Read the newest row, then insert" is a lost-update race: two webhooks for the same
+// session (a student clicking the camera off and on again) are handled by two goroutines,
+// and both could read "off" and both insert CAMERA_STARTED. The lock is transaction-scoped
+// and keyed by the SESSION, so it serialises exactly the deliveries that can conflict and
+// costs nothing for other sessions. It is released by the COMMIT/ROLLBACK below.
+//
+// # Why the statement also checks the session status
+//
+// A late `track_published(CAMERA)` for a session that has already LEFT must not append
+// history (the state machine's terminal rule, §74). The EXISTS clause is defence in depth
+// behind the processor's own check: the processor reads the status first, and this clause
+// closes the window in which the status changed in between.
+func (p *Postgres) ApplyTrackState(ctx context.Context, change TrackStateChange) (TrackStateApplied, error) {
+	if p == nil || p.pool == nil {
+		return false, errors.New("session: repository is not connected")
+	}
+	if change.SessionID == uuid.Nil {
+		return false, errors.New("session: a session id is required to record a track state")
+	}
+	if change.On == "" || change.Off == "" {
+		return false, errors.New("session: a track state needs both event types")
+	}
+
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, trackStateLockKey(change.SessionID)); err != nil {
+		return false, err
+	}
+
+	// $2/$3 are the two event types of the pair, $4 the state being recorded, $5 the
+	// publication, $6 the payload and $7 the state to assume when no row exists yet —
+	// which is always the OFF type, because both the camera (§24) and the microphone
+	// (§25) are opt-in.
+	//
+	// The session row is read once and used twice: its status is the terminal-session
+	// guard, and its identifiers are copied into the payload the way every other event row
+	// carries them (see withSessionContext — an operator grepping one row out of a log dump
+	// should not need a join to see which run it belonged to, §13/§59).
+	target := change.Off
+	assumed := change.Off
+	if change.Active {
+		target = change.On
+	}
+	query := `
+		INSERT INTO session_events (session_id, type, payload)
+		SELECT ss.id, $4,
+		       $6::jsonb || jsonb_build_object(
+		           'runId', ss.classroom_run_id::text,
+		           'studentId', ss.student_id::text)
+		  FROM student_sessions ss
+		 WHERE ss.id = $1
+		   AND ss.status NOT IN ('LEFT', 'ROOM_CLOSED')
+		   AND NOT EXISTS (
+		           SELECT 1 FROM session_events
+		            WHERE session_id = $1 AND type = $4 AND payload->>'trackSid' = $5
+		       )
+		   AND COALESCE((
+		           SELECT type FROM session_events
+		            WHERE session_id = $1 AND type IN ($2, $3)
+		            ORDER BY created_at DESC, id DESC
+		            LIMIT 1
+		       ), $7) <> $4
+		RETURNING id`
+
+	var recorded uuid.UUID
+	err = tx.QueryRow(ctx, query,
+		change.SessionID, string(change.On), string(change.Off), string(target),
+		change.TrackSid, jsonPayload(change.Payload), string(assumed),
+	).Scan(&recorded)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Nothing to record: the delivery is a duplicate, describes the state the log
+		// already implies, or arrived for a session that is over. Not an error, and
+		// deliberately not a second row (§74).
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if err != nil {
+		return false, translateWriteError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// trackStateLockKey derives the per-session advisory lock key for ApplyTrackState.
+//
+// WHY the first eight bytes of the session UUID and not a hash function: the key only has
+// to be stable and unique enough to separate sessions, the UUID already IS a random
+// 128-bit value, and taking half of it needs no function, no dependency and no collision
+// argument beyond "the same session always takes the same lock".
+func trackStateLockKey(sessionID uuid.UUID) int64 {
+	return int64(binary.BigEndian.Uint64(sessionID[:8]))
 }
 
 // CloseRunSessions marks every active session of a run ROOM_CLOSED (§49/§45).

@@ -231,24 +231,40 @@ func (p *Processor) participantGone(ctx context.Context, ev *livekit.WebhookEven
 
 // trackPublished handles track_published (§45).
 //
-// This is the ONLY observation that turns a session ONLINE, and only for a
-// SCREEN_SHARE track: §21 makes "online" mean "being screen-shared", so a camera or a
-// microphone published by a future phase must not be able to produce it (Phase 9/10
-// will handle those sources with their own events).
+// The source decides which half of the runtime path runs, and the split is the whole
+// point of §21/§24:
+//
+//   - SCREEN_SHARE is the ONLY observation that can turn a session ONLINE (see
+//     screenPublished).
+//   - CAMERA is the student's optional second track (§75). It is recorded and announced
+//     to the owner teacher, and it must not touch the session status at all — a student
+//     who turns their camera on while their screen is lost stays SCREEN_LOST, because
+//     §21 makes the SCREEN the mandatory track and a camera is not a substitute.
+//   - anything else (today: the microphone of Phase 10) is logged and dropped.
 func (p *Processor) trackPublished(ctx context.Context, ev *livekit.WebhookEvent, room, identity string) error {
-	source := ev.GetTrack().GetSource()
-	if source != livekit.TrackSource_SCREEN_SHARE {
-		// Deliberately Quiet: in Phase 8 nothing but a screen track is publishable by
-		// a student token, and Phase 9/10 will add the camera and microphone here.
-		logging.FromContext(ctx).Debug("non-screen track published; session state unchanged",
+	switch ev.GetTrack().GetSource() {
+	case livekit.TrackSource_SCREEN_SHARE:
+		return p.screenPublished(ctx, ev, room, identity)
+	case livekit.TrackSource_CAMERA:
+		return p.cameraObserved(ctx, ev, room, identity, true)
+	default:
+		// Deliberately Quiet: Phase 9 grants a student token the camera as well as the
+		// screen, so the only source that still lands here is the microphone of Phase 10
+		// (§76) — a non-event today, not an incident.
+		logging.FromContext(ctx).Debug("track source without a session rule; session state unchanged",
 			"action", "track_published_ignored",
 			"room", room,
-			"track_source", source.String(),
+			"track_source", ev.GetTrack().GetSource().String(),
 			"track_sid", ev.GetTrack().GetSid(),
 		)
 		return nil
 	}
+}
 
+// screenPublished is the §45/§21 rule: an observed SCREEN_SHARE track is what makes a
+// session ONLINE, and nothing else is.
+func (p *Processor) screenPublished(ctx context.Context, ev *livekit.WebhookEvent, room, identity string) error {
+	source := ev.GetTrack().GetSource()
 	stored, err := p.lookup(ctx, room, identity, ev)
 	if err != nil || stored == nil {
 		return err
@@ -318,25 +334,37 @@ func (p *Processor) trackPublished(ctx context.Context, ev *livekit.WebhookEvent
 	return nil
 }
 
-// trackUnpublished handles track_unpublished (§22/§45).
+// trackUnpublished handles track_unpublished (§22/§24/§45).
 //
-// Only ONLINE → SCREEN_LOST is allowed. That guard is what makes a webhook that
-// arrives BEFORE its own track_published harmless: the session is still CONNECTING, so
-// there is nothing to lose, and the late publication then moves it to ONLINE — the true
-// end state. Without the guard, the out-of-order pair would leave the session in
-// SCREEN_LOST forever.
+// Only a SCREEN_SHARE track can move ONLINE → SCREEN_LOST. That guard is what makes a
+// webhook that arrives BEFORE its own track_published harmless: the session is still
+// CONNECTING, so there is nothing to lose, and the late publication then moves it to
+// ONLINE — the true end state. Without the guard, the out-of-order pair would leave the
+// session in SCREEN_LOST forever.
+//
+// A CAMERA track is handled on its own path for the same reason: the camera going away is
+// not the screen going away, and §21's invariant is about the screen.
 func (p *Processor) trackUnpublished(ctx context.Context, ev *livekit.WebhookEvent, room, identity string) error {
-	source := ev.GetTrack().GetSource()
-	if source != livekit.TrackSource_SCREEN_SHARE {
-		logging.FromContext(ctx).Debug("non-screen track unpublished; session state unchanged",
+	switch ev.GetTrack().GetSource() {
+	case livekit.TrackSource_SCREEN_SHARE:
+		return p.screenUnpublished(ctx, ev, room, identity)
+	case livekit.TrackSource_CAMERA:
+		return p.cameraObserved(ctx, ev, room, identity, false)
+	default:
+		logging.FromContext(ctx).Debug("track source without a session rule; session state unchanged",
 			"action", "track_unpublished_ignored",
 			"room", room,
-			"track_source", source.String(),
+			"track_source", ev.GetTrack().GetSource().String(),
 			"track_sid", ev.GetTrack().GetSid(),
 		)
 		return nil
 	}
+}
 
+// screenUnpublished is the §22 rule: the screen went away while the student is still in
+// the room.
+func (p *Processor) screenUnpublished(ctx context.Context, ev *livekit.WebhookEvent, room, identity string) error {
+	source := ev.GetTrack().GetSource()
 	stored, err := p.lookup(ctx, room, identity, ev)
 	if err != nil || stored == nil {
 		return err
@@ -371,6 +399,73 @@ func (p *Processor) trackUnpublished(ctx context.Context, ev *livekit.WebhookEve
 		"track_sid", ev.GetTrack().GetSid(),
 	)
 	return p.notifyScreen(ctx, stored, false)
+}
+
+// cameraObserved handles track_published/track_unpublished for a CAMERA track (§24/§75).
+//
+// # What the camera may and may not do
+//
+// It records CAMERA_STARTED / CAMERA_STOPPED and tells the OWNER teacher. It does not
+// touch `student_sessions.status`, and that is the hard rule of this phase: §24 says a
+// camera does not affect ONLINE, §21 says only a screen track is mandatory, and §45 says
+// only SCREEN_SHARE produces ONLINE. A student who turns their camera on while their
+// screen share is lost must stay SCREEN_LOST — the teacher's wall answers "is this
+// student being supervised?", and a camera is not the supervision.
+//
+// # Why the state is read from the event log
+//
+// The camera has no column, so "is it already on?" is answered by the newest CAMERA_*
+// event of this session (see TrackStateChange). The processor does not read it: the STORE
+// makes the decision inside the transaction that appends the row, and reports back whether
+// history changed. Broadcasting on that answer is what makes at-least-once delivery
+// produce exactly one message per real change — a duplicate delivery, a retry of an
+// already-stopped publication and an out-of-order stop all write nothing, so nothing is
+// sent (see ApplyTrackState for the two halves of the guard).
+func (p *Processor) cameraObserved(ctx context.Context, ev *livekit.WebhookEvent, room, identity string, active bool) error {
+	stored, err := p.lookup(ctx, room, identity, ev)
+	if err != nil || stored == nil {
+		return err
+	}
+	if stored.Status.Terminal() {
+		// A late event for a session that already left or was closed (§74). Terminal
+		// states are never re-entered, so the camera cannot be started in one either.
+		logDebugSkip(ctx, ev, stored, "session is terminal")
+		return nil
+	}
+
+	payload := p.payload(ev, room)
+	payload["trackSid"] = ev.GetTrack().GetSid()
+	payload["trackSource"] = livekit.TrackSource_CAMERA.String()
+	payload["participantSid"] = ev.GetParticipant().GetSid()
+
+	applied, err := p.store.ApplyTrackState(ctx, TrackStateChange{
+		SessionID: stored.ID,
+		On:        EventCameraStarted,
+		Off:       EventCameraStopped,
+		Active:    active,
+		TrackSid:  ev.GetTrack().GetSid(),
+		Payload:   payload,
+	})
+	if err != nil {
+		return err
+	}
+	if !applied {
+		logDebugSkip(ctx, ev, stored, "camera state already recorded")
+		return nil
+	}
+
+	logging.FromContext(ctx).Info("student camera changed",
+		"action", "camera_changed",
+		"room", room,
+		"session_id", stored.ID.String(),
+		"student_id", stored.StudentID.String(),
+		"run_id", stored.ClassroomRunID.String(),
+		"track_sid", ev.GetTrack().GetSid(),
+		"active", active,
+		"session_status", string(stored.Status),
+		"note", "a camera never changes the session status (§24/§21)",
+	)
+	return p.notifyCamera(ctx, stored, active)
 }
 
 // roomFinished handles room_finished: every active session of that run ends (§45/§49).
@@ -641,6 +736,22 @@ func (p *Processor) notifyScreen(ctx context.Context, stored *StudentSession, re
 		return p.events.ScreenRestored(ctx, stored.Ref())
 	}
 	return p.events.ScreenLost(ctx, stored.Ref())
+}
+
+// notifyCamera tells the OWNER teacher that a student's camera went on or off (§47/§75).
+//
+// WHY only the owner, and why not the student: §26 forbids one student from learning
+// anything about a classmate, and "classmate turned their camera on" is exactly such a
+// fact — a classroom-wide CAMERA_CHANGED would tell every student who is being watched by
+// whom. The student themself does not need it either: they pressed the button and their
+// own page renders the local track, so a server copy could only arrive late and disagree
+// with what is already on screen. The teacher's wall, which cannot see anybody's button, is
+// the one audience that needs the fact.
+func (p *Processor) notifyCamera(ctx context.Context, stored *StudentSession, active bool) error {
+	if p.events == nil {
+		return nil
+	}
+	return p.events.CameraChanged(ctx, stored.Ref(), active)
 }
 
 // runRef resolves the run and classroom a close is about.

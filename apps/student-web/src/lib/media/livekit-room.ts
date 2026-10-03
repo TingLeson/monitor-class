@@ -10,9 +10,11 @@
  *    任何人的轨道；即便服务端已用 Subscription Permission 挡住其他学生，
  *    自动订阅也不该有"先拉下来再过滤"的机会。老师私密语音是 Phase 10 的事，
  *    届时也只允许**显式**订阅那一条。
- * 2. 屏幕轨道必须复用 Phase 5 Gate 通过的那条 `MediaStreamTrack`（§20）：
+ * 2. 本地轨道必须复用**已经拿到授权的那一条** `MediaStreamTrack`：屏幕那条来自
+ *    Phase 5 的 Gate（§20），摄像头那条来自学生点击后的 `getUserMedia`（§24）。
  *    这里只接受现成的 track，绝不调用 `createLocalScreenTracks()` /
- *    `getDisplayMedia()` 之类的"重新采集"API——那会让学生看到第二次授权弹窗。
+ *    `getDisplayMedia()` / `createLocalVideoTrack()` 之类的"重新采集"API——
+ *    那会让学生看到第二次授权弹窗（屏幕）或一个他没点过的摄像头授权（摄像头）。
  * 3. 地址与 token 只在这里被交给 SDK，不缓存、不打印（§44）。本文件没有
  *    `console.*`，异常也原样上抛，由 store 折叠成中文提示。
  */
@@ -95,6 +97,13 @@ export function createLiveKitScreenPublisherRoom(
 
   /** 当前已发布的本地屏幕轨道；重新发布时会被替换。 */
   let publishedTrack: LocalVideoTrack | null = null
+  /**
+   * 当前已发布的本地摄像头轨道（§24）。
+   *
+   * 与屏幕那条**分开存**：两条轨道独立开关（学生可以只开摄像头、也可以在共享屏幕的
+   * 同时开摄像头），共用一个变量会让"关闭摄像头"把屏幕一起撤下来。
+   */
+  let publishedCameraTrack: LocalVideoTrack | null = null
 
   return {
     async connect(): Promise<void> {
@@ -119,6 +128,39 @@ export function createLiveKitScreenPublisherRoom(
       publishedTrack = null
       if (!local) return
       // 第二个参数 false：不 stop 本地轨道，释放由捕获层负责（见上面的选项说明）。
+      await room.localParticipant.unpublishTrack(local, false)
+    },
+
+    async publishCameraTrack(track: MediaStreamTrack): Promise<void> {
+      /**
+       * 同样是 `userProvidedTrack = true`，但这里的意义比屏幕那条更直接：
+       * 摄像头在**重连**场景下如果让 SDK 自己重新采集，学生会在课堂中途再被弹一次
+       * 摄像头授权框——而 §24 的整个设计前提就是"只在他点击的那一刻请求一次"。
+       *
+       * `name: 'camera'` 与后端契约里那条轨道的名字逐字一致：判定归属靠的是
+       * `source`，但名字会进入 SFU 与 webhook 的记录，排障时能一眼区分
+       * "这条是屏幕还是摄像头"（§75 的契约把两件事都写明了）。
+       */
+      const local = new LocalVideoTrack(track, undefined, true)
+      await room.localParticipant.publishTrack(local, {
+        source: Track.Source.Camera,
+        name: 'camera',
+      })
+      publishedCameraTrack = local
+    },
+
+    async unpublishCameraTrack(): Promise<void> {
+      const local = publishedCameraTrack
+      publishedCameraTrack = null
+      if (!local) return
+      /**
+       * 第二个参数 false：**不**在这里 stop。
+       *
+       * WHY 这条尤其重要：摄像头轨道与屏幕轨道不同，它不是"用完就一直挂着"的
+       * 那种资源——`stop()` 是唯一能让系统摄像头指示灯灭掉的动作。释放点必须只有
+       * 一个（采集层），否则"unpublish 成功、stop 没跑到"就会留下一个学生以为
+       * 已经关掉、实际仍在采集的摄像头。store 里 unpublish 与 stop 是紧挨着的两句。
+       */
       await room.localParticipant.unpublishTrack(local, false)
     },
 

@@ -3,6 +3,7 @@ import { afterEach } from 'vitest'
 import {
   resetMonitorRoomFactory,
   setMonitorRoomFactory,
+  type CameraSubscription,
   type MediaCredentials,
   type MediaDisconnectReason,
   type MediaRemoteParticipant,
@@ -46,12 +47,24 @@ export interface FakeMonitorRoom {
   /** 每条订阅上的 setQuality 调用（切换 Focus 时必须走这条路，而不是重新订阅）。 */
   readonly qualityChanges: { identity: string; quality: ScreenQuality }[]
   readonly unsubscribeCalls: string[]
+  /**
+   * 摄像头的订阅调用（§24，**不去重**，理由同 subscribeCalls）。
+   *
+   * 与屏幕那几个数组分开：Phase 9 最要盯的性质就是"两条轨道互不影响"，
+   * 共用一个数组会让"取消摄像头订阅顺手把屏幕也退了"这种 bug 测不出来。
+   */
+  readonly subscribeCameraCalls: string[]
+  readonly unsubscribeCameraCalls: string[]
+  /** 摄像头被 attach 过的 `<video>`（断言画中画的画面真的挂上去了）。 */
+  readonly cameraAttachedElements: HTMLVideoElement[]
   /** 被 attach 过的 `<video>`（断言"画面真的挂上去了"）。 */
   readonly attachedElements: HTMLVideoElement[]
   /** 媒体层的参与者事实（业务状态不在这里，见 §51）。 */
   participants: MediaRemoteParticipant[]
   /** false 表示"业务说该有画面，但媒体里还没有这条轨道"（返回 null）。 */
   screenAvailable: boolean
+  /** false 表示"业务说他开着摄像头，但媒体里还没有这条轨道"（返回 null）。 */
+  cameraAvailable: boolean
   /**
    * 让 subscribeScreen 抛错（订阅失败 → 卡片显示失败 + 可重试）。
    *
@@ -59,6 +72,13 @@ export interface FakeMonitorRoom {
    * 测试往往需要在房间出现之前就把失败打开。
    */
   subscribeError: Error | null
+  /**
+   * 让 `subscribeCamera` 抛错（§24）。
+   *
+   * 与 `subscribeError` **分开**：Phase 9 要证明的正是"摄像头订阅失败只影响画中画，
+   * 屏幕那条照常"。共用一个开关就永远测不出这条性质。
+   */
+  subscribeCameraError: Error | null
   emitParticipantsChanged(): void
   emitScreenSubscribed(identity: string): void
   emitScreenUnsubscribed(identity: string): void
@@ -71,6 +91,7 @@ export interface MonitorRoomHarness {
   flags: {
     connectError: Error | null
     subscribeError: Error | null
+    subscribeCameraError: Error | null
     /**
      * 订阅闸门：非 null 时 `subscribeScreen` 会一直挂到它 resolve。
      *
@@ -92,6 +113,7 @@ export function installFakeMonitorRoom(
   const flags = {
     connectError: options.connectError ?? null,
     subscribeError: null as Error | null,
+    subscribeCameraError: null as Error | null,
     subscribeGate: null as Promise<void> | null,
   }
   /**
@@ -126,6 +148,7 @@ export function installFakeMonitorRoom(
 function makeFakeMonitorRoom(flags: {
   connectError: Error | null
   subscribeError: Error | null
+  subscribeCameraError: Error | null
   subscribeGate: Promise<void> | null
 }): FakeMonitorRoom {
   const participantsChanged: (() => void)[] = []
@@ -138,6 +161,9 @@ function makeFakeMonitorRoom(flags: {
   const qualityChanges: { identity: string; quality: ScreenQuality }[] = []
   const unsubscribeCalls: string[] = []
   const attachedElements: HTMLVideoElement[] = []
+  const subscribeCameraCalls: string[] = []
+  const unsubscribeCameraCalls: string[] = []
+  const cameraAttachedElements: HTMLVideoElement[] = []
   let connectCalls = 0
   let disconnectCalls = 0
 
@@ -193,6 +219,31 @@ function makeFakeMonitorRoom(flags: {
       unsubscribeCalls.push(identity)
       return Promise.resolve()
     },
+    subscribeCamera(identity: string): Promise<CameraSubscription | null> {
+      // 与真实适配层一致：调用**不去重**，幂等是 store 的责任（这里正是要测它）。
+      subscribeCameraCalls.push(identity)
+      if (flags.subscribeCameraError) return Promise.reject(flags.subscribeCameraError)
+      if (!self.participants.some((participant) => participant.identity === identity)) {
+        return Promise.resolve(null)
+      }
+      // 摄像头可能还没发布（业务状态领先于媒体状态）：返回 null，界面不画小窗。
+      if (!self.cameraAvailable) return Promise.resolve(null)
+      const subscription: CameraSubscription = {
+        identity,
+        attach(element: HTMLVideoElement): () => void {
+          cameraAttachedElements.push(element)
+          return () => {
+            const index = cameraAttachedElements.indexOf(element)
+            if (index >= 0) cameraAttachedElements.splice(index, 1)
+          }
+        },
+      }
+      return Promise.resolve(subscription)
+    },
+    unsubscribeCamera(identity: string): Promise<void> {
+      unsubscribeCameraCalls.push(identity)
+      return Promise.resolve()
+    },
     onParticipantsChanged(listener) {
       participantsChanged.push(listener)
       return () => removeFrom(participantsChanged, listener)
@@ -224,13 +275,23 @@ function makeFakeMonitorRoom(flags: {
     qualityChanges,
     unsubscribeCalls,
     attachedElements,
+    subscribeCameraCalls,
+    unsubscribeCameraCalls,
+    cameraAttachedElements,
     participants: [],
     screenAvailable: true,
+    cameraAvailable: true,
     get subscribeError() {
       return flags.subscribeError
     },
     set subscribeError(next: Error | null) {
       flags.subscribeError = next
+    },
+    get subscribeCameraError() {
+      return flags.subscribeCameraError
+    },
+    set subscribeCameraError(next: Error | null) {
+      flags.subscribeCameraError = next
     },
     emitParticipantsChanged() {
       for (const listener of [...participantsChanged]) listener()

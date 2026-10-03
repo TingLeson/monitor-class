@@ -164,8 +164,10 @@ type MonitorStudent struct {
 	// Status is the session state, or nil when SessionID is nil. It is never a second
 	// vocabulary for "not in": the six states of §12 are the whole set.
 	Status *Status
-	// ScreenActive, CameraActive and MicrophoneActive are the observed tracks. In
-	// Phase 6 only ScreenActive can be true (§72: no camera, no microphone), and a
+	// ScreenActive, CameraActive and MicrophoneActive are the observed tracks: the
+	// media plane reported a publication of that source and did not report it muted.
+	// From Phase 9 the camera can be true next to any session status (§24: a camera
+	// never changes the status), the microphone is still always false (§76), and a
 	// student without a session has all three false.
 	ScreenActive     bool
 	CameraActive     bool

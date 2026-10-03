@@ -295,6 +295,8 @@ const nobodyEntered = computed(() => monitor.rosterCount > 0 && monitor.enteredC
           :student="student"
           :subscription="monitor.subscriptionOf(student)"
           :media-state="monitor.mediaStateOf(student)"
+          :camera-subscription="monitor.cameraSubscriptionOf(student)"
+          :camera-media-state="monitor.cameraMediaStateOf(student)"
           :selected="monitor.focusedStudentId === student.studentId"
           @open="openFocus(student, $event)"
           @visibility-change="onTileVisibility(student.studentId, $event)"
@@ -312,6 +314,8 @@ const nobodyEntered = computed(() => monitor.rosterCount > 0 && monitor.enteredC
       :student="monitor.focusedStudent"
       :subscription="monitor.subscriptionOf(monitor.focusedStudent)"
       :media-state="monitor.mediaStateOf(monitor.focusedStudent)"
+      :camera-subscription="monitor.cameraSubscriptionOf(monitor.focusedStudent)"
+      :camera-media-state="monitor.cameraMediaStateOf(monitor.focusedStudent)"
       @close="closeFocus"
     />
   </div>

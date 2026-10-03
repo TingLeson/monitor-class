@@ -115,20 +115,124 @@ describe('课堂会话页', () => {
     expect(wrapper.find('[data-testid="screen-sharing-status"]').text()).toBe('🖥 正在共享整个屏幕')
   })
 
-  it('§56：摄像头 / 麦克风是不可点的说明文字，不是假开关（Phase 9/10）', async () => {
+  it('§24/§56：摄像头是真实开关；麦克风仍是 Phase 10 的不可点说明', async () => {
     installFakePublisherRoom()
     const { wrapper } = await mountSession()
 
     const camera = wrapper.find('[data-testid="camera-row"]')
+    expect(camera.find('[data-testid="toggle-camera"]').text()).toBe('📷 开启摄像头')
+    expect(camera.find('[data-testid="camera-status"]').text()).toBe('未开启')
+
     const microphone = wrapper.find('[data-testid="microphone-row"]')
-    expect(camera.text()).toContain('未启用')
-    expect(camera.text()).toContain('Phase 9')
     expect(microphone.text()).toContain('Phase 10')
-    // 一个点不动的假开关比没有开关更糟：学生会以为自己打开失败了。
-    expect(camera.find('button').exists()).toBe(false)
-    expect(camera.find('input').exists()).toBe(false)
+    // Phase 10 还没到：麦克风必须继续是"点不动的说明"，不是假开关（§54）。
     expect(microphone.find('button').exists()).toBe(false)
     expect(microphone.find('input').exists()).toBe(false)
+  })
+
+  /* -------------------------------------------------------------------- */
+  /* §24：摄像头（Phase 9）                                            */
+  /* -------------------------------------------------------------------- */
+
+  it('§24：进入课堂后挂载页面时**不**请求摄像头，点击之后才有第一次 getUserMedia', async () => {
+    const harness = installFakePublisherRoom()
+    const { wrapper, devices } = await mountSession()
+
+    // 挂载、连接、发布屏幕一路走完，摄像头一次都没被碰过。
+    expect(devices.cameraCalls).toHaveLength(0)
+    expect(harness.current().publishedCameraTracks).toHaveLength(0)
+
+    await wrapper.find('[data-testid="toggle-camera"]').trigger('click')
+    await flushPromises()
+
+    expect(devices.cameraCalls).toHaveLength(1)
+    // 请求的就是 §24 那一行约束：只要 video，不要音频（麦克风属于 Phase 10）。
+    expect(devices.cameraCalls[0]?.constraints).toEqual({ video: true })
+    const cameraTrack = devices.cameraStreams[0]?.getVideoTracks()[0]
+    expect(harness.current().publishedCameraTracks).toEqual([cameraTrack])
+    expect(harness.current().publishedCameraTracks[0]?.kind).toBe('video')
+  })
+
+  it('§56/§24：摄像头开启后页面里只有 1 个 <video>，而且它是摄像头自视画面', async () => {
+    installFakePublisherRoom()
+    const { wrapper } = await mountSession()
+
+    await wrapper.find('[data-testid="toggle-camera"]').trigger('click')
+    await flushPromises()
+
+    const videos = wrapper.findAll('video')
+    expect(videos).toHaveLength(1)
+    expect(videos[0]?.attributes('data-testid')).toBe('camera-self-view')
+    expect(wrapper.find('[data-testid="camera-status"]').text()).toBe('已开启')
+    // 屏幕预览依旧被禁止（§56）：没有任何一处渲染共享出去的屏幕画面。
+    expect(wrapper.find('[data-testid="tile-video"]').exists()).toBe(false)
+  })
+
+  it('§24：关闭摄像头 → unpublish + 真的 stop（灯灭），按钮回到「开启」', async () => {
+    const harness = installFakePublisherRoom()
+    const { wrapper, devices } = await mountSession()
+    await wrapper.find('[data-testid="toggle-camera"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="toggle-camera"]').text()).toBe('关闭摄像头')
+    await wrapper.find('[data-testid="toggle-camera"]').trigger('click')
+    await flushPromises()
+
+    expect(harness.current().unpublishCameraCalls).toBe(1)
+    expect(devices.cameraStreams[0]?.getVideoTracks()[0]?.readyState).toBe('ended')
+    expect(wrapper.find('[data-testid="camera-status"]').text()).toBe('未开启')
+    expect(wrapper.findAll('video')).toHaveLength(0)
+
+    // 再开：又一次真实的 getUserMedia（不是复用那条已经停掉的轨道）。
+    await wrapper.find('[data-testid="toggle-camera"]').trigger('click')
+    await flushPromises()
+    expect(devices.cameraCalls).toHaveLength(2)
+    expect(harness.current().publishedCameraTracks).toHaveLength(2)
+  })
+
+  it('§24：权限被拒 → 可执行的中文提示，且课堂与屏幕共享完全不受影响', async () => {
+    installFakePublisherRoom()
+    const { wrapper, devices, store } = await mountSession()
+    const denied = new Error('denied')
+    denied.name = 'NotAllowedError'
+    devices.cameraFailWith = denied
+
+    await wrapper.find('[data-testid="toggle-camera"]').trigger('click')
+    await flushPromises()
+
+    const failure = wrapper.find('[data-testid="camera-failure"]')
+    expect(failure.exists()).toBe(true)
+    expect(failure.text()).toContain('没有授予摄像头权限')
+    expect(failure.text()).toContain('仍然可以正常上课')
+
+    // 课堂照旧：屏幕还在共享、会话状态没变、没有媒体失败告警（§21：屏幕才是 mandatory）。
+    expect(wrapper.find('[data-testid="screen-sharing-status"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="session-phase"]').text()).toContain('已进入课堂')
+    expect(wrapper.find('[data-testid="media-failure"]').exists()).toBe(false)
+    expect(store.phase).toBe('online')
+  })
+
+  it('§21/§24：摄像头开着时停止屏幕共享 → 仍然显示「已停止屏幕共享」', async () => {
+    installFakePublisherRoom()
+    const { wrapper, devices } = await mountSession()
+    await wrapper.find('[data-testid="toggle-camera"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="camera-status"]').text()).toBe('已开启')
+
+    // 学生点了浏览器的"停止共享"：只有屏幕那条轨道结束。
+    trackOf(devices).emitEnded()
+    await flushPromises()
+
+    const lost = wrapper.find('[data-testid="screen-lost"]')
+    expect(lost.exists()).toBe(true)
+    expect(lost.text()).toContain('已停止屏幕共享')
+    expect(wrapper.find('[data-testid="screen-lost-status"]').text()).toContain('⚠ 已停止屏幕共享')
+    expect(wrapper.find('[data-testid="session-phase"]').text()).toContain('⚠ 已停止屏幕共享')
+    // 摄像头不能把界面"看起来正常"：那句"正在共享整个屏幕"必须消失。
+    expect(wrapper.find('[data-testid="screen-sharing-status"]').exists()).toBe(false)
+    // 同时摄像头状态如实保留（两件事互不影响），并提供恢复入口。
+    expect(wrapper.find('[data-testid="camera-status"]').text()).toBe('已开启')
+    expect(wrapper.find('[data-testid="reshare-screen"]').exists()).toBe(true)
   })
 
   it('§56：状态面板显示课堂名、当前状态与网络质量', async () => {

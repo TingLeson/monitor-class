@@ -12,11 +12,13 @@ import { defineStore } from 'pinia'
 import { computed, markRaw, ref, shallowRef } from 'vue'
 import {
   createMonitorRoom,
+  type CameraSubscription,
   type MediaCredentials,
   type MonitorRoom,
   type ScreenQuality,
   type ScreenSubscription,
 } from '../lib/media/media-room.ts'
+import { shouldSubscribeCamera } from '../lib/camera-pip.ts'
 import {
   deriveMonitorTileState,
   isStudentEntered,
@@ -119,6 +121,23 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
    */
   const subscriptionQualities = ref<Record<string, ScreenQuality>>({})
 
+  /**
+   * 已建立的**摄像头**订阅：sessionId → CameraSubscription（§24）。
+   *
+   * 与 `subscriptions` 分开两张表，理由与适配层完全相同：同一 participant 的
+   * 两条轨道生命周期互相独立，合表之后任何一次退订都会顺手把另一条拆掉。
+   */
+  const cameraSubscriptions = shallowRef<Record<string, CameraSubscription>>({})
+
+  /**
+   * 摄像头订阅的媒体状态（键同样是 identity）。
+   *
+   * WHY 不复用 `mediaStates`（那是屏幕的）：一张卡片上"屏幕没有画面"与
+   * "摄像头没有画面"是两个独立的结论，共用一个值会让老师看到
+   * "画面订阅失败"出现在一个屏幕好好的卡片上。
+   */
+  const cameraMediaStates = ref<Record<string, MonitorMediaState>>({})
+
   /** 老师正在 Focus 看的学生（§30）；null = 在网格视图。 */
   const focusedStudentId = ref<string | null>(null)
 
@@ -151,6 +170,14 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
   let roomUnsubscribers: (() => void)[] = []
   /** 正在订阅中的 sessionId：第二次调用直接返回，不产生第二次 setSubscribed。 */
   const pending = new Set<string>()
+  /**
+   * 正在订阅摄像头中的 sessionId（与 `pending` 分开）。
+   *
+   * WHY 不能共用一个集合：同一个人的屏幕订阅与摄像头订阅是两次独立请求，
+   * 共用一个集合会让"屏幕正在订阅"把摄像头那次请求挡掉——表现是画中画永远不出现，
+   * 而屏幕上一切正常。
+   */
+  const pendingCamera = new Set<string>()
   /**
    * 当前在视口里的学生（studentId，不是 sessionId）。
    *
@@ -226,6 +253,23 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
   function qualityOf(student: MonitorStudent): ScreenQuality | null {
     if (student.sessionId === null) return null
     return subscriptionQualities.value[student.sessionId] ?? null
+  }
+
+  /**
+   * 某个学生的摄像头订阅（§24）；没有订阅时是 null。
+   *
+   * 视图拿它决定画不画画中画：**null 就不画**（见 camera-pip.ts 的说明），
+   * 绝不渲染一个空白小窗。
+   */
+  function cameraSubscriptionOf(student: MonitorStudent): CameraSubscription | null {
+    if (student.sessionId === null) return null
+    return cameraSubscriptions.value[student.sessionId] ?? null
+  }
+
+  /** 某个学生摄像头订阅的媒体状态（没有记录时是 'none'）。 */
+  function cameraMediaStateOf(student: MonitorStudent): MonitorMediaState {
+    if (student.sessionId === null) return 'none'
+    return cameraMediaStates.value[student.sessionId] ?? 'none'
   }
 
   /* ---------------------------------------------------------------------- */
@@ -326,6 +370,18 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
       // 适配层里对已经离开的 participant 是空操作；这里调用是为了对称与幂等。
       await active.unsubscribeScreen(identity)
     }
+    /**
+     * 摄像头那一半同样要跟着释放（§24）。
+     *
+     * WHY 不能只靠协调计划：计划是按 monitor DTO 算的，而 DTO 最多 60 秒才刷一次。
+     * 那 60 秒里右下角会停着**最后一帧**画面——老师会以为学生还在摄像头前，
+     * 而人早就走了。媒体层说人没了，就必须立刻反映出来。
+     */
+    for (const identity of Object.keys(cameraSubscriptions.value)) {
+      if (present.has(identity)) continue
+      dropLocalCameraSubscription(identity)
+      await active.unsubscribeCamera(identity)
+    }
     await reconcileSubscriptions()
   }
 
@@ -335,6 +391,13 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
     subscriptions.value = omitKey(subscriptions.value, identity)
     subscriptionQualities.value = omitKey(subscriptionQualities.value, identity)
     mediaStates.value = { ...mediaStates.value, [identity]: 'none' }
+  }
+
+  /** 摄像头那一半：只清摄像头的记录，屏幕的订阅一行都不动（§24）。 */
+  function dropLocalCameraSubscription(identity: string): void {
+    pendingCamera.delete(identity)
+    cameraSubscriptions.value = omitKey(cameraSubscriptions.value, identity)
+    cameraMediaStates.value = { ...cameraMediaStates.value, [identity]: 'none' }
   }
 
   /** 申请凭据并连接（幂等：已经连上就直接返回 true）。 */
@@ -388,6 +451,30 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
       const focused = student.studentId === focusedStudentId.value
       if (!focused && !visibleStudentIds.has(student.studentId)) continue
       desired.set(identity, focused ? FOCUS_QUALITY : GRID_QUALITY)
+    }
+    return desired
+  }
+
+  /**
+   * 现在**该**订阅谁的摄像头（§24 / §29）。
+   *
+   * 与屏幕那份计划共用三路输入（可见性 / Focus / 页面隐藏），但**筛的是另一个字段**
+   * （`camera.active` 而不是 `screen.active`）：摄像头是 optional（§21），
+   * 屏幕在不在发布与摄像头开没开没有任何推导关系。
+   *
+   * 摄像头**不区分 Focus**：画中画与 Focus 右侧的 Camera 区都是小窗，
+   * 所以它只有"订 / 不订"两种状态，没有画质档（§52 的分层只针对屏幕）。
+   */
+  function desiredCameraSubscriptions(): Set<string> {
+    const desired = new Set<string>()
+    if (pageHidden.value) return desired
+    for (const student of students.value) {
+      if (!shouldSubscribeCamera(student)) continue
+      const identity = student.sessionId
+      if (identity === null) continue
+      const focused = student.studentId === focusedStudentId.value
+      if (!focused && !visibleStudentIds.has(student.studentId)) continue
+      desired.add(identity)
     }
     return desired
   }
@@ -452,6 +539,62 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
     await Promise.all(
       [...desired].map(([identity, quality]) => establishSubscription(active, identity, quality)),
     )
+
+    /**
+     * 摄像头走**同一轮**协调（§52 的"不要另起一套"）。
+     *
+     * WHY 必须挂在同一个循环里：可见性、Focus、页面隐藏三路输入已经在上面合成过一遍
+     * 计划了，摄像头另起一条链路就会出现"滚动时屏幕退了、摄像头还留着"这种
+     * 只在真机上偶发的状态。这里只是把同一个计划里的另一半收敛掉。
+     */
+    await convergeCameraSubscriptions(active)
+  }
+
+  /**
+   * 摄像头订阅的收敛（先退掉不该留的，再补上缺的）。
+   *
+   * 与屏幕那半的差别只有画质：摄像头没有档位（永远 LOW，见 camera-pip.ts）。
+   */
+  async function convergeCameraSubscriptions(active: MonitorRoom): Promise<void> {
+    const desired = desiredCameraSubscriptions()
+
+    for (const identity of Object.keys(cameraSubscriptions.value)) {
+      if (desired.has(identity)) continue
+      dropLocalCameraSubscription(identity)
+      await active.unsubscribeCamera(identity)
+    }
+
+    await Promise.all([...desired].map((identity) => establishCameraSubscription(active, identity)))
+  }
+
+  /** 建立一条摄像头订阅并把结果写回状态（失败只影响这一格的小窗）。 */
+  async function establishCameraSubscription(active: MonitorRoom, identity: string): Promise<void> {
+    if (cameraSubscriptions.value[identity] !== undefined) return
+    // 与屏幕那半同一个防重复机制：同一 identity 的请求还没回来时不再发第二次。
+    if (pendingCamera.has(identity)) return
+    pendingCamera.add(identity)
+    cameraMediaStates.value = { ...cameraMediaStates.value, [identity]: 'pending' }
+    try {
+      const subscription = await active.subscribeCamera(identity)
+      if (subscription === null) {
+        /**
+         * 业务说他开着摄像头，媒体里却还没有这条轨道：可能是刚发布（webhook 比 SFU 快），
+         * 也可能老师端网络问题。**保持 'none' 并等下一次协调**——画中画不出现，
+         * 但屏幕画面完全不受影响。轨道发布事件（TrackPublished）会立刻再触发一轮。
+         */
+        cameraMediaStates.value = { ...cameraMediaStates.value, [identity]: 'none' }
+        return
+      }
+      cameraSubscriptions.value = {
+        ...cameraSubscriptions.value,
+        [identity]: markRaw(subscription),
+      }
+      cameraMediaStates.value = { ...cameraMediaStates.value, [identity]: 'subscribed' }
+    } catch {
+      cameraMediaStates.value = { ...cameraMediaStates.value, [identity]: 'failed' }
+    } finally {
+      pendingCamera.delete(identity)
+    }
   }
 
   /** 建立一条订阅并把结果写回状态（失败只影响这一格）。 */
@@ -702,11 +845,23 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
       }
       case 'CAMERA_CHANGED': {
         const { studentId, sessionId, active } = event.data
-        // Phase 9 才会有这个事件；这里把 DTO 里真实存在的字段更新掉，不做别的。
-        updateStudent(studentId, sessionId, 'CAMERA_CHANGED', (student) => ({
+        /**
+         * Phase 9：只改 `camera` 这一个字段。
+         *
+         * 事件证明不了别的——载荷里没有 `connection` / `joinedAt` / `sessionStatus`，
+         * 顺手"补一个看起来合理"的值就是造数据（§80）。摄像头本身也不改变会话状态
+         * （§21/§24：屏幕才是 mandatory），所以这里连 `sessionStatus` 都不碰。
+         */
+        const changed = updateStudent(studentId, sessionId, 'CAMERA_CHANGED', (student) => ({
           ...student,
           camera: { active },
         }))
+        /**
+         * 订阅要跟着变，但**仍然走协调器**（§52）：这里只重新收敛一次计划，
+         * 直接调 subscribeCamera/unsubscribeCamera 就会与可见性、Focus、
+         * 页面隐藏三路输入打架——那正是 Phase 7 建这套协调器的原因。
+         */
+        if (changed) void reconcileSubscriptions()
         return
       }
       case 'MIC_CHANGED': {
@@ -834,7 +989,10 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
     subscriptions.value = {}
     subscriptionQualities.value = {}
     mediaStates.value = {}
+    cameraSubscriptions.value = {}
+    cameraMediaStates.value = {}
     pending.clear()
+    pendingCamera.clear()
     if (current !== null) {
       try {
         await current.disconnect()
@@ -880,6 +1038,8 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
     mediaStates,
     subscriptions,
     subscriptionQualities,
+    cameraSubscriptions,
+    cameraMediaStates,
     subscribedCount,
     rosterCount,
     enteredCount,
@@ -893,6 +1053,8 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
     mediaStateOf,
     subscriptionOf,
     qualityOf,
+    cameraSubscriptionOf,
+    cameraMediaStateOf,
     setStudentVisible,
     setFocusedStudent,
     setPageHidden,

@@ -285,12 +285,15 @@ describe('课堂监督墙', () => {
     // 同一份订阅现在挂到了两个 <video> 上（网格小窗 + Focus 大画面）。
     expect(harness.current().attachedElements).toHaveLength(2)
 
-    // 右侧面板：Camera 占位（Phase 9）、Screen / Camera / Mic、Network。
-    expect(focus.find('[data-testid="focus-camera-placeholder"]').text()).toContain('Phase 9')
+    // 右侧面板：Camera 真实画面（Phase 9）、Screen / Camera / Mic、Network。
+    expect(focus.find('[data-testid="focus-camera-video"]').exists()).toBe(true)
     expect(focus.find('[data-testid="focus-device-screen"]').text()).toContain('已开启')
     expect(focus.find('[data-testid="focus-device-camera"]').text()).toContain('已开启')
     expect(focus.find('[data-testid="focus-device-microphone"]').text()).toContain('已开启')
     expect(focus.find('[data-testid="focus-network"]').text()).toContain('Fair')
+    // 同一条摄像头订阅现在挂在两个元素上（网格画中画 + Focus 的 Camera 区）：
+    // 展开 Focus 不会让 SFU 再推一路视频（§52）。
+    expect(harness.current().cameraAttachedElements).toHaveLength(2)
 
     // 可访问性：面板是一个（非模态）dialog，并且标出了它的名字。
     const dialog = focus.find('[role="dialog"]')

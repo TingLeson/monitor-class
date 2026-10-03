@@ -18,7 +18,7 @@
 | 6 | `phase/06-livekit-screen` | 1 老师 + 1 学生 + 1 屏幕轨道 | ✅ 已完成 |
 | 7 | `phase/07-multi-student` | 多学生监督墙、Focus View、手动订阅 | ✅ 已完成 |
 | 8 | `phase/08-runtime-state` | WebSocket、LiveKit Webhook、StudentSession、SessionEvent | ✅ 已完成 |
-| 9 | `phase/09-camera` | 可选摄像头 + 老师端画中画 | ⏳ |
+| 9 | `phase/09-camera` | 可选摄像头 + 老师端画中画 | ✅ 已完成 |
 | 10 | `phase/10-private-audio` | 学生可选麦克风 + 老师私密语音状态机 | ⏳ |
 | 11 | `phase/11-production` | HTTPS、TURN、反代、限流、CSRF、CORS、指标、重连 | ⏳ |
 | 12 | `phase/12-performance` | 1 老师 + 20/30 学生压测（禁止用假 video 标签冒充） | ⏳ |

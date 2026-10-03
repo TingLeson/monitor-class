@@ -529,7 +529,10 @@ func TestStudentJoinLifecycleEndToEnd(t *testing.T) {
 		t.Errorf("leftAt = %v, want NULL", stored.LeftAt)
 	}
 
-	// The token request carries the permissions of §28 and the run's opaque room.
+	// The token request carries the permissions of §28/§75 and the run's opaque room:
+	// the screen (mandatory, §21) and the camera (optional, §24), and no microphone — the
+	// microphone is Phase 10 (§76) and the event path that would observe it does not exist
+	// yet.
 	req := e.media.lastTokenRequest(t)
 	if req.Identity != sessionID.String() {
 		t.Errorf("token identity = %q, want %s", req.Identity, sessionID)
@@ -537,8 +540,14 @@ func TestStudentJoinLifecycleEndToEnd(t *testing.T) {
 	if !strings.HasPrefix(req.RoomName, "lk_") || strings.Contains(req.RoomName, "C++") {
 		t.Errorf("token room = %q, want an opaque lk_<run_uuid> name (§8)", req.RoomName)
 	}
-	if len(req.PublishSources) != 1 || req.PublishSources[0] != media.PublishScreenShare {
-		t.Errorf("publish sources = %v, want [SCREEN_SHARE] only", req.PublishSources)
+	wantSources := []media.PublishSource{media.PublishScreenShare, media.PublishCamera}
+	if len(req.PublishSources) != len(wantSources) {
+		t.Fatalf("publish sources = %v, want %v", req.PublishSources, wantSources)
+	}
+	for i := range wantSources {
+		if req.PublishSources[i] != wantSources[i] {
+			t.Fatalf("publish sources = %v, want %v", req.PublishSources, wantSources)
+		}
 	}
 	if !req.CanSubscribe || req.CanPublishData {
 		t.Errorf("grants = subscribe:%v publishData:%v, want true/false", req.CanSubscribe, req.CanPublishData)
@@ -819,6 +828,85 @@ func TestMonitorAdvancesStateFromMediaObservation(t *testing.T) {
 	tiles = e.monitorOf(t, teacherCookies, classroomID)
 	if status := tiles[student.ID.String()]["sessionStatus"]; status != "DISCONNECTED" {
 		t.Errorf("sessionStatus = %v, want DISCONNECTED", status)
+	}
+}
+
+// TestMonitorReportsTheCameraWithoutChangingTheStatus is the §51/§24 acceptance test: the
+// camera flag of the wall comes from the media-plane observation, and an observed camera
+// never moves the session out of CONNECTING — §21 makes the SCREEN the mandatory track, and
+// a camera is not a substitute for supervision.
+func TestMonitorReportsTheCameraWithoutChangingTheStatus(t *testing.T) {
+	e := newMediaE2E(t)
+	teacher, teacherCookies := e.staff(t)
+	student, studentCookies := e.student(t)
+	e.cleanupAccounts(t, teacher.ID, student.ID)
+
+	classroomID := e.openClassroom(t, teacherCookies, student)
+	rec := e.studentCall(t, http.MethodPost, "/api/v1/student/classrooms/"+classroomID.String()+"/join", "", studentCookies)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("join: status = %d (%s)", rec.Code, rec.Body.String())
+	}
+	body := jsonBody(t, rec)
+	sessionID, err := uuid.Parse(body["sessionId"].(string))
+	if err != nil {
+		t.Fatalf("sessionId: %v", err)
+	}
+	token, _ := body["token"].(string)
+	identity := strings.Split(strings.TrimPrefix(token, "fake-token."), ".")[0]
+
+	// --- 1. a camera on a student who is not sharing a screen --------------------------
+	e.media.publish(identity, media.ParticipantTracks{Camera: true})
+	tiles := e.monitorOf(t, teacherCookies, classroomID)
+	tile := tiles[student.ID.String()]
+	if camera, _ := tile["camera"].(map[string]any); camera["active"] != true {
+		t.Fatalf("camera = %v, want active:true from the observation", tile["camera"])
+	}
+	if tile["sessionStatus"] != "CONNECTING" {
+		t.Fatalf("sessionStatus = %v, want CONNECTING: a camera never produces ONLINE (§21/§24)", tile["sessionStatus"])
+	}
+	if screen, _ := tile["screen"].(map[string]any); screen["active"] != false {
+		t.Errorf("screen = %v, want active:false", tile["screen"])
+	}
+	// The connection is still UNKNOWN: only a screen track makes the control plane claim
+	// GOOD, because that is the only media it can attest to.
+	if tile["connection"] != "UNKNOWN" {
+		t.Errorf("connection = %v, want UNKNOWN", tile["connection"])
+	}
+	if stored := e.storedSession(t, sessionID); stored.Status != "CONNECTING" {
+		t.Errorf("stored status = %v, want CONNECTING: the camera must not touch the row", stored.Status)
+	}
+
+	// --- 2. screen and camera together: ONLINE, with the camera reported ----------------
+	e.media.publish(identity, media.ParticipantTracks{ScreenShare: true, Camera: true})
+	tiles = e.monitorOf(t, teacherCookies, classroomID)
+	tile = tiles[student.ID.String()]
+	if tile["sessionStatus"] != "ONLINE" {
+		t.Fatalf("sessionStatus = %v, want ONLINE", tile["sessionStatus"])
+	}
+	if camera, _ := tile["camera"].(map[string]any); camera["active"] != true {
+		t.Errorf("camera = %v, want active:true next to the screen", tile["camera"])
+	}
+
+	// --- 3. the camera goes away, the screen stays: ONLINE, camera false ----------------
+	e.media.publish(identity, media.ParticipantTracks{ScreenShare: true})
+	tiles = e.monitorOf(t, teacherCookies, classroomID)
+	tile = tiles[student.ID.String()]
+	if camera, _ := tile["camera"].(map[string]any); camera["active"] != false {
+		t.Errorf("camera = %v, want active:false after the camera was unpublished", tile["camera"])
+	}
+	if tile["sessionStatus"] != "ONLINE" {
+		t.Errorf("sessionStatus = %v, want ONLINE: the screen is still shared", tile["sessionStatus"])
+	}
+
+	// --- 4. the participant is gone: the camera flag is not carried over ----------------
+	e.media.disconnect(identity)
+	tiles = e.monitorOf(t, teacherCookies, classroomID)
+	tile = tiles[student.ID.String()]
+	if camera, _ := tile["camera"].(map[string]any); camera["active"] != false {
+		t.Errorf("camera = %v, want active:false for an absent participant", tile["camera"])
+	}
+	if tile["sessionStatus"] != "DISCONNECTED" {
+		t.Errorf("sessionStatus = %v, want DISCONNECTED", tile["sessionStatus"])
 	}
 }
 

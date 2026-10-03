@@ -11,16 +11,19 @@ import { useRealtimeStore } from '../stores/realtime.ts'
 import { useScreenShareStore } from '../stores/screen-share'
 
 /**
- * 课堂会话页（§55 / §56 / §22 / §49）—— Phase 6 的真实实现。
+ * 课堂会话页（§55 / §56 / §22 / §49）—— Phase 6 的真实实现，Phase 9 追加摄像头。
  *
- * 这一页只做四件事，别的一概不做：
+ * 这一页只做五件事，别的一概不做：
  *
  * 1. **接收** PreJoin 交接过来的凭据与那条已经授权的屏幕轨道（§18 的顺序：
  *    先 Gate，后 join），连上 LiveKit 并把它发布成 ScreenShare（§20）。
- * 2. **只显示状态**（§56）：正在共享整屏 / 摄像头与麦克风未启用 / 网络质量 /
+ * 2. **只显示状态**（§56）：正在共享整屏 / 摄像头与麦克风是否启用 / 网络质量 /
  *    当前状态。**没有**自己的屏幕预览——那会形成 screen inside screen inside
  *    screen，而且对"我到底有没有被看见"这个问题毫无帮助（页面上那句
  *    「正在共享整个屏幕」才是答案）。
+ *    **例外是摄像头自视小窗**（Phase 9，§24）：理由见 store 里 `cameraStream` 的说明——
+ *    学生必须能确认自己在画面里（角度、光线、开错设备都只能靠眼睛发现），
+ *    而屏幕共享不存在这个问题（共享的是整块显示器，没有"取景"可言）。
  * 3. **在共享中断时给出一条恢复路径**（§22）：提示 + 「重新共享整个屏幕」，
  *    重新走一遍**完整**的 Gate（含 displaySurface 检查），然后发布新轨道。
  *    这里**不**重新 join——会话还在，只是轨道没了；重连是媒体链路的另一条路径。
@@ -98,6 +101,48 @@ const gateMessage = computed(() =>
 
 /** 正在重新共享：按钮 loading + 一句说明（§22 的恢复过程要可见）。 */
 const resharing = computed(() => screenShare.isRequesting)
+
+/* -------------------------------------------------------------------------- */
+/* 摄像头自视画面（§24 / §56 的唯一例外）                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 自视小窗的 `<video>`。
+ *
+ * WHY 直接绑 `srcObject` 而不是走媒体层：这条流是**本地**的（还没经过任何 SFU），
+ * 学生要看的就是"摄像头到底拍到了什么"。走订阅链路既没有意义（没有人会订阅自己），
+ * 也会把 §26 的"学生端不订阅任何轨道"这条不变量弄出一个例外。
+ *
+ * `flush: 'post'`：`<video>` 是 `v-if` 出来的，只有 DOM 更新之后 ref 才有值。
+ */
+const cameraVideoRef = ref<HTMLVideoElement | null>(null)
+
+watch(
+  [() => session.cameraStream, cameraVideoRef],
+  ([stream]) => {
+    const element = cameraVideoRef.value
+    if (element === null) return
+    element.srcObject = stream
+  },
+  { immediate: true, flush: 'post' },
+)
+
+/** §24：入口只在**进入课堂之后**出现；没进课堂时连按钮都不该有。 */
+const canToggleCamera = computed(() => session.canUseCamera)
+
+/** 摄像头的一行状态文字（与"正在共享整个屏幕"是两件独立的事）。 */
+const cameraStatusText = computed(() => {
+  switch (session.cameraState) {
+    case 'on':
+      return '已开启'
+    case 'requesting':
+      return '正在请求摄像头…'
+    case 'error':
+      return '未开启'
+    default:
+      return '未开启'
+  }
+})
 
 /**
  * 进入本页时开始会话。
@@ -283,13 +328,42 @@ watch(sessionId, (next) => {
 
           <dl class="grid gap-3 border-t border-border-subtle pt-4 text-sm sm:grid-cols-3">
             <!--
-              摄像头与麦克风是 Phase 9 / Phase 10 的内容（§24/§25）。
-              这里刻意显示成**不可点的说明文字**而不是开关：一个点不动的假开关
-              会让学生以为"打开失败"，而老师那端根本没有这个功能。
+              摄像头（§24）：进入课堂之后才有的**真实开关**，点一下才申请设备权限。
+              它与上面那行屏幕状态是两件独立的事：摄像头开着不代表屏幕还在共享，
+              反之亦然——所以这里既不改那句话，也不受它影响。
             -->
             <div class="space-y-1" data-testid="camera-row">
               <dt class="text-xs tracking-wide text-ink-muted uppercase">摄像头</dt>
-              <dd class="text-ink">未启用（Phase 9 接入）</dd>
+              <dd class="flex flex-wrap items-center gap-2 text-ink">
+                <AppButton
+                  v-if="canToggleCamera"
+                  size="sm"
+                  variant="secondary"
+                  :loading="session.isCameraRequesting"
+                  :disabled="session.isCameraRequesting"
+                  data-testid="toggle-camera"
+                  @click="session.toggleCamera()"
+                >
+                  {{ session.cameraActionLabel }}
+                </AppButton>
+                <!-- 还没进入课堂：入口不该出现（§24 明令禁止在此之前请求摄像头）。 -->
+                <span v-else class="text-ink-muted">未启用</span>
+                <span data-testid="camera-status">{{ cameraStatusText }}</span>
+                <!--
+                  §24 的自视小窗（约 120px）。**只有摄像头**：屏幕预览依旧禁止（§56），
+                  否则就是 screen inside screen inside screen，而摄像头没有替代方案——
+                  学生必须能亲眼确认自己在画面里。
+                -->
+                <video
+                  v-if="session.isCameraOn"
+                  ref="cameraVideoRef"
+                  class="h-[90px] w-[120px] rounded-control border border-border-subtle bg-surface-muted object-cover"
+                  autoplay
+                  playsinline
+                  muted
+                  data-testid="camera-self-view"
+                />
+              </dd>
             </div>
             <div class="space-y-1" data-testid="microphone-row">
               <dt class="text-xs tracking-wide text-ink-muted uppercase">麦克风</dt>
@@ -394,6 +468,21 @@ watch(sessionId, (next) => {
         data-testid="screen-gate-error"
       >
         {{ gateMessage.description }}
+      </AppAlert>
+
+      <!--
+        摄像头失败（§24）。刻意用 **info** 而不是 danger，也不叫"错误"：
+        摄像头是可选设备（§21），它打不开与"课堂出问题了"完全是两回事。
+        用红色告警会把学生吓到以为自己上不了课，也会把上面那条真正的
+        「⚠ 已停止屏幕共享」淹没掉。文案本身来自词表，已包含下一步动作。
+      -->
+      <AppAlert
+        v-if="session.hasCameraFailure"
+        tone="info"
+        title="摄像头没有开启（不影响上课）"
+        data-testid="camera-failure"
+      >
+        {{ session.cameraFailure?.message }}
       </AppAlert>
 
       <!--

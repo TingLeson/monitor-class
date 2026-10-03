@@ -298,6 +298,67 @@ func TestScreenLostReachesTheOwnerAndThatStudentOnly(t *testing.T) {
 	}
 }
 
+// TestCameraChangedGoesToTheOwnerAndNobodyElse is the §26/§75 audience rule: a student's
+// camera is a fact for the teacher's wall, and for nobody else. Not for the classroom (a
+// classmate must not learn who has a camera on) and not for the student themself (their
+// own page owns that button; see Service.CameraChanged).
+func TestCameraChangedGoesToTheOwnerAndNobodyElse(t *testing.T) {
+	service, hub, audience := newServiceUnderTest()
+	ctx := context.Background()
+
+	classroomID, runID, owner := uuid.New(), uuid.New(), uuid.New()
+	alice := StudentRef{StudentID: uuid.New(), DisplayName: "张三"}
+	bob := StudentRef{StudentID: uuid.New(), DisplayName: "李四"}
+	audience.forRun(runID, audience.seed(classroomID, "C++", owner, alice, bob))
+
+	ref := session.SessionRef{SessionID: uuid.New(), StudentID: alice.StudentID, RunID: runID}
+	for _, active := range []bool{true, false} {
+		if err := service.CameraChanged(ctx, ref, active); err != nil {
+			t.Fatalf("CameraChanged(%v): %v", active, err)
+		}
+	}
+
+	messages := hub.teacherMessages(TypeCameraChanged)
+	if len(messages) != 2 {
+		t.Fatalf("teacher messages = %d, want one per change", len(messages))
+	}
+	for i, message := range messages {
+		if message.Data["studentId"] != alice.StudentID.String() ||
+			message.Data["sessionId"] != ref.SessionID.String() {
+			t.Fatalf("data = %+v", message.Data)
+		}
+		if message.Data["active"] != (i == 0) {
+			t.Fatalf("active = %v on message %d, want true then false", message.Data["active"], i)
+		}
+	}
+	if hub.sent[0].teacher != owner {
+		t.Fatalf("sent to %s, want the owner %s", hub.sent[0].teacher, owner)
+	}
+
+	// THE assertion of this test: no student connection heard anything, not the student
+	// whose camera it is and not their classmate.
+	if recipients := hub.studentsWith(TypeCameraChanged); len(recipients) != 0 {
+		t.Fatalf("CAMERA_CHANGED reached student connections %v, want none (§26)", recipients)
+	}
+}
+
+// TestCameraChangedForAnUnrosteredStudentIsNotSent reuses the roster guard: a session that
+// outlived a roster entry must not put a tile on the wall that no roster explains.
+func TestCameraChangedForAnUnrosteredStudentIsNotSent(t *testing.T) {
+	service, hub, audience := newServiceUnderTest()
+	classroomID, runID, owner := uuid.New(), uuid.New(), uuid.New()
+	alice := StudentRef{StudentID: uuid.New(), DisplayName: "张三"}
+	audience.forRun(runID, audience.seed(classroomID, "C++", owner, alice))
+
+	stranger := session.SessionRef{SessionID: uuid.New(), StudentID: uuid.New(), RunID: runID}
+	if err := service.CameraChanged(context.Background(), stranger, true); err != nil {
+		t.Fatalf("CameraChanged(): %v", err)
+	}
+	if len(hub.sent) != 0 {
+		t.Fatalf("sent = %+v, want nothing", hub.sent)
+	}
+}
+
 func TestScreenRestoredUsesTheSameAudiences(t *testing.T) {
 	service, hub, audience := newServiceUnderTest()
 	ctx := context.Background()
@@ -336,6 +397,7 @@ func TestAMessageAboutSomebodyOffTheRosterIsNotSent(t *testing.T) {
 		func() error { return service.StudentOffline(ctx, stranger, session.OfflineDisconnected) },
 		func() error { return service.ScreenLost(ctx, stranger) },
 		func() error { return service.ScreenRestored(ctx, stranger) },
+		func() error { return service.CameraChanged(ctx, stranger, true) },
 	} {
 		if err := call(); err != nil {
 			t.Fatalf("call: %v", err)

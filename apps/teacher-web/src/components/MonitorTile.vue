@@ -2,7 +2,8 @@
 import type { MonitorStudent } from '@classwatch/shared-types'
 import { AppBadge } from '@classwatch/ui'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import type { ScreenSubscription } from '../lib/media/media-room.ts'
+import { deriveCameraPipState, isCameraPipVisible } from '../lib/camera-pip.ts'
+import type { CameraSubscription, ScreenSubscription } from '../lib/media/media-room.ts'
 import {
   TILE_BODY_HINT,
   TILE_BODY_TEXT,
@@ -15,7 +16,7 @@ import {
 import { createTileVisibility, type TileVisibilityHandle } from '../lib/tile-visibility.ts'
 
 /**
- * 监督卡片（§29 / §51 / §52 / §73）。
+ * 监督卡片（§29 / §51 / §52 / §73；Phase 9 追加摄像头画中画）。
  *
  * 卡片由两部分拼成，界线必须清楚：
  * - **业务状态**（徽章、是否该有画面）来自 `student`（Monitor DTO，§51）；
@@ -32,18 +33,30 @@ import { createTileVisibility, type TileVisibilityHandle } from '../lib/tile-vis
  *   老师端把学生桌面的声音外放出来就是一个回声源（老师说话 → 学生麦克风 → 又回到
  *   老师这边）。所以这里宁可显式写死 `muted`，也不留"看起来没事"的默认值。
  *
- * 摄像头画中画（§29 的右下角 CAM 小窗）属于 Phase 9，这里**不**预留空框：
- * 一个永远空着的框会被老师读成"摄像头坏了"。页脚那行"摄像头已开启"用的是
- * DTO 里真实存在的 `camera.active`，不是假 UI。
+ * 摄像头画中画（§29 的右下角 CAM 小窗）有一条与屏幕相反的纪律：
+ * **没有画面就什么都不画**。一个空框会被老师读成"学生把摄像头关了"或"摄像头坏了"，
+ * 而这两种结论都不成立；只有真的拿到订阅时小窗才存在（见 camera-pip.ts）。
  */
-const props = defineProps<{
-  student: MonitorStudent
-  /** 已建立的订阅；null 表示这个学生当前没有可播放的画面。 */
-  subscription: ScreenSubscription | null
-  mediaState: MonitorMediaState
-  /** 这张卡片是不是当前 Focus 的对象（只影响 aria 与高亮，不影响订阅）。 */
-  selected?: boolean
-}>()
+const props = withDefaults(
+  defineProps<{
+    student: MonitorStudent
+    /** 已建立的屏幕订阅；null 表示这个学生当前没有可播放的画面。 */
+    subscription: ScreenSubscription | null
+    mediaState: MonitorMediaState
+    /**
+     * 已建立的**摄像头**订阅（§24）；null 表示现在没有可播的摄像头画面。
+     *
+     * 可选是为了让"只关心屏幕"的调用方（以及只读卡片的测试）不必编一个假订阅出来；
+     * 缺省即"没有小窗"。
+     */
+    cameraSubscription?: CameraSubscription | null
+    /** 摄像头订阅的媒体状态（'failed' 时 Focus 面板会写出原因，卡片不画小窗）。 */
+    cameraMediaState?: MonitorMediaState
+    /** 这张卡片是不是当前 Focus 的对象（只影响 aria 与高亮，不影响订阅）。 */
+    selected?: boolean
+  }>(),
+  { cameraSubscription: null, cameraMediaState: 'none', selected: false },
+)
 
 const emit = defineEmits<{
   /** 老师要放大这个学生（点击或键盘激活）。带上事件是为了让父组件能把焦点还回来。 */
@@ -54,6 +67,7 @@ const emit = defineEmits<{
 
 const rootRef = ref<HTMLElement | null>(null)
 const videoRef = ref<HTMLVideoElement | null>(null)
+const cameraVideoRef = ref<HTMLVideoElement | null>(null)
 
 /**
  * 当前的 detach 函数。
@@ -62,10 +76,13 @@ const videoRef = ref<HTMLVideoElement | null>(null)
  * 放进响应式 state 还会让 Vue 去代理一个持有媒体对象的闭包。
  */
 let detach: (() => void) | null = null
+let detachCamera: (() => void) | null = null
 
 function detachCurrent(): void {
   detach?.()
   detach = null
+  detachCamera?.()
+  detachCamera = null
 }
 
 /**
@@ -78,9 +95,28 @@ function detachCurrent(): void {
 watch(
   [() => props.subscription, videoRef],
   ([subscription]) => {
-    detachCurrent()
+    detach?.()
+    detach = null
     if (subscription === null || videoRef.value === null) return
     detach = subscription.attach(videoRef.value)
+  },
+  { immediate: true, flush: 'post' },
+)
+
+/**
+ * 画中画的 attach（§29）。
+ *
+ * 与屏幕那个 watcher 分开：两条轨道是**两份独立的订阅**，一个 watcher 里同时处理
+ * 两条轨道，任何一次重新订阅都会把另一条的画面摘掉再挂上——表现是屏幕闪一下。
+ * 这里也**不**再判断该不该订：那是 store 的计划（§52），组件只负责"有订阅就挂画面"。
+ */
+watch(
+  [() => props.cameraSubscription, cameraVideoRef],
+  ([subscription]) => {
+    detachCamera?.()
+    detachCamera = null
+    if (subscription === null || cameraVideoRef.value === null) return
+    detachCamera = subscription.attach(cameraVideoRef.value)
   },
   { immediate: true, flush: 'post' },
 )
@@ -148,6 +184,24 @@ const body = computed(() =>
 const placeholderText = computed(() => (body.value === 'live' ? null : TILE_BODY_TEXT[body.value]))
 const placeholderHint = computed(() => (body.value === 'live' ? null : TILE_BODY_HINT[body.value]))
 const connectionHint = computed(() => describeConnectionHint(props.student.connection))
+
+/**
+ * 画中画的状态（§29 / §52）。
+ *
+ * 只有 `'visible'` 才会渲染 `<video>`。`camera.active === false`、订阅还没到
+ * （waiting）、订阅失败（failed）三种情况都**不画小窗**——空白框在监督墙上是最糟的
+ * 一种信息（老师无法区分"没开"与"坏了"）。失败原因留给 Focus 面板去说，那里有位置。
+ */
+const cameraPipState = computed(() =>
+  deriveCameraPipState(props.student, {
+    state: props.cameraMediaState,
+    hasSubscription: props.cameraSubscription !== null,
+  }),
+)
+const showCameraPip = computed(() => isCameraPipVisible(cameraPipState.value))
+
+/** 页面底部那个角标：与画中画用**同一份**合成结果，两者永远不可能互相矛盾。 */
+const cameraOn = computed(() => cameraPipState.value !== 'off')
 </script>
 
 <template>
@@ -178,7 +232,7 @@ const connectionHint = computed(() => describeConnectionHint(props.student.conne
     </header>
 
     <!-- 桌面屏幕是卡片主体（§29）；没有画面时给出**具体原因**，而不是一个黑框。 -->
-    <div class="aspect-video bg-surface-muted">
+    <div class="relative aspect-video bg-surface-muted">
       <video
         v-if="body === 'live'"
         ref="videoRef"
@@ -192,13 +246,42 @@ const connectionHint = computed(() => describeConnectionHint(props.student.conne
         <p class="text-sm text-ink-muted" data-testid="tile-placeholder">{{ placeholderText }}</p>
         <p v-if="placeholderHint" class="text-xs text-ink-muted/80">{{ placeholderHint }}</p>
       </div>
+
+      <!--
+        §29 的摄像头画中画：右下角一个小窗。
+        它只在**真的拿到订阅**时出现（showCameraPip），没有画面时这块 DOM 根本不存在。
+        muted 同样不能省：摄像头轨道通常带音频，而老师端把学生的声音外放出来
+        就是一条回声回路（老师说话 → 学生麦克风 → 又回到老师这边）。
+      -->
+      <div
+        v-if="showCameraPip"
+        class="absolute right-2 bottom-2 w-[120px] overflow-hidden rounded-control border border-border-subtle bg-surface-muted shadow-card"
+        data-testid="tile-camera-pip"
+        aria-label="学生摄像头画面"
+      >
+        <video
+          ref="cameraVideoRef"
+          class="h-full w-full object-cover"
+          autoplay
+          playsinline
+          muted
+          data-testid="tile-camera-video"
+        />
+      </div>
     </div>
 
     <footer class="flex items-center justify-between gap-2 border-t border-border-subtle px-4 py-2">
       <span class="text-xs text-ink-muted" data-testid="tile-connection">
         连接：{{ connectionHint }}
       </span>
-      <span v-if="student.camera.active" class="text-xs text-ink-muted">摄像头已开启</span>
+      <!--
+        角标说的是**业务事实**（DTO 的 camera.active，§51），与上面那个小窗不是一回事：
+        学生开着摄像头但老师端还没订到画面时，这里显示"已开启"而小窗不出现——
+        这恰好是老师需要知道的区别（他开着了，只是画面还没到）。
+      -->
+      <span v-if="cameraOn" class="text-xs text-ink-muted" data-testid="tile-camera-flag">
+        摄像头已开启
+      </span>
     </footer>
   </article>
 </template>

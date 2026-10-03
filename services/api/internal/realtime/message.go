@@ -68,10 +68,13 @@ const (
 	// TypeScreenRestored is the counterpart of TypeScreenLost. Same audiences, same
 	// data.
 	TypeScreenRestored MessageType = "SCREEN_RESTORED"
-	// TypeCameraChanged and TypeMicChanged are defined by the contract and are not sent
-	// in Phase 8: the camera is Phase 9 (§75) and the microphone Phase 10 (§76). They
-	// exist here so the frontend can write its switch statement once. Data:
-	// {studentId, sessionId, active}.
+	// TypeCameraChanged is sent to the OWNER teacher when a student's camera goes on or
+	// off (§24/§75). Data: {studentId, sessionId, active}. It is never addressed to a
+	// classroom: a classmate's camera is exactly the kind of fact §26 hides.
+	//
+	// TypeMicChanged is defined by the contract and is not sent in Phase 9: the
+	// microphone is Phase 10 (§76). They exist here so the frontend can write its switch
+	// statement once. Same data shape.
 	TypeCameraChanged MessageType = "CAMERA_CHANGED"
 	TypeMicChanged    MessageType = "MIC_CHANGED"
 	// TypePrivateTalkRequest, TypePrivateTalkStarted and TypePrivateTalkEnded belong to

@@ -75,6 +75,24 @@ export interface ScreenSubscription {
 }
 
 /**
+ * 一次已建立的**摄像头**订阅（§24 / §29 / §52）。
+ *
+ * WHY 与 {@link ScreenSubscription} 分开而不是复用它：
+ * - 摄像头**没有画质档位**。§52 只规定"网格低 / Focus 高"，而画中画与 Focus 右侧
+ *   的 Camera 区都是小窗（§29 的右下角角标、§30 的侧栏），不存在需要升档的场景。
+ *   复用 ScreenSubscription 就必须实现一个永远只被调用一次的 `setQuality`，
+ *   那是一个看起来有、实际没有的能力（§80：不要用假接口撑门面）。
+ * - 它是**另一条轨道**。摄像头与屏幕是同一个 participant 的两个 publication，
+ *   一条的生命周期与另一条无关（学生可以只开摄像头、也可以中途关掉）。
+ *   共用一个类型会让人以为它们是同一个东西的两个视图。
+ */
+export interface CameraSubscription {
+  identity: string
+  /** 与屏幕订阅同约定：把画面挂到 `<video>` 上，返回 detach。 */
+  attach(element: HTMLVideoElement): () => void
+}
+
+/**
  * 老师端的媒体房间。
  *
  * `subscribeScreen()` 必须**幂等**：同一个 identity 反复调用只能产生一次订阅。
@@ -98,7 +116,19 @@ export interface MonitorRoom {
   subscribeScreen(identity: string, quality?: ScreenQuality): Promise<ScreenSubscription | null>
   /** 取消订阅（同时停止下行，§52 的"取消不可见 Track 的订阅"）。 */
   unsubscribeScreen(identity: string): Promise<void>
-  /** 有人加入/离开，或发布了新的屏幕轨道：业务状态仍以 monitor DTO 为准。 */
+  /**
+   * 订阅某参与者的**摄像头**轨道（§24）；他没有在发布摄像头时返回 null。
+   *
+   * 与 `subscribeScreen` 一样必须**幂等**（同一 identity 反复调用只产生一次订阅），
+   * 而且是**另一条独立的订阅**：取消摄像头订阅绝不能影响屏幕那条，反之亦然。
+   *
+   * 刻意没有画质参数：画中画与 Focus 的 Camera 区都是小窗，永远按最低档订阅
+   * （见 {@link CameraSubscription} 的说明）。
+   */
+  subscribeCamera(identity: string): Promise<CameraSubscription | null>
+  /** 取消摄像头订阅（不影响屏幕那一条）。 */
+  unsubscribeCamera(identity: string): Promise<void>
+  /** 有人加入/离开，或发布了新的屏幕/摄像头轨道：业务状态仍以 monitor DTO 为准。 */
   onParticipantsChanged(listener: () => void): () => void
   onScreenSubscribed(listener: (identity: string) => void): () => void
   onScreenUnsubscribed(listener: (identity: string) => void): () => void

@@ -1,7 +1,16 @@
 import type { RealtimeConnectionState } from '@classwatch/api-client'
 import type { RealtimeEvent, StudentClassroom } from '@classwatch/shared-types'
 import { defineStore } from 'pinia'
-import { computed, ref } from 'vue'
+import { computed, markRaw, ref, shallowRef } from 'vue'
+import {
+  releaseCameraCapture,
+  requestCamera,
+  toCameraFailure,
+  toCameraFailureKindOf,
+  type CameraCapture,
+  type CameraFailure,
+  type CameraState,
+} from '../lib/camera-capture.ts'
 import {
   createScreenPublisherRoom,
   type ConnectionQualityLevel,
@@ -74,6 +83,11 @@ export interface PrepareInput {
  *    "等待课堂确认"，直到服务端说 `SCREEN_RESTORED` 才算恢复正常。
  * 5. **课堂是否开着以 WebSocket 事件为主、低频轮询兜底**（§47/§49）：
  *    事件负责快，轮询负责"通道断了也不漏"（见 `syncPollTimer`）。
+ * 6. **摄像头是可选设备，与课堂状态完全解耦**（§21/§24）。`cameraState` 只回答
+ *    "摄像头开没开"，它不是 `phase` 的一部分：摄像头打不开不会把 phase 变成
+ *    media-error（学生照样能上课），屏幕丢了也不会因为"摄像头还开着"就显得正常
+ *    （SessionView 里那条 ⚠ 提示是独立的）。`on` 的含义被收紧成"已发布、老师看得见"——
+ *    连接一断就释放设备，绝不留下亮着灯却无人能看的摄像头。
  */
 export const useMediaSessionStore = defineStore('student-media-session', () => {
   /* ---------------------------------------------------------------------- */
@@ -103,6 +117,35 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
   const realtimeState = ref<RealtimeConnectionState>('closed')
 
   /* ---------------------------------------------------------------------- */
+  /* 摄像头（§24）                                                           */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * 摄像头状态机（`off | requesting | on | error`，定义与迁移图见 camera-capture.ts）。
+   *
+   * 它与 `phase` 是两件**互不影响**的事：这里是"这个可选设备现在开没开"，
+   * `phase` 是"我这一端在课堂里的位置"。把摄像头塞进 phase 会立刻产生两个错误结论：
+   * 摄像头失败变成"媒体连接失败"（学生被吓到，其实课堂好好的），
+   * 以及"摄像头开着"掩盖掉"屏幕已经停了"（§21 的强制规则被绕过）。
+   */
+  const cameraState = ref<CameraState>('off')
+  /** 摄像头失败的类别 + 中文文案（失败不影响会话，见文件头第 6 点）。 */
+  const cameraFailure = ref<CameraFailure | null>(null)
+  /**
+   * 供 §56 的小自视画面绑定的本地流。
+   *
+   * WHY 放 `shallowRef` + `markRaw`：MediaStream 是浏览器宿主对象，被 Vue 深度代理
+   * 之后 `srcObject` 赋值会出现 `Illegal invocation`（同 screen-share store 里那段
+   * 关于 markRaw 的说明）。视图只把它交给 `<video>.srcObject`，不做任何业务判断。
+   *
+   * WHY 允许这一处 `<video>`，而屏幕上仍然禁止预览（§56）：屏幕预览会形成
+   * screen-inside-screen-inside-screen，而且"我正在共享整屏"这句话本来就由状态行回答；
+   * 摄像头则相反——学生**必须**能确认自己真的在画面里（角度、光线、有没有开错设备），
+   * 而那句话是任何文字都代替不了的。两者是不同的问题，因此规则不同。
+   */
+  const cameraStream = shallowRef<MediaStream | null>(null)
+
+  /* ---------------------------------------------------------------------- */
   /* 只存在于内存的私有内容（绝不进 state，见文件头第 1 点）                  */
   /* ---------------------------------------------------------------------- */
 
@@ -119,6 +162,24 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
    */
   let capture: ScreenCapture | null = null
   let room: ScreenPublisherRoom | null = null
+  /**
+   * 当前持有的摄像头采集（§24）。
+   *
+   * 与 `capture` 一样刻意**不是** ref：MediaStreamTrack 是浏览器宿主对象，
+   * 被 Vue 代理后会出现 `Illegal invocation`（详见 screen-share.ts 里那段说明）。
+   * 界面需要的只是"开没开"（`cameraState`）与那条流（`cameraStream`，已 markRaw）。
+   */
+  let cameraCapture: CameraCapture | null = null
+  let unsubscribeCameraEnded: (() => void) | null = null
+  /**
+   * 摄像头请求序号。
+   *
+   * WHY 需要它：`getUserMedia` 与随后的 publish 都是异步的，而学生可以在几百毫秒里
+   * 点开又点关。没有序号的话，"关闭"之后才回来的那条轨道会覆盖掉关闭动作的结果——
+   * 界面显示已关闭，设备却亮着灯。每次状态迁移都让序号自增，晚到的结果一律作废
+   * 并**立刻释放**它拿到的那条轨道。
+   */
+  let cameraSeq = 0
   /** 房间事件与轨道 ended 的取消订阅函数；退出时必须逐个调用。 */
   let roomUnsubscribers: (() => void)[] = []
   let unsubscribeEnded: (() => void) | null = null
@@ -150,6 +211,21 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
   const awaitingScreenRestore = computed(
     () => screenLostByServer.value && (phase.value === 'online' || phase.value === 'connecting'),
   )
+
+  /**
+   * 摄像头入口是否可见（§24：**进入课堂之后**才显示）。
+   *
+   * WHY 用 phase 而不是"页面上有按钮"：§24 的原话是"Student 已经成功进入课堂以后
+   * 才显示 📷 开启摄像头"，也就是**不允许**在 PreJoin / 课堂详情页出现这个入口。
+   * `online` 与 `screen-lost` 都算"已经在课堂里"：摄像头是可选设备（§21），
+   * 屏幕断了不代表摄像头开不了，把入口一起收掉反而是把两件事混为一谈。
+   */
+  const canUseCamera = computed(() => phase.value === 'online' || phase.value === 'screen-lost')
+  const isCameraOn = computed(() => cameraState.value === 'on')
+  const isCameraRequesting = computed(() => cameraState.value === 'requesting')
+  const hasCameraFailure = computed(() => cameraFailure.value !== null)
+  /** 按钮文案（§56 的线框图是「摄像头 [开启]」）。 */
+  const cameraActionLabel = computed(() => (isCameraOn.value ? '关闭摄像头' : '📷 开启摄像头'))
 
   /* ---------------------------------------------------------------------- */
   /* 内部工具                                                                */
@@ -188,6 +264,14 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     detachListeners()
     const current = room
     room = null
+    /**
+     * 摄像头跟着连接一起放手（见 dropCamera）。
+     *
+     * WHY 放在这里而不是各个调用点：`teardownRoom` 是"这条媒体连接结束了"的唯一出口
+     * （退出、重试、课堂关闭、切课堂都走它）。分开写就一定会漏掉其中一条路径，
+     * 而漏掉的后果是学生的摄像头灯在课堂结束后继续亮着（§65 Case 14 的同一类问题）。
+     */
+    dropCamera()
     if (!current) return
     try {
       await current.disconnect()
@@ -307,6 +391,153 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     })
   }
 
+  /* ---------------------------------------------------------------------- */
+  /* 摄像头（§24 / §56）                                                     */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * 释放摄像头采集（幂等）。
+   *
+   * WHY 一定要真的 `stop()` 而不是只 unpublish：`stop()` 是唯一能让**操作系统级**
+   * 摄像头指示灯灭掉的动作。只撤下发布的话，学生会看到一个"已关闭"的界面，
+   * 而摄像头灯还亮着——那是最直接的一种信任崩塌（他会认为自己在被偷看）。
+   * 采集层保证 `stop()` 幂等，所以这里可以无脑调用。
+   */
+  function releaseCamera(): void {
+    unsubscribeCameraEnded?.()
+    unsubscribeCameraEnded = null
+    releaseCameraCapture(cameraCapture)
+    cameraCapture = null
+    cameraStream.value = null
+  }
+
+  /**
+   * 连接已经不可用时丢弃摄像头（**不**试图 unpublish：连接没了，没有信令通道）。
+   *
+   * WHY 连接一断就必须放手：`on` 的含义是"已发布、老师看得见"。连接断了还留着
+   * 一条 live 轨道，界面会继续显示"摄像头 已开启"，而老师那端什么都没有。
+   */
+  function dropCamera(): void {
+    cameraSeq += 1
+    releaseCamera()
+    cameraState.value = 'off'
+    cameraFailure.value = null
+  }
+
+  /**
+   * 开启摄像头（§24：**只有学生点击**才会走到这里）。
+   *
+   * 顺序不能变：先申请设备 → 再发布。反过来的话，publish 成功而设备授权失败，
+   * 老师那端会先看到一个空的摄像头位。
+   *
+   * 这个函数**从不抛出**，也**从不触碰** phase / screen 相关的状态：摄像头失败
+   * 必须完全局限在 `cameraState` / `cameraFailure` 里（§21：屏幕才是 mandatory）。
+   */
+  async function enableCamera(): Promise<void> {
+    // 重入保护：requesting 期间的重复点击必须是空操作（否则每次点击都是一次设备请求）。
+    if (cameraState.value === 'requesting' || cameraState.value === 'on') return
+    const active = room
+    /**
+     * 没有媒体连接时**不**申请设备权限。
+     *
+     * WHY 这条守卫放在最前面：一条没有房间可发布的轨道只会亮着摄像头灯，却谁也看不到。
+     * 界面上这个入口本来就只在课堂里出现（见 `canUseCamera`），这里是那道不变量。
+     */
+    if (active === null || !canUseCamera.value) return
+
+    const seq = ++cameraSeq
+    cameraState.value = 'requesting'
+    cameraFailure.value = null
+
+    /** 这次开启是否已经被放弃（学生点了关闭、离开课堂、或媒体连接断了）。 */
+    const abandoned = (): boolean => seq !== cameraSeq || room !== active
+
+    try {
+      const next = await requestCamera()
+
+      /**
+       * 请求飞行期间被放弃：这条轨道**没有主人**了，必须立刻释放。
+       * 少了这一句就会出现"学生已经关了摄像头，灯却亮着"。
+       */
+      if (abandoned()) {
+        releaseCameraCapture(next)
+        return
+      }
+
+      cameraCapture = next
+      cameraStream.value = markRaw(next.stream)
+      unsubscribeCameraEnded = next.onEnded(() => {
+        // 身份判断：回调可能来自一条已经被替换掉的旧轨道。
+        if (cameraCapture !== next) return
+        /**
+         * 设备被拔出 / 被系统或别的程序抢走。轨道已经死了，界面必须回到"没开"，
+         * 并给出一句解释——继续显示"已开启"会让老师盯着一个空位。
+         */
+        releaseCamera()
+        /**
+         * 还要把这条已经死掉的**发布**撤下来（与 §22 的屏幕丢失同一种处理）。
+         *
+         * WHY 不能只 stop 本地轨道：本地放手之后，SFU 里仍留着一条没有轨道在推流的
+         * camera 发布，服务端的 `track_unpublished` webhook 便永远不会到——
+         * 于是老师那端的 `camera.active` 一直停在 true，画中画钉在最后一帧上。
+         */
+        void active.unpublishCameraTrack().catch(() => undefined)
+        cameraState.value = 'error'
+        cameraFailure.value = toCameraFailure('track-ended')
+      })
+
+      await active.publishCameraTrack(next.track)
+
+      /**
+       * 发布完成才发现这次开启已经被放弃（学生点得太快）：把刚发布的轨道撤下来。
+       * 不做这一步，服务端会留着一条没有本地轨道在推流的 camera 发布，
+       * 老师那端就会出现一个永远黑屏的画中画。
+       */
+      if (abandoned()) {
+        await active.unpublishCameraTrack().catch(() => undefined)
+        return
+      }
+
+      cameraState.value = 'on'
+    } catch (cause) {
+      // 晚到的失败同样作废：它属于一次已经被放弃的开启。
+      if (abandoned()) return
+      releaseCamera()
+      cameraState.value = 'error'
+      const kind = toCameraFailureKindOf(cause)
+      cameraFailure.value = toCameraFailure(kind)
+      // 只留错误名：异常对象可能带上设备信息（§44 的"凭据不进日志"同样适用于设备）。
+      const name = cause instanceof Error ? cause.name : typeof cause
+      console.error(`[media-session] camera failed: ${name}`)
+    }
+  }
+
+  /**
+   * 关闭摄像头：**unpublish + 真正 stop 本地轨道**（§24 的"允许 开 / 关 / 再开"）。
+   *
+   * WHY 必须两步都做：
+   * - 只 stop 不 unpublish：老师那端留着一条永远黑屏的发布；
+   * - 只 unpublish 不 stop：摄像头指示灯不灭（见 releaseCamera 的说明）。
+   *
+   * 先发信令再释放设备：即便 unpublish 卡在网络里，本地也必须在同一个 tick 里放手——
+   * 学生点了"关闭"，灯不能等到一次网络往返之后才灭。
+   */
+  function disableCamera(): void {
+    if (cameraState.value === 'off' && cameraCapture === null) return
+    cameraSeq += 1
+    const active = room
+    if (active !== null) void active.unpublishCameraTrack().catch(() => undefined)
+    releaseCamera()
+    cameraState.value = 'off'
+    cameraFailure.value = null
+  }
+
+  /** 学生点击摄像头开关时的唯一入口。 */
+  function toggleCamera(): void {
+    if (cameraState.value === 'on') disableCamera()
+    else void enableCamera()
+  }
+
   /** 订阅房间事件：断线、重连、连接质量。 */
   function subscribeRoomEvents(active: ScreenPublisherRoom): void {
     roomUnsubscribers.push(
@@ -326,6 +557,12 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
         reconnecting.value = false
         fail('disconnected')
         phase.value = 'media-error'
+        /**
+         * 摄像头必须一起放手：`on` 的含义是"已发布、老师看得见"，而这条连接已经没了。
+         * 界面那句"媒体连接有问题"已经解释了发生什么，这里不再叠一条摄像头文案。
+         * （屏幕轨道刻意**不**在这里释放：它是学生重新共享时要复用的那条，见 §22。）
+         */
+        dropCamera()
       }),
       /**
        * 网络抖动时 LiveKit 会自己重连（§52：不要在 V1 自己实现重连策略）。
@@ -708,6 +945,11 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
       }
     }
     releaseCapture()
+    /**
+     * 摄像头必须在这里同步释放。`stop()` 是同步的，所以卸载路径能真正做到"灯立刻灭"；
+     * 而断开连接是异步的、很可能跑不完（浏览器会在请求完成前销毁页面）。
+     */
+    dropCamera()
     credentials = null
     classroomId = null
     if (phase.value !== 'closed') phase.value = 'left'
@@ -754,6 +996,16 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     hasFailure,
     canRetry,
     awaitingScreenRestore,
+    cameraState,
+    cameraFailure,
+    cameraStream,
+    canUseCamera,
+    isCameraOn,
+    isCameraRequesting,
+    hasCameraFailure,
+    cameraActionLabel,
+    toggleCamera,
+    disableCamera,
     prepare,
     begin,
     publishCapture,

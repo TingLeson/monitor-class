@@ -49,10 +49,14 @@ export interface MediaCredentials {
 export type MediaDisconnectReason = string | null
 
 /**
- * 学生端的媒体房间（只剩"发布屏幕"这一半，见文件头第 3 点）。
+ * 学生端的媒体房间：只发布，不订阅（见文件头第 3 点）。
  *
  * 所有 `on*` 方法都返回**取消订阅**函数，与 `screen-capture.ts` 的 `onEnded`
  * 保持同一种风格：调用方（store）只负责保存取消函数并在退出时调用。
+ *
+ * 摄像头（§24）是**追加**在这个端口上的两个方法，不是第二套端口：摄像头与屏幕是
+ * 同一个 participant 的两条轨道，共用同一条连接、同一份凭据、同一个断开动作。
+ * 拆成两个 room 会让"离开课堂时到底断开哪个连接"变成一个需要回答的问题。
  */
 export interface ScreenPublisherRoom {
   /** `autoSubscribe=false` 由适配层负责（§26/§28），调用方不需要也无法改变它。 */
@@ -66,6 +70,21 @@ export interface ScreenPublisherRoom {
   publishScreenTrack(track: MediaStreamTrack): Promise<void>
   /** 撤下屏幕轨道；不 rejoin、不停止轨道（轨道由捕获层负责释放）。 */
   unpublishScreenTrack(): Promise<void>
+  /**
+   * 把摄像头轨道发布成 `camera` 源（§24/§75）。
+   *
+   * 与屏幕那条的差别只有 source 与生命周期：屏幕必须在 `connect()` 之后立刻发布
+   * （§21 的不变量），摄像头则是"学生点了才发、点了关就撤"。参数同样是现成的
+   * `MediaStreamTrack`——适配层不得自己调 `getUserMedia`，否则学生会看到第二次授权框。
+   */
+  publishCameraTrack(track: MediaStreamTrack): Promise<void>
+  /**
+   * 撤下摄像头轨道；不 rejoin、不停止轨道。
+   *
+   * WHY 不在这里 stop：真正释放设备（让摄像头指示灯灭掉）的是采集层的 `stop()`，
+   * 由 store 在"关闭摄像头"的同一段逻辑里调用。适配层只负责信令面。
+   */
+  unpublishCameraTrack(): Promise<void>
   /** 断开连接。刻意返回 Promise，但 `beforeunload` 里调用方会不 await 地发起它。 */
   disconnect(): Promise<void>
   connectionQuality(): ConnectionQualityLevel

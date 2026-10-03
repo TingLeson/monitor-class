@@ -100,7 +100,8 @@ type Audience interface {
 //   - ROOM_OPENED goes to the classroom's authorized students (§48).
 //   - ROOM_CLOSED goes to the same students AND the owner teacher (§49).
 //   - STUDENT_ONLINE / STUDENT_OFFLINE / CAMERA_CHANGED / MIC_CHANGED go to the owner
-//     teacher alone.
+//     teacher alone. Camera and microphone are media facts about ONE student, and §26
+//     keeps a student's browser from learning anything about a classmate.
 //   - SCREEN_LOST / SCREEN_RESTORED go to the owner teacher AND to that one student —
 //     the student whose own screen it is, addressed by their user id, so no other
 //     student's connection can receive it (§26/§47).
@@ -213,6 +214,41 @@ func (s *Service) ScreenLost(ctx context.Context, ref session.SessionRef) error 
 // ScreenRestored tells the owner AND the student themself that the screen is back.
 func (s *Service) ScreenRestored(ctx context.Context, ref session.SessionRef) error {
 	return s.screenChanged(ctx, ref, true)
+}
+
+// CameraChanged tells the owner that a student turned their camera on or off
+// (§24/§47/§75).
+//
+// # Why the audience is the owner and NOT the classroom
+//
+// §26 is a rule about students, and the camera is the clearest case for it: a classroom
+// broadcast would tell every student's browser who in the room has a camera on right now,
+// which is a fact about their classmates that this product exists to hide. "Who may see
+// this" is answered here and nowhere else — the session domain names the fact
+// (Processor.notifyCamera) and cannot widen the audience, because CameraChanged takes a
+// ref and no recipient list.
+//
+// # Why the student themself is not told
+//
+// They pressed the button: their own page already renders the local camera track, and the
+// authoritative answer for their own screen/connection state arrives as SCREEN_LOST /
+// SCREEN_RESTORED, which are theirs too. Sending a CAMERA_CHANGED echo would create a
+// second, later source of truth for a UI state the browser owns, and a stale echo (delayed
+// by a retry, say) could flip the button back. The teacher's wall has the opposite
+// problem — it cannot see anybody's button — so it is the one audience that needs the
+// message.
+func (s *Service) CameraChanged(ctx context.Context, ref session.SessionRef, active bool) error {
+	view, student, err := s.resolveStudent(ctx, ref, "camera_changed")
+	if err != nil || view == nil || !student {
+		return err
+	}
+	msg := newMessage(TypeCameraChanged, map[string]any{
+		"studentId": ref.StudentID.String(),
+		"sessionId": ref.SessionID.String(),
+		"active":    active,
+	})
+	s.sendToTeacher(ctx, view.OwnerTeacherID, msg, "camera_changed", ref.RunID)
+	return nil
 }
 
 func (s *Service) screenChanged(ctx context.Context, ref session.SessionRef, restored bool) error {

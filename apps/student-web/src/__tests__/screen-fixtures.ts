@@ -113,6 +113,39 @@ export function makeFakeStream(tracks: FakeTrack[], withVideo = true): FakeStrea
   }
 }
 
+/**
+ * 摄像头轨道替身（§24 / §75）。
+ *
+ * 刻意复用 `makeFakeTrack('missing')`：它的 `getSettings()` **没有** `displaySurface`
+ * ——摄像头代码本来就不该读那个字段（§16 的 Gate 只针对屏幕）。用一个"没有共享面"
+ * 的轨道当摄像头替身，等于在测试层面盯住"摄像头这条路径上不存在任何 displaySurface
+ * 判断"；哪天有人把两条路径合到一起，这些用例会立刻红。
+ */
+export function makeFakeCameraTrack(): FakeTrack {
+  return makeFakeTrack('missing')
+}
+
+/**
+ * 摄像头流替身：**必须是真实的 `MediaStream` 实例**。
+ *
+ * WHY 与 `makeFakeStream`（屏幕用）不同：摄像头开启后页面会把它挂到
+ * `<video>.srcObject`，而 happy-dom 对 srcObject 做类型检查（不是 MediaStream
+ * 就抛 TypeError）。屏幕那条流刻意不满足这个条件——§56 禁止屏幕预览，它连一个
+ * `<video>` 都不该碰到；这条差异本身就是"两种画面的处理规则不同"的证明。
+ *
+ * happy-dom 漏实现了 `getTracks()`（真实浏览器有），这里按规范补上：少了它，
+ * `releaseCamera` 的 stopAllTracks 会在测试里抛错，而生产路径不可能失败——
+ * 那会把"关掉摄像头必须停轨道"变成一次测试环境的假故障。
+ */
+export function makeFakeCameraStream(tracks: FakeTrack[] = [makeFakeCameraTrack()]): FakeStream {
+  const stream = new MediaStream(tracks as unknown as MediaStreamTrack[])
+  Object.defineProperty(stream, 'getTracks', {
+    value: () => [...tracks],
+    configurable: true,
+  })
+  return stream as unknown as FakeStream
+}
+
 export interface MediaDevicesStub {
   calls: CapturedCall[]
   /**
@@ -130,6 +163,24 @@ export interface MediaDevicesStub {
   /** 每次调用前执行，用来构造"第 N 次不同"的场景。 */
   beforeCall: (() => void) | null
   getDisplayMedia(constraints?: unknown): Promise<unknown>
+
+  /* ------------------------------------------------------------------ */
+  /* 摄像头（§24）                                                        */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * 每一次 `getUserMedia` 的入参。
+   *
+   * 数组长度就是本 Phase 最核心的一条断言的来源：**进入课堂前与挂载时必须是 0**，
+   * 只有学生点了按钮才允许变成 1。用长度而不是一个布尔，才能同时断言"开/关/再开"
+   * 是三次独立的请求。
+   */
+  cameraCalls: { constraints: unknown }[]
+  /** 每次返回的摄像头流（与 cameraCalls 一一对应）。 */
+  cameraStreams: FakeStream[]
+  /** 让 getUserMedia 抛出这个错误（权限被拒 / 设备被占用）。 */
+  cameraFailWith: Error | null
+  getUserMedia(constraints?: unknown): Promise<unknown>
 }
 
 export function makeMediaDevicesStub(
@@ -147,6 +198,16 @@ export function makeMediaDevicesStub(
       if (stub.failWith) return Promise.reject(stub.failWith)
       const stream = makeFakeStream([makeFakeTrack(stub.surface)])
       stub.streams.push(stream)
+      return Promise.resolve(stream)
+    },
+    cameraCalls: [],
+    cameraStreams: [],
+    cameraFailWith: null,
+    getUserMedia(constraints?: unknown): Promise<unknown> {
+      stub.cameraCalls.push({ constraints })
+      if (stub.cameraFailWith) return Promise.reject(stub.cameraFailWith)
+      const stream = makeFakeCameraStream()
+      stub.cameraStreams.push(stream)
       return Promise.resolve(stream)
     },
   }

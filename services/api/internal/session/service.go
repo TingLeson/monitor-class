@@ -174,10 +174,22 @@ func (s *Service) Join(ctx context.Context, in JoinInput) (*JoinResult, error) {
 		// §47: business messages go over a WebSocket, so the WebRTC data channel is
 		// switched off rather than left as an unobserved side channel.
 		CanPublishData: false,
-		// Phase 6 scope (§72): screen only. Camera and microphone are separate phases
-		// (§75/§76), and granting them now would let a client publish media the
-		// monitoring wall cannot yet interpret.
-		PublishSources: []media.PublishSource{media.PublishScreenShare},
+		// §28: a student may publish their screen and — from Phase 9 — their camera.
+		//
+		// WHY the camera joins the grant now: §75 makes the camera the student's
+		// OPTIONAL second track, and the publish permission has to be in the TOKEN
+		// (LiveKit enforces sources, so a camera track published without this entry is
+		// refused by the media plane before any webhook could describe it). The order
+		// mirrors §28: screen first because it is mandatory, camera second because it
+		// is not.
+		//
+		// WHY the microphone is still absent (Phase 10, §76): the grant is not the
+		// missing piece — the CONTROL PLANE is. A microphone published today would
+		// produce no MIC_STARTED/MIC_STOPPED event, no MIC_CHANGED message, and no
+		// answer to the §31 question "who is the teacher allowed to talk to?". §33
+		// keeps the media plane behind the control plane, never ahead of it, so the
+		// permission is granted in the same phase as its event path.
+		PublishSources: []media.PublishSource{media.PublishScreenShare, media.PublishCamera},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrMediaUnavailable, err)
@@ -348,9 +360,12 @@ func (s *Service) TeacherToken(ctx context.Context, in TeacherTokenInput) (*Teac
 		CanPublish:     true,
 		CanSubscribe:   true,
 		CanPublishData: false,
-		// §27 + §72: the teacher's private audio is Phase 10; Phase 6 grants the
-		// microphone source but the client publishes nothing yet. If the teacher
-		// published a screen instead, the wall would show the lesson to itself.
+		// §27 + §76: the teacher's private audio is Phase 10; the microphone source is
+		// granted now (the phase-6 token always carried it) but the client publishes
+		// nothing yet. §27 also gives the teacher NO camera and NO screen share in V1,
+		// and Phase 9 does not change that: the camera is the student's track, and a
+		// teacher who published one would put a tile of the teacher on the teacher's
+		// own wall.
 		PublishSources: []media.PublishSource{media.PublishMicrophone},
 	})
 	if err != nil {

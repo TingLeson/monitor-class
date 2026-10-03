@@ -32,10 +32,12 @@ const (
 	EventScreenLost EventType = "SCREEN_LOST"
 	// EventScreenRestored records SCREEN_LOST → ONLINE after a new whole-screen share.
 	EventScreenRestored EventType = "SCREEN_RESTORED"
-	// EventCameraStarted and EventCameraStopped belong to Phase 9 (§75). They are part
-	// of the vocabulary now because the CHECK constraint is the contract the frontend
-	// is written against, and a later migration to widen it would break that contract
-	// in the middle of a lesson.
+	// EventCameraStarted and EventCameraStopped are Phase 9's two events (§75). They
+	// record the camera of ONE student session, and they are the ONLY place the camera's
+	// state is written down: `student_sessions` deliberately has no camera column,
+	// because §24 says a camera must not be able to change the session status, and a
+	// column next to `status` is how such a rule gets broken later. See
+	// TrackStateChange for how "is the camera on?" is answered from these two rows.
 	EventCameraStarted EventType = "CAMERA_STARTED"
 	EventCameraStopped EventType = "CAMERA_STOPPED"
 	// EventMicStarted and EventMicStopped belong to Phase 10 (§76), same reasoning.
@@ -109,6 +111,62 @@ type Transition struct {
 // Applied reports whether the transition is worth writing at all.
 func (t Transition) Applied() bool { return len(t.From) > 0 && t.To != "" }
 
+// TrackStateChange is one observed on/off state of media that has NO status column:
+// the student's camera in Phase 9 (§24/§75), the microphones of Phase 10 (§76).
+//
+// # Why this is not a Transition
+//
+// A Transition guards on `student_sessions.status`, and that guard is exactly what the
+// camera must not participate in: §24/§21 say a camera never moves a session out of
+// ONLINE, and §45 says only a SCREEN_SHARE track can produce ONLINE. Writing the camera
+// as a status transition (say, a CAS from ONLINE to ONLINE) would put the camera into the
+// state machine's vocabulary and make the invariant unprovable.
+//
+// # So how is "is the camera already on?" answered?
+//
+// From the EVENT LOG, which is the only place the camera's state exists:
+//
+//	current state = the type of the newest event of this pair for this session
+//	                (CAMERA_STARTED = on, CAMERA_STOPPED = off)
+//	                ... and OFF when there is no such event at all.
+//
+// OFF as the default is not an arbitrary choice: §24 makes the camera opt-in ("点击才请求
+// getUserMedia"), so a session that has never reported a camera is a session whose camera
+// is off, and a `track_unpublished` arriving before its `track_published` therefore
+// changes nothing (the same discipline as §22's out-of-order screen unpublish).
+//
+// # Why TrackSid is part of the decision
+//
+// A webhook is delivered at least once and a RETRY can arrive long after the fact. Without
+// the sid, the sequence "publish(A) → unpublish(A) → [retry of publish(A)]" would flip the
+// camera back to on for a publication that is already over. A CAMERA_* row for a given
+// publication is written at most once, so the retry is recognised as a duplicate of
+// history rather than as a new state.
+type TrackStateChange struct {
+	SessionID uuid.UUID
+	// On and Off are the two event types that record this media's two states, in the
+	// §13 vocabulary (CAMERA_STARTED / CAMERA_STOPPED).
+	On, Off EventType
+	// Active is the state THIS delivery observed. It is written only when it differs
+	// from the state derived above.
+	Active bool
+	// TrackSid is LiveKit's id for the publication this observation is about. A
+	// re-published camera gets a new sid, so it is a new publication and not a
+	// duplicate of the previous one.
+	TrackSid string
+	// Payload is the diagnostic metadata of the row (§13: identifiers only, never
+	// media). The implementation adds the session's run and student ids.
+	Payload map[string]any
+}
+
+// TrackStateApplied reports whether a TrackStateChange actually wrote an event row.
+//
+// false is the normal outcome of at-least-once delivery: a duplicate, an out-of-order
+// delivery that describes the state the log already implies, or a retry of a publication
+// that was already stopped. In all three the caller must neither append history nor send
+// a message.
+type TrackStateApplied bool
+
 // TransitionResult is the outcome of one Transition.
 //
 // A nil Session with no error is "the guard did not match": the row moved on, or the
@@ -150,6 +208,16 @@ type EventStore interface {
 	// ApplyTransition persists one guarded change and appends its event row in the
 	// same transaction. A guard that does not match returns an empty result.
 	ApplyTransition(ctx context.Context, t Transition) (*TransitionResult, error)
+
+	// ApplyTrackState records the on/off state of media that has no status column (§24),
+	// appending its event row only when the change is real. It reports whether THIS call
+	// wrote the row, which is what the caller broadcasts on.
+	//
+	// It is the camera's equivalent of ApplyTransition, and it keeps the same two
+	// properties that matter for at-least-once delivery: the decision ("is this a
+	// change?") is made from COMMITTED state in the same transaction as the append, and
+	// a delivery that describes the state the log already implies writes nothing.
+	ApplyTrackState(ctx context.Context, change TrackStateChange) (TrackStateApplied, error)
 
 	// CloseRunSessions marks every ACTIVE session of a run ROOM_CLOSED and appends one
 	// event per row, in one transaction (§49/§45). It returns the sessions it closed,
@@ -232,6 +300,15 @@ type SessionEvents interface {
 	// ScreenLost and ScreenRestored tell the owner AND the student themself (§47/§26).
 	ScreenLost(ctx context.Context, ref SessionRef) error
 	ScreenRestored(ctx context.Context, ref SessionRef) error
+	// CameraChanged tells the OWNER that a student's camera went on or off (§24/§47).
+	//
+	// WHY there is no student copy and no classroom copy: §26 forbids a student's browser
+	// from learning anything about a classmate, and the camera of a classmate is exactly
+	// such a fact. The student themself does not need the message either — they pressed
+	// the button, and their own page renders the local track it just published (the
+	// server's copy would arrive after the fact and could only contradict it). The wall,
+	// on the other hand, has no way to see the button: the teacher learns it here.
+	CameraChanged(ctx context.Context, ref SessionRef, active bool) error
 }
 
 // LifecycleEvents is what the join and leave endpoints tell the runtime layer (§74).

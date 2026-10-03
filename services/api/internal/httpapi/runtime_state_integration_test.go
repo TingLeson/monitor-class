@@ -547,10 +547,91 @@ func TestSignedWebhookDrivesTheSessionStateMachineEndToEnd(t *testing.T) {
 	}
 }
 
+// TestSignedCameraWebhookIsIdempotentAndNeverTouchesTheSession is the Phase 9 acceptance
+// path over the real endpoint: the signature is verified, the camera lands in the event log
+// exactly once per real change, and `student_sessions` does not move — not the status, not
+// the timestamps.
+func TestSignedCameraWebhookIsIdempotentAndNeverTouchesTheSession(t *testing.T) {
+	e := newRuntimeE2E(t)
+	teacher, teacherCookies := e.staff(t)
+	student, studentCookies := e.student(t, "张三")
+	e.cleanupAccounts(t, teacher.ID, student.ID)
+
+	classroomID := e.createClassroom(t, teacherCookies, student)
+	e.openClassroom(t, classroomID, teacherCookies)
+	sessionID := e.join(t, classroomID, studentCookies)
+
+	before := e.sessionState(t, sessionID)
+	if before.Status != "CONNECTING" {
+		t.Fatalf("status after join = %s, want CONNECTING", before.Status)
+	}
+	room := e.roomNameOf(t, before.RunID)
+
+	camera := func(kind, sid string) *livekit.WebhookEvent {
+		return &livekit.WebhookEvent{
+			Event:       kind,
+			Id:          uuid.NewString(),
+			Room:        &livekit.Room{Name: room},
+			Participant: &livekit.ParticipantInfo{Identity: before.Identity, Sid: "PA_1"},
+			Track:       &livekit.TrackInfo{Sid: sid, Source: livekit.TrackSource_CAMERA, Type: livekit.TrackType_VIDEO},
+		}
+	}
+
+	// --- the camera comes on, delivered twice -----------------------------------------
+	for attempt := 1; attempt <= 2; attempt++ {
+		if rec := e.postWebhook(t, camera(webhook.EventTrackPublished, "TR_cam"), true); rec.Code != http.StatusOK {
+			t.Fatalf("camera publish #%d: status = %d (%s)", attempt, rec.Code, rec.Body.String())
+		}
+	}
+	// --- and goes off, delivered twice ------------------------------------------------
+	for attempt := 1; attempt <= 2; attempt++ {
+		if rec := e.postWebhook(t, camera(webhook.EventTrackUnpublished, "TR_cam"), true); rec.Code != http.StatusOK {
+			t.Fatalf("camera unpublish #%d: status = %d (%s)", attempt, rec.Code, rec.Body.String())
+		}
+	}
+
+	after := e.sessionState(t, sessionID)
+	if after.Status != "CONNECTING" {
+		t.Fatalf("status = %s, want CONNECTING: a camera must not produce ONLINE (§21/§24)", after.Status)
+	}
+	if after.ConnectedAt != nil || after.ScreenStartedAt != nil || after.ScreenLostAt != nil {
+		t.Fatalf("session = %+v, want every timestamp untouched by the camera", after)
+	}
+	want := []string{"SESSION_CREATED", "CAMERA_STARTED", "CAMERA_STOPPED"}
+	if got := e.eventTypes(t, sessionID); !equalStrings(got, want) {
+		t.Fatalf("events = %v, want %v: at-least-once delivery must not duplicate camera history", got, want)
+	}
+
+	// --- the payload of the stored row ------------------------------------------------
+	var sid, source string
+	if err := e.pool.QueryRow(context.Background(), `
+		SELECT payload->>'trackSid', payload->>'trackSource' FROM session_events
+		 WHERE session_id = $1 AND type = 'CAMERA_STARTED'`, sessionID).Scan(&sid, &source); err != nil {
+		t.Fatalf("read camera payload: %v", err)
+	}
+	if sid != "TR_cam" || source != "CAMERA" {
+		t.Fatalf("payload = %q/%q, want the track sid and the CAMERA source", sid, source)
+	}
+
+	// --- a camera event that arrives after the lesson is over -------------------------
+	// The classroom is closed, so every session of the run is ROOM_CLOSED (terminal). A
+	// late camera publication is acknowledged (200) and writes nothing (§74).
+	e.closeClassroom(t, classroomID, teacherCookies)
+	if rec := e.postWebhook(t, camera(webhook.EventTrackPublished, "TR_cam_late"), true); rec.Code != http.StatusOK {
+		t.Fatalf("late camera publish: status = %d, want 200 (a 4xx would make LiveKit retry forever)", rec.Code)
+	}
+	if got := e.sessionState(t, sessionID).Status; got != "ROOM_CLOSED" {
+		t.Fatalf("status = %s, want ROOM_CLOSED", got)
+	}
+	want = append(want, "ROOM_CLOSED")
+	if got := e.eventTypes(t, sessionID); !equalStrings(got, want) {
+		t.Fatalf("events = %v, want %v: a terminal session records no camera", got, want)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // WebSocket end to end
 // ---------------------------------------------------------------------------
-
 // wsClient is one WebSocket connection with a reader behind it.
 type wsClient struct {
 	t      *testing.T
@@ -749,6 +830,63 @@ func TestWebSocketScopingEndToEnd(t *testing.T) {
 	// THE assertion of this phase's §26 rule: the other student's socket received
 	// nothing at all about Alice's screen.
 	bobSocket.expectSilence("another student's screen state")
+
+	// --- the camera (§24/§75): the owner is told, and NOBODY else ----------------------
+	cameraPublished := &livekit.WebhookEvent{
+		Event:       webhook.EventTrackPublished,
+		Id:          uuid.NewString(),
+		Room:        &livekit.Room{Name: room},
+		Participant: &livekit.ParticipantInfo{Identity: state.Identity, Sid: "PA_1"},
+		Track:       &livekit.TrackInfo{Sid: "TR_cam", Source: livekit.TrackSource_CAMERA, Type: livekit.TrackType_VIDEO},
+	}
+	if rec := e.postWebhook(t, cameraPublished, true); rec.Code != http.StatusOK {
+		t.Fatalf("camera track_published: status = %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	cameraOn := teacherSocket.waitFor(realtime.TypeCameraChanged)
+	if cameraOn.Data["studentId"] != alice.ID.String() ||
+		cameraOn.Data["sessionId"] != sessionID.String() ||
+		cameraOn.Data["active"] != true {
+		t.Fatalf("CAMERA_CHANGED data = %+v", cameraOn.Data)
+	}
+	// A camera is not the supervision: the session is still SCREEN_LOST (§21/§24).
+	if got := e.sessionState(t, sessionID).Status; got != "SCREEN_LOST" {
+		t.Fatalf("status = %s after a camera was published, want SCREEN_LOST: a camera never restores ONLINE", got)
+	}
+	// §26: neither the classmate nor the student herself is told about a camera. For the
+	// student this is also a design choice, not an oversight — see Service.CameraChanged.
+	bobSocket.expectSilence("a classmate's camera")
+	aliceSocket.expectSilence("her own camera is her own UI, not a server message")
+
+	if rec := e.postWebhook(t, &livekit.WebhookEvent{
+		Event:       webhook.EventTrackUnpublished,
+		Id:          uuid.NewString(),
+		Room:        &livekit.Room{Name: room},
+		Participant: &livekit.ParticipantInfo{Identity: state.Identity},
+		Track:       &livekit.TrackInfo{Sid: "TR_cam", Source: livekit.TrackSource_CAMERA},
+	}, true); rec.Code != http.StatusOK {
+		t.Fatalf("camera track_unpublished: status = %d", rec.Code)
+	}
+	cameraOff := teacherSocket.waitFor(realtime.TypeCameraChanged)
+	if cameraOff.Data["active"] != false || cameraOff.Data["sessionId"] != sessionID.String() {
+		t.Fatalf("CAMERA_CHANGED after the camera stopped = %+v", cameraOff.Data)
+	}
+	bobSocket.expectSilence("a classmate's camera being switched off")
+
+	// The event log holds exactly one CAMERA_STARTED and one CAMERA_STOPPED, and the
+	// session row still says SCREEN_LOST with no connected_at change.
+	cameraEvents := 0
+	for _, kind := range e.eventTypes(t, sessionID) {
+		if kind == "CAMERA_STARTED" || kind == "CAMERA_STOPPED" {
+			cameraEvents++
+		}
+	}
+	if cameraEvents != 2 {
+		t.Fatalf("camera events = %d, want 2: %v", cameraEvents, e.eventTypes(t, sessionID))
+	}
+	if got := e.sessionState(t, sessionID); got.ScreenStartedAt == nil || got.Status != "SCREEN_LOST" {
+		t.Fatalf("session = %+v, want an unchanged SCREEN_LOST row", got)
+	}
 
 	// --- closing the lesson reaches the students and the owner -------------------------
 	e.closeClassroom(t, classroomID, teacherCookies)

@@ -145,17 +145,17 @@ Token 是后端签发的 JWT，由 LiveKit 校验。**它是本 Phase 唯一的�
 | `roomCreate` | **不设置（false）** | **不设置（false）** | §33/§43 | 房间只能由后端创建。若 Token 能建房，参与者就能造出控制面从未听说过的媒体房间 |
 | `roomAdmin` / `roomList` / `roomRecord` | 不设置 | 不设置 | §53 | 参与者不需要任何房间管理或录制能力 |
 | `canPublish` | `true` | `true` | §28 | 学生要发布屏幕；老师 Phase 10 要发布私密语音 |
-| `canPublishSources` | `["screen_share"]` | `["microphone"]` | §27/§28/§72 | **这是本 Phase 最窄的一条**：学生只能发屏幕，老师只能发麦克风。设了它之后 LiveKit 用它**取代** `canPublish`，所以「学生不能发摄像头」是媒体面的事实，而不是 UI 约定 |
+| `canPublishSources` | `["screen_share", "camera"]` | `["microphone"]` | §27/§28/§72/§75 | **这是最窄的一条**：学生只能发屏幕与（可选的）摄像头，老师只能发麦克风。设了它之后 LiveKit 用它**取代** `canPublish`，所以「学生不能发麦克风」「老师不能发屏幕/摄像头」是媒体面的事实，而不是 UI 约定。摄像头在 Phase 9 加入（§75），麦克风在学生侧要等 Phase 10（§76）——grant 必须先于事件路径存在，否则媒体面就跑在控制面前面（§33） |
 | `canSubscribe` | `true` | `true` | §28 | 学生需要接收老师私密语音；老师需要看学生的屏幕。客户端仍然 `autoSubscribe=false`（见 [webrtc-basics](webrtc-basics.md) §3） |
 | `canPublishData` | `false` | `false` | §47 | 业务消息走独立 WebSocket，不占用 WebRTC DataChannel：少一条控制面看不见的旁路 |
 | `canUpdateOwnMetadata` | 不设置 | 不设置 | —— | 参与者不需要改自己的元数据 |
 | `hidden` / `recorder` / `agent` | 不设置 | 不设置 | §53 | 参与者就是普通参与者 |
 
-Phase 6 的取值汇总（也就是代码里的字面量）：
+当前取值汇总（也就是代码里的字面量）：
 
 ```text
 学生 Token:  identity = <session uuid>   room = lk_<run uuid>
-             roomJoin=true  canPublish=true  canPublishSources=[screen_share]
+             roomJoin=true  canPublish=true  canPublishSources=[screen_share, camera]   ← camera 自 Phase 9（§75）
              canSubscribe=true  canPublishData=false
 老师 Token:  identity = <login session uuid>   room = lk_<run uuid>
              roomJoin=true  canPublish=true  canPublishSources=[microphone]

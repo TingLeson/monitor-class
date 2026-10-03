@@ -2,7 +2,8 @@
 import type { MonitorStudent } from '@classwatch/shared-types'
 import { AppBadge, AppButton } from '@classwatch/ui'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import type { ScreenSubscription } from '../lib/media/media-room.ts'
+import { CAMERA_PIP_TEXT, deriveCameraPipState, isCameraPipVisible } from '../lib/camera-pip.ts'
+import type { CameraSubscription, ScreenSubscription } from '../lib/media/media-room.ts'
 import {
   TILE_BODY_HINT,
   TILE_BODY_TEXT,
@@ -22,25 +23,35 @@ import {
  * 所以它是一层页面内的状态，用 `role="dialog"` + Esc + 焦点归还来保证可访问性。
  *
  * 订阅不在这里发起：画质与订阅集合由 store 的计划决定（§30 / §52）。
- * 这个组件只做两件事——把已经拿到的轨道挂到大 `<video>` 上，以及把 DTO 里的
+ * 这个组件只做两件事——把已经拿到的轨道挂到 `<video>` 上，以及把 DTO 里的
  * 设备状态如实画出来。
  *
- * 摄像头预览（§30 右上角的 Camera 区）与私密语音（§31）分别属于 Phase 9 / 10，
- * 这里给出的是**明确的占位说明**，不是能点但没反应的假控件。
+ * Camera 区（§30 右上角）Phase 9 起是**真实画面**：学生开着摄像头时显示订阅到的画面，
+ * 没开就说"未开启"，订阅失败就说"订阅失败"——三种情况都是不同的话，
+ * 合成一句"暂无画面"会让老师无法判断该不该等。
+ * 私密语音（§31）属于 Phase 10，按钮保持禁用。
  */
-const props = defineProps<{
-  student: MonitorStudent
-  subscription: ScreenSubscription | null
-  mediaState: MonitorMediaState
-}>()
+const props = withDefaults(
+  defineProps<{
+    student: MonitorStudent
+    subscription: ScreenSubscription | null
+    mediaState: MonitorMediaState
+    /** 摄像头订阅（§24）；null 表示现在没有可播的摄像头画面。 */
+    cameraSubscription?: CameraSubscription | null
+    cameraMediaState?: MonitorMediaState
+  }>(),
+  { cameraSubscription: null, cameraMediaState: 'none' },
+)
 
 const emit = defineEmits<{ close: [] }>()
 
 const videoRef = ref<HTMLVideoElement | null>(null)
+const cameraVideoRef = ref<HTMLVideoElement | null>(null)
 /** 面板容器：打开时把焦点移进来（见 onMounted），关闭时由父组件把焦点还给卡片。 */
 const panelRef = ref<HTMLElement | null>(null)
 
 let detach: (() => void) | null = null
+let detachCamera: (() => void) | null = null
 
 watch(
   [() => props.subscription, videoRef],
@@ -53,9 +64,23 @@ watch(
   { immediate: true, flush: 'post' },
 )
 
+/** Camera 区的 attach：与网格里的画中画是**同一条订阅、不同的元素**（§30）。 */
+watch(
+  [() => props.cameraSubscription, cameraVideoRef],
+  ([subscription]) => {
+    detachCamera?.()
+    detachCamera = null
+    if (subscription === null || cameraVideoRef.value === null) return
+    detachCamera = subscription.attach(cameraVideoRef.value)
+  },
+  { immediate: true, flush: 'post' },
+)
+
 onBeforeUnmount(() => {
   detach?.()
   detach = null
+  detachCamera?.()
+  detachCamera = null
 })
 
 /**
@@ -114,6 +139,25 @@ const devices = computed(() => [
   { key: 'camera', label: 'Camera', active: props.student.camera.active },
   { key: 'microphone', label: 'Mic', active: props.student.microphone.active },
 ])
+
+/**
+ * Camera 区（§30 的右上角）：只有 'visible' 才渲染画面，其余三档各说一句话。
+ *
+ * WHY 不在这里自己发订阅：§30 明确要求"Focus 优先订阅较高质量 Screen Track"，
+ * 而订阅集合与画质由 store 的计划统一决定（§52）。组件只消费结果。
+ */
+const cameraPipState = computed(() =>
+  deriveCameraPipState(props.student, {
+    state: props.cameraMediaState,
+    hasSubscription: props.cameraSubscription !== null,
+  }),
+)
+const cameraVisible = computed(() => isCameraPipVisible(cameraPipState.value))
+const cameraText = computed(() =>
+  cameraVisible.value
+    ? null
+    : CAMERA_PIP_TEXT[cameraPipState.value as 'off' | 'waiting' | 'failed'],
+)
 </script>
 
 <template>
@@ -182,13 +226,33 @@ const devices = computed(() => [
         </div>
 
         <aside class="flex flex-col gap-4">
-          <!-- Camera：§30 的信息面板顶部留位，Phase 9 接入。 -->
+          <!--
+            Camera 区（§30 的右上角留位）。Phase 9 起是**真实画面**：
+            与网格里的画中画共用同一条订阅（§52 的"同一份下行，多处 attach"），
+            所以展开 Focus 不会让 SFU 再推一路视频。
+          -->
           <div
-            class="flex aspect-video flex-col items-center justify-center gap-1 rounded-card border border-dashed border-border-subtle bg-surface px-4 text-center"
-            data-testid="focus-camera-placeholder"
+            class="aspect-video overflow-hidden rounded-card border border-border-subtle bg-surface-muted"
+            data-testid="focus-camera"
           >
-            <p class="text-sm font-medium text-ink-muted">Camera</p>
-            <p class="text-xs text-ink-muted">摄像头画面将在 Phase 9 接入</p>
+            <video
+              v-if="cameraVisible"
+              ref="cameraVideoRef"
+              class="h-full w-full object-cover"
+              autoplay
+              playsinline
+              muted
+              data-testid="focus-camera-video"
+            />
+            <div
+              v-else
+              class="flex h-full flex-col items-center justify-center gap-1 px-4 text-center"
+            >
+              <p class="text-sm font-medium text-ink-muted">Camera</p>
+              <p class="text-xs text-ink-muted" data-testid="focus-camera-status">
+                {{ cameraText }}
+              </p>
+            </div>
           </div>
 
           <div class="rounded-card border border-border-subtle bg-surface px-4 py-3 shadow-card">

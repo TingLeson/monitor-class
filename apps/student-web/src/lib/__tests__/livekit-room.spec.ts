@@ -190,9 +190,49 @@ describe('LiveKit 适配层（学生端）', () => {
       'onQualityChanged',
       'onReconnected',
       'onReconnecting',
+      'publishCameraTrack',
       'publishScreenTrack',
+      'unpublishCameraTrack',
       'unpublishScreenTrack',
     ])
+  })
+
+  it('§24：摄像头用同一个 LocalVideoTrack 包装方式发布到 Track.Source.Camera', async () => {
+    const room = createLiveKitScreenPublisherRoom(CREDENTIALS)
+    const track = { kind: 'video' } as unknown as MediaStreamTrack
+
+    await room.publishCameraTrack(track)
+
+    // 第三个参数 true = userProvidedTrack：SDK 不得在重连时自己重新采集摄像头
+    // （那等于学生在课堂中途被弹第二次授权框，§24 的前提就是只请求一次）。
+    expect(lk.localVideoTrackArgs).toEqual([[track, undefined, true]])
+    expect(lk.publishCalls).toHaveLength(1)
+    // source 是判定归属的字段（后端 webhook 也只看它）；name 是 §75 契约里那条轨道的名字。
+    expect(lk.publishCalls[0]?.options).toEqual({ source: 'camera', name: 'camera' })
+  })
+
+  it('§24：摄像头与屏幕是两条独立的发布，撤下其中一条不影响另一条', async () => {
+    const room = createLiveKitScreenPublisherRoom(CREDENTIALS)
+    const screen = { kind: 'video' } as unknown as MediaStreamTrack
+    const camera = { kind: 'video' } as unknown as MediaStreamTrack
+    await room.publishScreenTrack(screen)
+    await room.publishCameraTrack(camera)
+
+    await room.unpublishCameraTrack()
+
+    expect(lk.unpublishCalls).toEqual([{ track: expect.anything(), stop: false }])
+    // 屏幕那条仍然在发布（unpublish 只发生在摄像头上）。
+    await room.unpublishScreenTrack()
+    expect(lk.unpublishCalls).toHaveLength(2)
+    expect(lk.unpublishCalls[0]?.track).not.toBe(lk.unpublishCalls[1]?.track)
+  })
+
+  it('没有发布过摄像头时 unpublish 是空操作', async () => {
+    const room = createLiveKitScreenPublisherRoom(CREDENTIALS)
+
+    await room.unpublishCameraTrack()
+
+    expect(lk.unpublishCalls).toHaveLength(0)
   })
 
   it('unpublish / disconnect 都不停止本地轨道（stopTracks=false）', async () => {

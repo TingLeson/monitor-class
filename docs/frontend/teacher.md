@@ -167,7 +167,7 @@ POST /api/v1/teacher/classrooms/:id/close   → { "classroom": ..., "run": ... }
 
 ---
 
-## 7. 监督墙（Phase 6：能真的看到画面）
+## 7. 监督墙（Phase 7：多学生网格 + Focus View + 摄像头画中画）
 
 进入 `/teacher/classrooms/:id/monitor` 后：
 
@@ -184,12 +184,56 @@ GET  /teacher/classrooms/:id/monitor       ← 业务状态（来自 PostgreSQL 
 - 老师端**可以**显示学生的屏幕画面（这正是监督墙的意义）；Phase 7 会加网格、Focus View 与按可见性动态订阅。
 - Phase 6 是"1 老师 + 1 学生"的形态；多学生网格与降质策略属 Phase 7。
 
+### 7.1 完整名单（包括"还没进来"的学生）
+
+`GET /monitor` 返回的是**该课堂全部被授权学生**，不只是已进入的：未进入的学生
+`sessionId = null`、`sessionStatus = null`（**没有**第 7 个状态），卡片显示 ⚪ 未进入。
+
+为什么必须这样：监督工具里"谁还没来"和"谁来了"同样重要，任务书 §29 的头部就是 `18 / 25`——
+不知道分母就做不出这个界面。排序按账号升序，保证卡片位置在轮询之间不跳动。
+
+### 7.2 网格、画质与订阅（§52）
+
+| 位置 | 订阅与画质 |
+| --- | --- |
+| 视口内的网格卡片 | 订阅屏幕，`VideoQuality.LOW` |
+| 滚出视口 | **取消订阅**（老师端是纯接收方，没人看的像素不值得下行） |
+| Focus 的学生 | 屏幕 `VideoQuality.HIGH`；退出 Focus 降回 LOW（改档不重订） |
+| 摄像头 | 独立轨道，画中画固定 LOW（小窗不需要更高） |
+| 页面切到后台 | 释放全部订阅；回到页面按计划恢复（老师端可以这样省带宽；学生端**不允许**因为 `visibilityState` 被判定为异常，§23） |
+
+不做自研 RTP 自适应码率（§52 明确要求用 LiveKit 已有能力）。
+
+### 7.3 Focus View（§30）
+
+点击卡片进入 Focus：左侧大画面，右侧信息面板（`Screen` / `Camera` / `Mic` / `Network`），
+`[语音沟通]` **禁用**并注明 Phase 10。Esc 退出；未进入的学生点开只显示原因，**不产生任何订阅**。
+
+### 7.4 学生之间的媒体隔离（§26）
+
+老师端始终 `autoSubscribe = false`；服务端在每次 monitor 观测时用 LiveKit `UpdateSubscriptions`
+**撤销学生之间的互相订阅**并记录 Warn 日志（`action=peer_subscription_revoked`）。
+
+必须说清边界：`canSubscribe=true` 是 §28 的明确要求（学生要能收老师的私密语音），
+所以**一个主动改代码的客户端仍可自行重新订阅**——LiveKit 协议里也没有"读取某人在订阅什么"的 API，
+服务端做的是对已发布轨道做**对账**，而不是检测订阅。详见
+[media/track-permissions.md](../media/track-permissions.md)。
+
+### 7.5 摄像头画中画（§29，Phase 9）
+
+- 学生摄像头开启时（`camera.active`），卡片**右下角**出现小窗；关闭时小窗消失（**不留空窗**）。
+- 摄像头与屏幕是同一 participant 的**两条独立轨道**：订阅与释放互不影响。
+  这条在真机验证时抓到过真实缺陷——早期实现把房间级的 `TrackSubscribed/TrackUnsubscribed`
+  直接当成"屏幕的订阅变化"，于是学生一关摄像头，老师端卡片的**屏幕画面也会一起消失**
+  （只剩"正在订阅画面…"，而业务徽章仍是 🟢）。修复是给这两个监听加 `source` 过滤，并留了回归测试。
+- `CAMERA_CHANGED` 只改 `camera` 一个字段：它证明不了 `connection`/`joinedAt`/`sessionStatus`。
+- 摄像头**不影响会话状态**（§21/§24）：屏幕丢了仍然是 🔴 屏幕中断，哪怕摄像头开着。
+
 ## 8. 未做（按 Phase 归属）
 
 | 项 | Phase |
 | --- | --- |
-| 监督墙（学生卡片、屏幕画面、状态徽章） | 7 |
-| Focus View、按可见性动态订阅 | 7 |
+| 摄像头（学生可选、老师端画中画） | ✅ Phase 9 |
 | 课堂历史 Run 列表 / 出勤统计 | V1 未定义（数据已在库里，界面属于 V2） |
 | 私密语音 | 10 |
 | 学生目录搜索、批量导入 CSV | 明确不做（见 §4.1） |

@@ -19,13 +19,18 @@ import (
 type PublishSource string
 
 const (
-	// PublishScreenShare is what a student publishes in Phase 6 (§21/§28).
+	// PublishScreenShare is what a student publishes in Phase 6 (§21/§28). It is the
+	// only source that can produce ONLINE: §21 makes the screen mandatory, and the
+	// session state machine is written against exactly that.
 	PublishScreenShare PublishSource = "SCREEN_SHARE"
-	// PublishCamera and PublishMicrophone are not granted in Phase 6. They exist so
-	// the roles of §27/§28 can be expressed as data when their phases arrive, and so
-	// that "the student may not publish a camera yet" is a missing value rather than
-	// a remembered omission.
-	PublishCamera     PublishSource = "CAMERA"
+	// PublishCamera is the student's OPTIONAL camera, granted from Phase 9 (§24/§75).
+	// Optional is the load-bearing word: a camera may appear, disappear and come back
+	// while the session stays ONLINE, so nothing in the state machine may depend on it.
+	PublishCamera PublishSource = "CAMERA"
+	// PublishMicrophone is Phase 10 (§76) for both roles: the student's own microphone
+	// and the teacher's private talk. It is deliberately still NOT granted to a student
+	// token — a source that can be published before the control plane handles its events
+	// is media nobody observes, which is exactly the kind of gap §33 exists to prevent.
 	PublishMicrophone PublishSource = "MICROPHONE"
 )
 

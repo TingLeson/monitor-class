@@ -185,6 +185,51 @@ func (f *fakeStore) RecordEventOnce(_ context.Context, sessionID uuid.UUID, even
 	return true, nil
 }
 
+// ApplyTrackState mirrors the production statement for the camera (§24/§75): the two
+// halves of its guard are reproduced here, because they ARE the idempotency under test —
+//
+//  1. a row of this type for this publication already exists (the retry guard), or
+//  2. the newest row of the pair is already this state (the state guard),
+//
+// ... then nothing is written. The terminal-session guard lives in the SQL as defence in
+// depth and is deliberately NOT reproduced: the unit tests must prove that the PROCESSOR
+// refuses a terminal session, and a faithful fake would hide a missing check.
+func (f *fakeStore) ApplyTrackState(_ context.Context, change TrackStateChange) (TrackStateApplied, error) {
+	if f.applyErr != nil {
+		return false, f.applyErr
+	}
+	target := change.Off
+	if change.Active {
+		target = change.On
+	}
+
+	latest := EventType("")
+	for _, existing := range f.events {
+		if existing.SessionID != change.SessionID {
+			continue
+		}
+		// The retry guard: a row of THIS state for THIS publication already exists. The
+		// same publication in the OTHER state (a camera that was started and then
+		// stopped) is history, not a duplicate.
+		if existing.Type == target && existing.Payload["trackSid"] == change.TrackSid {
+			return false, nil
+		}
+		if existing.Type == change.On || existing.Type == change.Off {
+			latest = existing.Type
+		}
+	}
+	// No camera row at all means "off": §24 makes the camera opt-in, so the default is
+	// the OFF type.
+	if latest == "" {
+		latest = change.Off
+	}
+	if latest == target {
+		return false, nil
+	}
+	f.appendEvent(change.SessionID, target, change.Payload)
+	return true, nil
+}
+
 func (f *fakeStore) appendEvent(sessionID uuid.UUID, event EventType, payload map[string]any) *SessionEvent {
 	recorded := SessionEvent{
 		ID:        uuid.New(),
@@ -231,11 +276,18 @@ type offlineMessage struct {
 	reason OfflineReason
 }
 
+// cameraMessage is one recorded CAMERA_CHANGED call.
+type cameraMessage struct {
+	ref    SessionRef
+	active bool
+}
+
 type fakeEvents struct {
 	online         []SessionRef
 	offline        []offlineMessage
 	screenLost     []SessionRef
 	screenRestored []SessionRef
+	camera         []cameraMessage
 	roomsOpened    [][2]uuid.UUID
 	roomsClosed    [][2]uuid.UUID
 
@@ -290,6 +342,14 @@ func (f *fakeEvents) ScreenRestored(_ context.Context, ref SessionRef) error {
 	return nil
 }
 
+func (f *fakeEvents) CameraChanged(_ context.Context, ref SessionRef, active bool) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.camera = append(f.camera, cameraMessage{ref: ref, active: active})
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -339,6 +399,43 @@ func screenTrackEvent(kind, room, identity, sid string, source livekit.TrackSour
 
 func screenShareEvent(kind, room, identity, sid string) *livekit.WebhookEvent {
 	return screenTrackEvent(kind, room, identity, sid, livekit.TrackSource_SCREEN_SHARE)
+}
+
+// cameraEvent is the same shape for the camera source (§24/§75).
+func cameraEvent(kind, room, identity, sid string) *livekit.WebhookEvent {
+	return screenTrackEvent(kind, room, identity, sid, livekit.TrackSource_CAMERA)
+}
+
+// statusSnapshot freezes everything about a session that a camera must NOT change.
+//
+// WHY a struct and not four assertions per test: "the camera changed nothing but the
+// event log" is THE rule of this phase (§24/§21), and comparing the whole row makes the
+// assertion impossible to weaken by adding a column later.
+type statusSnapshot struct {
+	Status          Status
+	ConnectedAt     *time.Time
+	ScreenStartedAt *time.Time
+	ScreenLostAt    *time.Time
+	LeftAt          *time.Time
+	UpdatedAt       time.Time
+}
+
+func snapshotOf(stored *StudentSession) statusSnapshot {
+	return statusSnapshot{
+		Status:          stored.Status,
+		ConnectedAt:     stored.ConnectedAt,
+		ScreenStartedAt: stored.ScreenStartedAt,
+		ScreenLostAt:    stored.ScreenLostAt,
+		LeftAt:          stored.LeftAt,
+		UpdatedAt:       stored.UpdatedAt,
+	}
+}
+
+func (s statusSnapshot) assertUnchanged(t *testing.T, h *processorHarness, sessionID uuid.UUID, what string) {
+	t.Helper()
+	if got := snapshotOf(h.store.sessions[sessionID]); got != s {
+		t.Fatalf("session row = %+v, want %+v: %s must not move the session state machine (§24/§21)", got, s, what)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +590,278 @@ func TestScreenRestoredAfterALoss(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// track_published / track_unpublished for the CAMERA (§24/§75)
+// ---------------------------------------------------------------------------
+
+// TestCameraStartedRecordsAndAnnouncesWithoutGoingOnline is the most important assertion
+// of Phase 9: a camera is recorded, the owner is told, and the SESSION ROW does not move.
+// A student who turns their camera on before sharing a screen is CONNECTING, not ONLINE
+// (§21: only a SCREEN_SHARE track may produce ONLINE).
+func TestCameraStartedRecordsAndAnnouncesWithoutGoingOnline(t *testing.T) {
+	h := newProcessorHarness(t)
+	runID := uuid.New()
+	studentID := uuid.New()
+	stored := h.store.seed(runID, uuid.New(), studentID, StatusConnecting)
+	before := snapshotOf(stored)
+
+	if err := h.process.ProcessWebhook(h.ctx, cameraEvent(webhook.EventTrackPublished, h.store.room(runID), stored.LiveKitIdentity, "TR_cam")); err != nil {
+		t.Fatalf("ProcessWebhook(): %v", err)
+	}
+
+	before.assertUnchanged(t, h, stored.ID, "track_published(CAMERA)")
+	if got := h.store.eventsOf(stored.ID); len(got) != 1 || got[0] != EventCameraStarted {
+		t.Fatalf("events = %v, want [CAMERA_STARTED]", got)
+	}
+	if len(h.events.camera) != 1 {
+		t.Fatalf("CAMERA_CHANGED = %+v, want exactly one", h.events.camera)
+	}
+	if message := h.events.camera[0]; !message.active || message.ref.StudentID != studentID {
+		t.Fatalf("CAMERA_CHANGED = %+v, want active for the student", message)
+	}
+	// Nothing that means "online": no session message, and no screen event.
+	if len(h.events.online) != 0 || len(h.events.screenLost) != 0 || len(h.events.screenRestored) != 0 {
+		t.Fatalf("a camera produced a session message: online=%v lost=%v restored=%v",
+			h.events.online, h.events.screenLost, h.events.screenRestored)
+	}
+
+	// The payload names the track and the camera: no image, no name, no token (§13/§59).
+	payload := h.store.events[0].Payload
+	if payload["trackSid"] != "TR_cam" || payload["trackSource"] != "CAMERA" {
+		t.Fatalf("payload = %+v, want the track sid and the CAMERA source", payload)
+	}
+	if _, leaked := payload["displayName"]; leaked {
+		t.Fatalf("payload carries a display name: %+v", payload)
+	}
+}
+
+// TestCameraWhileTheScreenIsLostKeepsScreenLost: the camera is not the supervision. §21
+// makes the screen the mandatory track, so a camera cannot restore ONLINE — otherwise a
+// teacher would see "online" for a student whose desktop nobody can see.
+func TestCameraWhileTheScreenIsLostKeepsScreenLost(t *testing.T) {
+	h := newProcessorHarness(t)
+	runID := uuid.New()
+	stored := h.store.seed(runID, uuid.New(), uuid.New(), StatusOnline)
+
+	if err := h.process.ProcessWebhook(h.ctx, screenShareEvent(webhook.EventTrackUnpublished, h.store.room(runID), stored.LiveKitIdentity, "TR_screen")); err != nil {
+		t.Fatalf("screen unpublish: %v", err)
+	}
+	if got := h.store.sessions[stored.ID].Status; got != StatusScreenLost {
+		t.Fatalf("status = %s, want SCREEN_LOST", got)
+	}
+	lost := snapshotOf(h.store.sessions[stored.ID])
+
+	if err := h.process.ProcessWebhook(h.ctx, cameraEvent(webhook.EventTrackPublished, h.store.room(runID), stored.LiveKitIdentity, "TR_cam")); err != nil {
+		t.Fatalf("camera publish: %v", err)
+	}
+	lost.assertUnchanged(t, h, stored.ID, "track_published(CAMERA) on a lost screen")
+	if got := h.store.eventsOf(stored.ID); len(got) != 2 || got[1] != EventCameraStarted {
+		t.Fatalf("events = %v, want [SCREEN_LOST CAMERA_STARTED]", got)
+	}
+	if len(h.events.online) != 0 {
+		t.Fatal("a camera restored ONLINE")
+	}
+}
+
+func TestCameraStoppedWritesTheEventAndBroadcastsInactive(t *testing.T) {
+	h := newProcessorHarness(t)
+	runID := uuid.New()
+	studentID := uuid.New()
+	stored := h.store.seed(runID, uuid.New(), studentID, StatusOnline)
+	before := snapshotOf(stored)
+
+	if err := h.process.ProcessWebhook(h.ctx, cameraEvent(webhook.EventTrackPublished, h.store.room(runID), stored.LiveKitIdentity, "TR_cam")); err != nil {
+		t.Fatalf("camera publish: %v", err)
+	}
+	if err := h.process.ProcessWebhook(h.ctx, cameraEvent(webhook.EventTrackUnpublished, h.store.room(runID), stored.LiveKitIdentity, "TR_cam")); err != nil {
+		t.Fatalf("camera unpublish: %v", err)
+	}
+
+	before.assertUnchanged(t, h, stored.ID, "a camera on/off cycle")
+	want := []EventType{EventCameraStarted, EventCameraStopped}
+	got := h.store.eventsOf(stored.ID)
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+	if len(h.events.camera) != 2 || !h.events.camera[0].active || h.events.camera[1].active {
+		t.Fatalf("CAMERA_CHANGED = %+v, want true then false", h.events.camera)
+	}
+	if h.events.camera[1].ref.StudentID != studentID {
+		t.Fatalf("CAMERA_CHANGED about %s, want %s", h.events.camera[1].ref.StudentID, studentID)
+	}
+}
+
+// TestDuplicateCameraDeliveriesWriteOneEventAndOneMessage is the at-least-once rule: the
+// same delivery twice must produce one row and one message, not two of each.
+func TestDuplicateCameraDeliveriesWriteOneEventAndOneMessage(t *testing.T) {
+	h := newProcessorHarness(t)
+	runID := uuid.New()
+	stored := h.store.seed(runID, uuid.New(), uuid.New(), StatusOnline)
+	room := h.store.room(runID)
+
+	started := cameraEvent(webhook.EventTrackPublished, room, stored.LiveKitIdentity, "TR_cam")
+	stopped := cameraEvent(webhook.EventTrackUnpublished, room, stored.LiveKitIdentity, "TR_cam")
+	for i := 0; i < 3; i++ {
+		if err := h.process.ProcessWebhook(h.ctx, started); err != nil {
+			t.Fatalf("publish #%d: %v", i+1, err)
+		}
+		if err := h.process.ProcessWebhook(h.ctx, stopped); err != nil {
+			t.Fatalf("unpublish #%d: %v", i+1, err)
+		}
+	}
+
+	want := []EventType{EventCameraStarted, EventCameraStopped}
+	if got := h.store.eventsOf(stored.ID); len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("events = %v, want %v: duplicate delivery must not duplicate history", got, want)
+	}
+	if len(h.events.camera) != 2 {
+		t.Fatalf("CAMERA_CHANGED published %d times, want 2 (one per real change)", len(h.events.camera))
+	}
+}
+
+// TestCameraUnpublishedBeforePublishedChangesNothing is the out-of-order rule: a stop that
+// arrives before its own start describes a state the log already implies (the camera is
+// off until the student turns it on, §24), and the late start is the truth.
+func TestCameraUnpublishedBeforePublishedChangesNothing(t *testing.T) {
+	h := newProcessorHarness(t)
+	runID := uuid.New()
+	stored := h.store.seed(runID, uuid.New(), uuid.New(), StatusConnecting)
+	room := h.store.room(runID)
+	before := snapshotOf(stored)
+
+	if err := h.process.ProcessWebhook(h.ctx, cameraEvent(webhook.EventTrackUnpublished, room, stored.LiveKitIdentity, "TR_cam")); err != nil {
+		t.Fatalf("early unpublish: %v", err)
+	}
+	if got := h.store.eventsOf(stored.ID); len(got) != 0 {
+		t.Fatalf("events = %v, want none: stopping a camera that was never on is not a change", got)
+	}
+	if len(h.events.camera) != 0 {
+		t.Fatalf("CAMERA_CHANGED = %+v, want none", h.events.camera)
+	}
+	before.assertUnchanged(t, h, stored.ID, "an out-of-order camera unpublish")
+
+	if err := h.process.ProcessWebhook(h.ctx, cameraEvent(webhook.EventTrackPublished, room, stored.LiveKitIdentity, "TR_cam")); err != nil {
+		t.Fatalf("late publish: %v", err)
+	}
+	if got := h.store.eventsOf(stored.ID); len(got) != 1 || got[0] != EventCameraStarted {
+		t.Fatalf("events = %v, want [CAMERA_STARTED]: the late publication is the true end state", got)
+	}
+	if len(h.events.camera) != 1 || !h.events.camera[0].active {
+		t.Fatalf("CAMERA_CHANGED = %+v, want one active message", h.events.camera)
+	}
+}
+
+// TestCameraRetryOfAStoppedPublicationDoesNotTurnItBackOn is why the track sid is part of
+// the idempotency rule: a webhook retried long after the camera was switched off carries
+// the sid of a publication that is already over.
+func TestCameraRetryOfAStoppedPublicationDoesNotTurnItBackOn(t *testing.T) {
+	h := newProcessorHarness(t)
+	runID := uuid.New()
+	stored := h.store.seed(runID, uuid.New(), uuid.New(), StatusOnline)
+	room := h.store.room(runID)
+
+	for _, event := range []*livekit.WebhookEvent{
+		cameraEvent(webhook.EventTrackPublished, room, stored.LiveKitIdentity, "TR_cam_1"),
+		cameraEvent(webhook.EventTrackUnpublished, room, stored.LiveKitIdentity, "TR_cam_1"),
+		// The retry: same publication, delivered again after the stop.
+		cameraEvent(webhook.EventTrackPublished, room, stored.LiveKitIdentity, "TR_cam_1"),
+	} {
+		if err := h.process.ProcessWebhook(h.ctx, event); err != nil {
+			t.Fatalf("%s: %v", event.GetEvent(), err)
+		}
+	}
+
+	want := []EventType{EventCameraStarted, EventCameraStopped}
+	got := h.store.eventsOf(stored.ID)
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("events = %v, want %v: a retried publication must not be read as a new one", got, want)
+	}
+	if len(h.events.camera) != 2 || h.events.camera[1].active {
+		t.Fatalf("CAMERA_CHANGED = %+v, want true then false: the camera stayed off", h.events.camera)
+	}
+}
+
+// TestCameraRepublishedWithANewTrackIsANewState: the sid guard must not swallow a genuine
+// second camera (LiveKit gives every publication a new sid), or "off, then on again" —
+// which §24 explicitly allows — would be invisible.
+func TestCameraRepublishedWithANewTrackIsANewState(t *testing.T) {
+	h := newProcessorHarness(t)
+	runID := uuid.New()
+	stored := h.store.seed(runID, uuid.New(), uuid.New(), StatusOnline)
+	room := h.store.room(runID)
+
+	for _, event := range []*livekit.WebhookEvent{
+		cameraEvent(webhook.EventTrackPublished, room, stored.LiveKitIdentity, "TR_cam_1"),
+		cameraEvent(webhook.EventTrackUnpublished, room, stored.LiveKitIdentity, "TR_cam_1"),
+		cameraEvent(webhook.EventTrackPublished, room, stored.LiveKitIdentity, "TR_cam_2"),
+	} {
+		if err := h.process.ProcessWebhook(h.ctx, event); err != nil {
+			t.Fatalf("%s: %v", event.GetEvent(), err)
+		}
+	}
+
+	want := []EventType{EventCameraStarted, EventCameraStopped, EventCameraStarted}
+	got := h.store.eventsOf(stored.ID)
+	if len(got) != len(want) {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("events = %v, want %v", got, want)
+		}
+	}
+	if len(h.events.camera) != 3 || !h.events.camera[2].active {
+		t.Fatalf("CAMERA_CHANGED = %+v, want the last one active", h.events.camera)
+	}
+	// The last row is the NEW publication, not a rewrite of the first one.
+	if sid := h.store.events[len(h.store.events)-1].Payload["trackSid"]; sid != "TR_cam_2" {
+		t.Fatalf("trackSid = %v, want TR_cam_2", sid)
+	}
+}
+
+func TestCameraForATerminalSessionIsIgnored(t *testing.T) {
+	for _, terminal := range []Status{StatusLeft, StatusRoomClosed} {
+		t.Run(string(terminal), func(t *testing.T) {
+			h := newProcessorHarness(t)
+			runID := uuid.New()
+			stored := h.store.seed(runID, uuid.New(), uuid.New(), terminal)
+			before := snapshotOf(stored)
+			room := h.store.room(runID)
+
+			for _, event := range []*livekit.WebhookEvent{
+				cameraEvent(webhook.EventTrackPublished, room, stored.LiveKitIdentity, "TR_cam"),
+				cameraEvent(webhook.EventTrackUnpublished, room, stored.LiveKitIdentity, "TR_cam"),
+			} {
+				if err := h.process.ProcessWebhook(h.ctx, event); err != nil {
+					t.Fatalf("%s: %v", event.GetEvent(), err)
+				}
+			}
+			before.assertUnchanged(t, h, stored.ID, "a camera event for a terminal session")
+			if got := h.store.eventsOf(stored.ID); len(got) != 0 {
+				t.Fatalf("events = %v, want none: a terminal session is never re-entered (§74)", got)
+			}
+			if len(h.events.camera) != 0 {
+				t.Fatalf("CAMERA_CHANGED = %+v, want none", h.events.camera)
+			}
+		})
+	}
+}
+
+func TestCameraStoreFailureIsReportedSoTheWebhookCanBeRetried(t *testing.T) {
+	h := newProcessorHarness(t)
+	runID := uuid.New()
+	stored := h.store.seed(runID, uuid.New(), uuid.New(), StatusOnline)
+	h.store.applyErr = errors.New("database is down")
+
+	err := h.process.ProcessWebhook(h.ctx, cameraEvent(webhook.EventTrackPublished, h.store.room(runID), stored.LiveKitIdentity, "TR_cam"))
+	if err == nil {
+		t.Fatal("ProcessWebhook() returned nil: a camera observation that could not be recorded must be retried")
+	}
+	if len(h.events.camera) != 0 {
+		t.Fatal("CAMERA_CHANGED was published for a change that was not recorded")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Out-of-order delivery
 // ---------------------------------------------------------------------------
 
@@ -535,6 +904,7 @@ func TestLateEventsCannotResurrectATerminalSession(t *testing.T) {
 				webhookEvent(webhook.EventParticipantJoined, room, stored.LiveKitIdentity),
 				screenShareEvent(webhook.EventTrackPublished, room, stored.LiveKitIdentity, "TR_late"),
 				screenShareEvent(webhook.EventTrackUnpublished, room, stored.LiveKitIdentity, "TR_late"),
+				cameraEvent(webhook.EventTrackPublished, room, stored.LiveKitIdentity, "TR_cam_late"),
 				webhookEvent(webhook.EventParticipantLeft, room, stored.LiveKitIdentity),
 			}
 			for _, event := range events {
@@ -549,7 +919,7 @@ func TestLateEventsCannotResurrectATerminalSession(t *testing.T) {
 			if got := h.store.eventsOf(stored.ID); len(got) != 0 {
 				t.Fatalf("events = %v, want none: nothing happened, so nothing is recorded", got)
 			}
-			if len(h.events.online)+len(h.events.offline)+len(h.events.screenLost)+len(h.events.screenRestored) != 0 {
+			if len(h.events.online)+len(h.events.offline)+len(h.events.screenLost)+len(h.events.screenRestored)+len(h.events.camera) != 0 {
 				t.Fatal("a terminal session produced a runtime message")
 			}
 		})
@@ -755,22 +1125,29 @@ func TestUnknownEventTypeIsAcceptedAndIgnored(t *testing.T) {
 	}
 }
 
-func TestNonScreenTrackPublishedDoesNotProduceOnline(t *testing.T) {
-	for _, source := range []livekit.TrackSource{livekit.TrackSource_CAMERA, livekit.TrackSource_MICROPHONE} {
-		t.Run(source.String(), func(t *testing.T) {
+func TestMicrophoneTrackIsStillIgnored(t *testing.T) {
+	// The microphone is Phase 10 (§76) and its token grant does not exist yet, but a
+	// webhook naming one must still be a no-op rather than an error: the media plane is
+	// allowed to be ahead of the control plane, and a source this phase does not consume
+	// writes neither state nor history.
+	for _, kind := range []string{webhook.EventTrackPublished, webhook.EventTrackUnpublished} {
+		t.Run(kind, func(t *testing.T) {
 			h := newProcessorHarness(t)
 			runID := uuid.New()
 			stored := h.store.seed(runID, uuid.New(), uuid.New(), StatusConnecting)
 
-			event := screenTrackEvent(webhook.EventTrackPublished, h.store.room(runID), stored.LiveKitIdentity, "TR_cam", source)
+			event := screenTrackEvent(kind, h.store.room(runID), stored.LiveKitIdentity, "TR_mic", livekit.TrackSource_MICROPHONE)
 			if err := h.process.ProcessWebhook(h.ctx, event); err != nil {
 				t.Fatalf("ProcessWebhook(): %v", err)
 			}
 			if got := h.store.sessions[stored.ID].Status; got != StatusConnecting {
-				t.Fatalf("status = %s, want CONNECTING: only a SCREEN_SHARE track means ONLINE (§21/§45)", got)
+				t.Fatalf("status = %s, want CONNECTING", got)
 			}
 			if len(h.store.events) != 0 {
 				t.Fatalf("events = %v, want none", h.store.events)
+			}
+			if len(h.events.camera) != 0 {
+				t.Fatalf("CAMERA_CHANGED = %+v, want none", h.events.camera)
 			}
 		})
 	}

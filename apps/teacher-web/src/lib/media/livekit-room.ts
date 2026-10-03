@@ -37,6 +37,7 @@ import {
   type RemoteVideoTrack,
 } from 'livekit-client'
 import type {
+  CameraSubscription,
   MediaCredentials,
   MediaDisconnectReason,
   MediaRemoteParticipant,
@@ -62,8 +63,20 @@ function describeDisconnectReason(reason: DisconnectReason | undefined): MediaDi
 
 /** 这条参与者有没有在发布屏幕轨道（只看 screen_share，§29）。 */
 function findScreenPublication(participant: RemoteParticipant): RemoteTrackPublication | undefined {
+  return findPublication(participant, Track.Source.ScreenShare)
+}
+
+/** 这条参与者有没有在发布摄像头轨道（§24）。 */
+function findCameraPublication(participant: RemoteParticipant): RemoteTrackPublication | undefined {
+  return findPublication(participant, Track.Source.Camera)
+}
+
+function findPublication(
+  participant: RemoteParticipant,
+  source: Track.Source,
+): RemoteTrackPublication | undefined {
   for (const publication of participant.trackPublications.values()) {
-    if (publication.source === Track.Source.ScreenShare) return publication
+    if (publication.source === source) return publication
   }
   return undefined
 }
@@ -92,7 +105,7 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
     disconnectOnPageLeave: true,
   })
 
-  /** 已建立的订阅：identity → 轨道、当前画质档与它当前挂着的元素。 */
+  /** 已建立的**屏幕**订阅：identity → 轨道、当前画质档与它当前挂着的元素。 */
   const subscriptions = new Map<
     string,
     {
@@ -100,6 +113,25 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
       track: RemoteVideoTrack
       elements: Set<HTMLVideoElement>
       quality: ScreenQuality
+    }
+  >()
+
+  /**
+   * 已建立的**摄像头**订阅（§24）。
+   *
+   * WHY 是第二张表而不是第一张表多一个字段：摄像头与屏幕是同一个 participant 的
+   * 两条独立 publication，生命周期互不相干（学生可以只开摄像头、可以共享屏幕时
+   * 中途关掉摄像头）。合并成"每人一条记录"之后，任何一侧的取消订阅都会顺手把
+   * 另一侧也拆掉——那正是本 Phase 最需要避免的一种互相影响。
+   *
+   * 没有画质档：画中画与 Focus 的 Camera 区都是小窗，永远按 LOW 订阅。
+   */
+  const cameraSubscriptions = new Map<
+    string,
+    {
+      publication: RemoteTrackPublication
+      track: RemoteVideoTrack
+      elements: Set<HTMLVideoElement>
     }
   >()
 
@@ -117,6 +149,23 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
     if (entry.quality === quality) return
     entry.quality = quality
     entry.publication.setVideoQuality(toVideoQuality(quality))
+  }
+
+  /**
+   * 拆掉一条订阅：把画面从所有元素上摘下来，并 `setSubscribed(false)`。
+   *
+   * WHY 取消订阅而不只是 detach：让服务端**停止下行**才是省带宽的那一步（§52）。
+   * 两种订阅共用这一段，避免"屏幕那边记得 setSubscribed(false)、摄像头那边忘了"
+   * 这种只会在真机上表现为"摄像头一直偷偷在下行"的漏。
+   */
+  function dropSubscription(entry: {
+    publication: RemoteTrackPublication
+    track: RemoteVideoTrack
+    elements: Set<HTMLVideoElement>
+  }): void {
+    for (const element of [...entry.elements]) entry.track.detach(element)
+    entry.elements.clear()
+    entry.publication.setSubscribed(false)
   }
 
   /**
@@ -179,6 +228,28 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
     }
   }
 
+  /** 摄像头订阅对象（§24）：只有 attach/detach，没有画质档位。 */
+  function toCameraSubscription(
+    identity: string,
+    entry: {
+      publication: RemoteTrackPublication
+      track: RemoteVideoTrack
+      elements: Set<HTMLVideoElement>
+    },
+  ): CameraSubscription {
+    return {
+      identity,
+      attach(element: HTMLVideoElement): () => void {
+        entry.track.attach(element)
+        entry.elements.add(element)
+        return () => {
+          entry.track.detach(element)
+          entry.elements.delete(element)
+        }
+      },
+    }
+  }
+
   return {
     async connect(): Promise<void> {
       // §52：老师端 autoSubscribe 必须为 false，且不能由调用方改写。
@@ -187,10 +258,12 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
 
     async disconnect(): Promise<void> {
       for (const [identity, entry] of [...subscriptions]) {
-        for (const element of [...entry.elements]) entry.track.detach(element)
-        entry.elements.clear()
-        entry.publication.setSubscribed(false)
+        dropSubscription(entry)
         subscriptions.delete(identity)
+      }
+      for (const [identity, entry] of [...cameraSubscriptions]) {
+        dropSubscription(entry)
+        cameraSubscriptions.delete(identity)
       }
       await room.disconnect(true)
     },
@@ -258,20 +331,63 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
       const entry = subscriptions.get(identity)
       if (!entry) return
       subscriptions.delete(identity)
-      for (const element of [...entry.elements]) entry.track.detach(element)
-      entry.elements.clear()
-      // 取消订阅（而不是只停止播放）：让服务端不再往下推，这才是省带宽的那一步（§52）。
-      entry.publication.setSubscribed(false)
+      dropSubscription(entry)
+    },
+
+    async subscribeCamera(identity: string): Promise<CameraSubscription | null> {
+      // 幂等：监督墙每次刷新都会重算计划，"学生摄像头还开着"每次都会成立。
+      const existing = cameraSubscriptions.get(identity)
+      if (existing) return toCameraSubscription(identity, existing)
+
+      const participant = room.getParticipantByIdentity(identity) as RemoteParticipant | undefined
+      if (!participant) return null
+      const publication = findCameraPublication(participant)
+      if (!publication) return null
+
+      /**
+       * 顺序与屏幕那条完全一致：先订阅、再定画质。
+       *
+       * §52 要求网格优先低分辨率，而画中画比网格卡片还小——它永远用 SDK 的最低档。
+       * 这里**不**调用 `setVideoDimensions`：房间开了 adaptiveStream，SDK 会按
+       * `<video>` 元素的实际尺寸挑层；写死尺寸会在老师改变窗口大小后变成错误的尺寸。
+       */
+      if (!publication.isSubscribed) publication.setSubscribed(true)
+      publication.setVideoQuality(VideoQuality.LOW)
+      const track = await waitForTrack(publication)
+
+      // 等待期间可能已经被取消（学生关了摄像头 / 卡片滚出视口 / 页面切走了）。
+      if (!publication.isSubscribed) return null
+
+      const entry = { publication, track, elements: new Set<HTMLVideoElement>() }
+      cameraSubscriptions.set(identity, entry)
+      return toCameraSubscription(identity, entry)
+    },
+
+    async unsubscribeCamera(identity: string): Promise<void> {
+      const entry = cameraSubscriptions.get(identity)
+      if (!entry) return
+      cameraSubscriptions.delete(identity)
+      // 只动摄像头那条：屏幕订阅与它没有任何关系。
+      dropSubscription(entry)
     },
 
     onParticipantsChanged(listener: () => void): () => void {
-      /** 丢掉某个 identity 的本地订阅记录，并把画面从所有元素上摘下来。 */
-      const dropSubscription = (identity: string): void => {
+      /** 丢掉某个 identity 的本地**屏幕**订阅记录，并把画面从所有元素上摘下来。 */
+      const dropScreenSubscription = (identity: string): void => {
         const entry = subscriptions.get(identity)
         if (!entry) return
         for (const element of [...entry.elements]) entry.track.detach(element)
         entry.elements.clear()
         subscriptions.delete(identity)
+      }
+
+      /** 摄像头那一半（§24）：同上，但只动摄像头。 */
+      const dropCameraSubscription = (identity: string): void => {
+        const entry = cameraSubscriptions.get(identity)
+        if (!entry) return
+        for (const element of [...entry.elements]) entry.track.detach(element)
+        entry.elements.clear()
+        cameraSubscriptions.delete(identity)
       }
 
       const onParticipantConnected = (): void => listener()
@@ -281,31 +397,50 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
        * WHY 必须在这里清掉本地订阅记录：参与者走了之后 publication 已经不会再推数据，
        * 但我们的 map 里还留着它——下一次 `subscribeScreen` 会**直接返回这条死订阅**，
        * 卡片就会一直停着最后一帧画面。监督墙最不能出现的就是"看起来还在，其实早走了"。
+       * 摄像头同理：留着就是右下角一个僵死的画中画。
        */
       const onParticipantDisconnected = (participant: RemoteParticipant): void => {
-        dropSubscription(participant.identity)
+        dropScreenSubscription(participant.identity)
+        dropCameraSubscription(participant.identity)
         listener()
       }
 
       /**
-       * 屏幕轨道的发布/取消也要通知：学生重新共享时（§22）就是"先 unpublish 再 publish"，
-       * 老师端要借此把卡片从"屏幕中断"切回"有画面"。
+       * 屏幕与摄像头轨道的发布/取消都要通知。
+       *
+       * WHY 屏幕：学生重新共享时（§22）就是"先 unpublish 再 publish"，老师端要借此
+       * 把卡片从"屏幕中断"切回"有画面"。
+       * WHY 摄像头（Phase 9）：`CAMERA_CHANGED` 事件（§24）是**业务**通知，它到达时
+       * 这条 publication 可能还没出现在老师端的 participant 上（webhook 与 SFU 的
+       * 传播本来就有先后）。不在这里再通知一次，画中画就要等到下一次快照（60 秒）
+       * 才会出现——而老师盯着的是一个"学生说开了摄像头却什么都没有"的卡片。
+       * 麦克风仍然不筛进来：音频属于 Phase 10（§54）。
        *
        * 判据用 `publication.source`（而不是在 participant 的 trackPublications 里找）：
        * 事件到达时 participant 的轨道表**可能还没有**这条新轨道，用后者会漏掉事件。
-       * 只筛 screen_share：摄像头/麦克风事件与本 Phase 无关（§54）。
        */
+      const isTrackedSource = (publication: RemoteTrackPublication): boolean =>
+        publication.source === Track.Source.ScreenShare ||
+        publication.source === Track.Source.Camera
+
       const onTrackPublished = (publication: RemoteTrackPublication): void => {
-        if (publication.source !== Track.Source.ScreenShare) return
+        if (!isTrackedSource(publication)) return
         listener()
       }
       const onTrackUnpublished = (
         publication: RemoteTrackPublication,
         participant: RemoteParticipant,
       ): void => {
-        if (publication.source !== Track.Source.ScreenShare) return
-        // 轨道没了：把本地订阅记录清掉，否则下次 subscribeScreen 会返回一条死订阅。
-        dropSubscription(participant.identity)
+        if (!isTrackedSource(publication)) return
+        /**
+         * 轨道没了：把对应的本地订阅记录清掉，否则下次订阅会返回一条死轨道。
+         * 按 source 分开清——摄像头关掉不该把屏幕那条也拆了（反之亦然）。
+         */
+        if (publication.source === Track.Source.Camera) {
+          dropCameraSubscription(participant.identity)
+        } else {
+          dropScreenSubscription(participant.identity)
+        }
         listener()
       }
 
@@ -324,9 +459,13 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
     onScreenSubscribed(listener: (identity: string) => void): () => void {
       const handler = (
         _track: RemoteTrack,
-        _publication: RemoteTrackPublication,
+        publication: RemoteTrackPublication,
         participant: RemoteParticipant,
       ): void => {
+        // **必须按 source 过滤**：房间级的 TrackSubscribed 对**每一条**轨道都触发，
+        // 摄像头也在内。不过滤的话，"订阅到摄像头"会被上层当成"订阅到屏幕"，
+        // 而摄像头是 optional 的（§21）——两个事实混在一起就会互相拆台。
+        if (publication.source !== Track.Source.ScreenShare) return
         listener(participant.identity)
       }
       room.on(RoomEvent.TrackSubscribed, handler)
@@ -336,9 +475,13 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
     onScreenUnsubscribed(listener: (identity: string) => void): () => void {
       const handler = (
         _track: RemoteTrack,
-        _publication: RemoteTrackPublication,
+        publication: RemoteTrackPublication,
         participant: RemoteParticipant,
       ): void => {
+        // 同上：**取消订阅摄像头不等于屏幕没了**。少了这行过滤的真实后果是：
+        // 学生一关摄像头，老师端卡片的屏幕画面会一起消失（只剩"正在订阅画面…"），
+        // 而业务徽章仍显示 🟢——画面与状态自相矛盾，老师无法判断到底出了什么事。
+        if (publication.source !== Track.Source.ScreenShare) return
         listener(participant.identity)
       }
       room.on(RoomEvent.TrackUnsubscribed, handler)

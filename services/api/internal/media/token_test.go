@@ -53,9 +53,13 @@ func decodeClaims(t *testing.T, token string) map[string]any {
 	return claims
 }
 
-// TestSignTokenStudentGrants pins §28: a student token joins the room, publishes only
-// a screen share, subscribes (for the teacher's private audio) and never uses the data
-// channel.
+// TestSignTokenStudentGrants pins §28 as Phase 9 signs it: a student token joins the room,
+// publishes a screen share AND (from §75) a camera, subscribes (for the teacher's private
+// audio) and never uses the data channel.
+//
+// The microphone is asserted ABSENT here as well as in internal/session: this test is the
+// last place before the JWT is handed to LiveKit, so a source that sneaks into the grant
+// list is caught in the bytes that grant it.
 func TestSignTokenStudentGrants(t *testing.T) {
 	client := newTestClient(t)
 	identity := "6c1e6a6a-4a5a-4a5a-8a5a-1a2b3c4d5e6f"
@@ -67,7 +71,7 @@ func TestSignTokenStudentGrants(t *testing.T) {
 		CanPublish:     true,
 		CanSubscribe:   true,
 		CanPublishData: false,
-		PublishSources: []PublishSource{PublishScreenShare},
+		PublishSources: []PublishSource{PublishScreenShare, PublishCamera},
 	})
 	if err != nil {
 		t.Fatalf("SignToken(): %v", err)
@@ -106,8 +110,22 @@ func TestSignTokenStudentGrants(t *testing.T) {
 	if !ok {
 		t.Fatalf("canPublishSources = %v, want a list", video["canPublishSources"])
 	}
-	if len(sources) != 1 || sources[0] != "screen_share" {
-		t.Errorf("canPublishSources = %v, want [screen_share] only", sources)
+	// The exact list, in order: screen (mandatory, §21) then camera (§75). Order is
+	// asserted because it is part of the signed value, and a diff of two grants is
+	// easier to read than a set comparison.
+	wantSources := []any{"screen_share", "camera"}
+	if len(sources) != len(wantSources) {
+		t.Fatalf("canPublishSources = %v, want %v", sources, wantSources)
+	}
+	for i := range wantSources {
+		if sources[i] != wantSources[i] {
+			t.Fatalf("canPublishSources = %v, want %v", sources, wantSources)
+		}
+	}
+	for _, source := range sources {
+		if source == "microphone" {
+			t.Fatal("the student token may publish a microphone: that is Phase 10 (§76)")
+		}
 	}
 
 	// The TTL is what §63 calls "short-lived": assert the signed window, not the code

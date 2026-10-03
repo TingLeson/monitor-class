@@ -381,7 +381,8 @@ classwatch/
 | 6 | LiveKit 媒体接入：join API（Screen Gate 之后才建会话）、短时 Token（identity 为 opaque UUID、权限位按角色收窄）、复用同一条屏幕轨道发布、老师端手动订阅并渲染；会话状态由**服务端观测**（RoomService）推进，媒体面故障不写成业务事实；关课终止 Room | 多学生监督墙与 Focus View（7） |
 | 7 | 多学生监督墙：monitor 返回**完整课堂名单**（含未进入的学生，即 `18 / 25` 的分母）、网格 + Focus View、按可见性与焦点动态订阅与画质分层、服务端 `UpdateSubscriptions` 撤销学生互订 | 事件与 WebSocket（8） |
 | 8 | 运行时状态与事件：LiveKit Webhook（签名校验）权威推进会话状态、`session_events` 审计、业务 WebSocket（`/ws/student`、`/ws/teacher`，Cookie 鉴权 + 作用域隔离 + close code 4401/4403）、开课/关课广播、前端改事件驱动并保留低频兜底 | 摄像头（9） |
-| 9–12 | —— | 摄像头（9）、私密语音（10）、生产加固（11）、压测（12） |
+| 9 | 摄像头（可选）：学生进入课堂后可开/关/再开（`getUserMedia` → `source=Camera`），服务端由 webhook 发 `CAMERA_CHANGED` 且**不改变会话状态**（§21/§24），老师端卡片右下角画中画（§29）+ Focus 面板摄像头区，订阅沿用可见性协调器 | 麦克风与私密语音（10） |
+| 10–12 | —— | 私密语音（10）、生产加固（11）、压测（12） |
 
 验收标准：Phase 0 是 **`make dev` 能启动基础环境**（任务书 §66）；
 Phase 1 是**三种角色都能登录、跨入口与停用账号都被服务端正确拒绝**（§67）。
