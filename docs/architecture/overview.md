@@ -382,7 +382,8 @@ classwatch/
 | 7 | 多学生监督墙：monitor 返回**完整课堂名单**（含未进入的学生，即 `18 / 25` 的分母）、网格 + Focus View、按可见性与焦点动态订阅与画质分层、服务端 `UpdateSubscriptions` 撤销学生互订 | 事件与 WebSocket（8） |
 | 8 | 运行时状态与事件：LiveKit Webhook（签名校验）权威推进会话状态、`session_events` 审计、业务 WebSocket（`/ws/student`、`/ws/teacher`，Cookie 鉴权 + 作用域隔离 + close code 4401/4403）、开课/关课广播、前端改事件驱动并保留低频兜底 | 摄像头（9） |
 | 9 | 摄像头（可选）：学生进入课堂后可开/关/再开（`getUserMedia` → `source=Camera`），服务端由 webhook 发 `CAMERA_CHANGED` 且**不改变会话状态**（§21/§24），老师端卡片右下角画中画（§29）+ Focus 面板摄像头区，订阅沿用可见性协调器 | 麦克风与私密语音（10） |
-| 10–12 | —— | 私密语音（10）、生产加固（11）、压测（12） |
+| 10 | 麦克风与私密语音：学生可选麦克风（不影响会话状态）、老师麦克风经 `UpdateSubscriptions` **只让被选中的那一个学生**订阅（切换先撤销旧目标）、`PRIVATE_TALK_REQUEST/STARTED/ENDED` 事件与 `TEACHER_TALK_*` 审计、Focus 面板「语音沟通」启用、老师可听 Focus 学生的麦克风 | 生产加固（11） |
+| 11–12 | —— | 生产加固（11）、压测（12） |
 
 验收标准：Phase 0 是 **`make dev` 能启动基础环境**（任务书 §66）；
 Phase 1 是**三种角色都能登录、跨入口与停用账号都被服务端正确拒绝**（§67）。

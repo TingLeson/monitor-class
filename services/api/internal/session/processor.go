@@ -34,6 +34,11 @@ import (
 type Processor struct {
 	store  EventStore
 	events SessionEvents
+	// talk is the private-talk state machine, attached when one exists. It is optional on
+	// purpose: without it the event path still records everything it observes, and the only
+	// thing missing is the revocation of a talk whose target went away — which the monitor's
+	// reconciliation pass reaches on its next poll anyway (see Service.enforcePrivateTalk).
+	talk PrivateTalkEnder
 }
 
 // NewProcessor wires the processor. events may be nil in a deployment without a
@@ -42,6 +47,18 @@ type Processor struct {
 // with no hub (see internal/realtime for why the hub is process-local in Phase 8).
 func NewProcessor(store EventStore, events SessionEvents) *Processor {
 	return &Processor{store: store, events: events}
+}
+
+// WithPrivateTalkEnder attaches the private-talk state machine (§31).
+//
+// WHY a setter: the processor and the state machine are two halves of one package wired
+// from main, and making the ender a constructor argument would force every existing caller
+// and test to build a private-talk service just to process a screen webhook. A nil ender is
+// a supported state — the media plane is converged by the monitor — and that is worth
+// seeing at the wiring site.
+func (p *Processor) WithPrivateTalkEnder(talk PrivateTalkEnder) *Processor {
+	p.talk = talk
+	return p
 }
 
 // ProcessWebhook applies one verified LiveKit webhook (§45).
@@ -226,13 +243,20 @@ func (p *Processor) participantGone(ctx context.Context, ev *livekit.WebhookEven
 		"to", string(StatusDisconnected),
 		"livekit_event", ev.GetEvent(),
 	)
+	// §31: a private talk whose TARGET dropped is over. This is one of the reasons §31
+	// lists among the revocation triggers, and it is the one that cannot be left to the
+	// teacher — their console may not even be open. The revocation is best effort (see
+	// endPrivateTalk): the ender is a no-op unless this session was the target.
+	p.endPrivateTalk(ctx, "private_talk_ended_on_disconnect", func(cleanup context.Context) error {
+		return p.talk.EndPrivateTalkForSession(cleanup, stored.ID, TalkEndReasonDisconnected)
+	})
 	return p.notifyOffline(ctx, stored, OfflineDisconnected)
 }
 
 // trackPublished handles track_published (§45).
 //
 // The source decides which half of the runtime path runs, and the split is the whole
-// point of §21/§24:
+// point of §21/§24/§25:
 //
 //   - SCREEN_SHARE is the ONLY observation that can turn a session ONLINE (see
 //     screenPublished).
@@ -240,17 +264,21 @@ func (p *Processor) participantGone(ctx context.Context, ev *livekit.WebhookEven
 //     to the owner teacher, and it must not touch the session status at all — a student
 //     who turns their camera on while their screen is lost stays SCREEN_LOST, because
 //     §21 makes the SCREEN the mandatory track and a camera is not a substitute.
-//   - anything else (today: the microphone of Phase 10) is logged and dropped.
+//   - MICROPHONE is the student's optional third track (§76) and follows the camera's
+//     path exactly: MIC_STARTED + MIC_CHANGED to the owner, and NO status change (§25
+//     says the microphone is opt-in and §21 says only the screen decides the state).
+//   - anything else is logged and dropped.
 func (p *Processor) trackPublished(ctx context.Context, ev *livekit.WebhookEvent, room, identity string) error {
 	switch ev.GetTrack().GetSource() {
 	case livekit.TrackSource_SCREEN_SHARE:
 		return p.screenPublished(ctx, ev, room, identity)
 	case livekit.TrackSource_CAMERA:
 		return p.cameraObserved(ctx, ev, room, identity, true)
+	case livekit.TrackSource_MICROPHONE:
+		return p.micObserved(ctx, ev, room, identity, true)
 	default:
-		// Deliberately Quiet: Phase 9 grants a student token the camera as well as the
-		// screen, so the only source that still lands here is the microphone of Phase 10
-		// (§76) — a non-event today, not an incident.
+		// A source this project does not grant (a data track, a future LiveKit enum).
+		// Quiet on purpose: an unobserved source is not an incident.
 		logging.FromContext(ctx).Debug("track source without a session rule; session state unchanged",
 			"action", "track_published_ignored",
 			"room", room,
@@ -334,7 +362,7 @@ func (p *Processor) screenPublished(ctx context.Context, ev *livekit.WebhookEven
 	return nil
 }
 
-// trackUnpublished handles track_unpublished (§22/§24/§45).
+// trackUnpublished handles track_unpublished (§22/§24/§25/§45).
 //
 // Only a SCREEN_SHARE track can move ONLINE → SCREEN_LOST. That guard is what makes a
 // webhook that arrives BEFORE its own track_published harmless: the session is still
@@ -342,14 +370,16 @@ func (p *Processor) screenPublished(ctx context.Context, ev *livekit.WebhookEven
 // ONLINE — the true end state. Without the guard, the out-of-order pair would leave the
 // session in SCREEN_LOST forever.
 //
-// A CAMERA track is handled on its own path for the same reason: the camera going away is
-// not the screen going away, and §21's invariant is about the screen.
+// A CAMERA or MICROPHONE track is handled on its own path for the same reason: neither
+// going away is the screen going away, and §21's invariant is about the screen.
 func (p *Processor) trackUnpublished(ctx context.Context, ev *livekit.WebhookEvent, room, identity string) error {
 	switch ev.GetTrack().GetSource() {
 	case livekit.TrackSource_SCREEN_SHARE:
 		return p.screenUnpublished(ctx, ev, room, identity)
 	case livekit.TrackSource_CAMERA:
 		return p.cameraObserved(ctx, ev, room, identity, false)
+	case livekit.TrackSource_MICROPHONE:
+		return p.micObserved(ctx, ev, room, identity, false)
 	default:
 		logging.FromContext(ctx).Debug("track source without a session rule; session state unchanged",
 			"action", "track_unpublished_ignored",
@@ -466,6 +496,82 @@ func (p *Processor) cameraObserved(ctx context.Context, ev *livekit.WebhookEvent
 		"note", "a camera never changes the session status (§24/§21)",
 	)
 	return p.notifyCamera(ctx, stored, active)
+}
+
+// micObserved handles track_published/track_unpublished for a MICROPHONE track (§25/§76).
+//
+// # What the microphone may and may not do
+//
+// It records MIC_STARTED / MIC_STOPPED and tells the OWNER teacher, exactly like the
+// camera of Phase 9. It does NOT touch `student_sessions.status`, and that constraint is
+// the hard rule of this phase: §21 makes only a screen track mandatory, §24 makes the
+// camera optional, §25 makes the microphone optional — three separate sources, and exactly
+// one of them decides whether a student is being supervised. A student who opens their
+// microphone while their screen share is lost must stay SCREEN_LOST.
+//
+// # Why the state is read from the event log
+//
+// The microphone has no column either, so "is it already on?" is the type of the newest
+// MIC_* event of this session (see TrackStateChange). The store makes that decision inside
+// the transaction that appends the row, and reports whether history changed; broadcasting
+// on that answer is what makes at-least-once delivery produce exactly one MIC_CHANGED per
+// real change (a duplicate, a re-delivered stop and an out-of-order stop all write
+// nothing).
+//
+// # Why the payload carries no audio
+//
+// The event row records track sid, source, participant sid and the webhook's own
+// identifiers. There is no audio, no transcript and no duration here, and there must never
+// be one (§13/§53: V1 does not record). What a lesson report can say about a private talk
+// comes from TEACHER_TALK_STARTED/ENDED (§31), not from the media itself.
+func (p *Processor) micObserved(ctx context.Context, ev *livekit.WebhookEvent, room, identity string, active bool) error {
+	stored, err := p.lookup(ctx, room, identity, ev)
+	if err != nil || stored == nil {
+		// The teacher's own microphone lands here: a teacher identity is not a student
+		// session, so there is no MIC_STARTED for it. That is correct — the teacher's
+		// microphone is not supervised media, and §51's DTO is about students.
+		return err
+	}
+	if stored.Status.Terminal() {
+		// A late event for a session that already left or was closed (§74). Terminal
+		// states are never re-entered, so the microphone cannot be started in one either.
+		logDebugSkip(ctx, ev, stored, "session is terminal")
+		return nil
+	}
+
+	payload := p.payload(ev, room)
+	payload["trackSid"] = ev.GetTrack().GetSid()
+	payload["trackSource"] = livekit.TrackSource_MICROPHONE.String()
+	payload["participantSid"] = ev.GetParticipant().GetSid()
+
+	applied, err := p.store.ApplyTrackState(ctx, TrackStateChange{
+		SessionID: stored.ID,
+		On:        EventMicStarted,
+		Off:       EventMicStopped,
+		Active:    active,
+		TrackSid:  ev.GetTrack().GetSid(),
+		Payload:   payload,
+	})
+	if err != nil {
+		return err
+	}
+	if !applied {
+		logDebugSkip(ctx, ev, stored, "microphone state already recorded")
+		return nil
+	}
+
+	logging.FromContext(ctx).Info("student microphone changed",
+		"action", "mic_changed",
+		"room", room,
+		logging.FieldSessionID, stored.ID.String(),
+		"student_id", stored.StudentID.String(),
+		"run_id", stored.ClassroomRunID.String(),
+		"track_sid", ev.GetTrack().GetSid(),
+		"active", active,
+		"session_status", string(stored.Status),
+		"note", "a microphone never changes the session status (§21/§25)",
+	)
+	return p.notifyMic(ctx, stored, active)
 }
 
 // roomFinished handles room_finished: every active session of that run ends (§45/§49).
@@ -612,6 +718,12 @@ func (p *Processor) SessionLeft(ctx context.Context, stored *StudentSession) err
 		logging.FieldSessionID, stored.ID.String(),
 		"event_type", string(EventStudentLeft),
 	)
+	// §31: the target left, so the talk is over — and the teacher has to be told, because
+	// the student's microphone is about to stop flowing and the console must not keep
+	// showing an active private talk.
+	p.endPrivateTalk(ctx, "private_talk_ended_on_leave", func(cleanup context.Context) error {
+		return p.talk.EndPrivateTalkForSession(cleanup, stored.ID, TalkEndReasonLeft)
+	})
 	return p.notifyOffline(ctx, stored, OfflineLeft)
 }
 
@@ -622,6 +734,14 @@ func (p *Processor) SessionLeft(ctx context.Context, stored *StudentSession) err
 // lesson-level message is due (the teacher's close sends it; a room_finished with no
 // active sessions sends nothing).
 func (p *Processor) closeRun(ctx context.Context, ref ClassroomRef, source, room string) ([]StudentSession, error) {
+	// §31: the lesson is over, so no private talk of it can still be running. This is
+	// deliberately the FIRST thing that happens: the sessions below are about to become
+	// terminal, and the talk's target is one of them — ending the talk while its session is
+	// still identifiable is the honest order, and the revocation is best effort either way.
+	p.endPrivateTalk(ctx, "private_talk_ended_on_close", func(cleanup context.Context) error {
+		return p.talk.EndPrivateTalkForRun(cleanup, ref.RunID, TalkEndReasonRoomClosed)
+	})
+
 	payload := map[string]any{
 		"reason": string(OfflineRoomClosed),
 		"source": source,
@@ -754,6 +874,58 @@ func (p *Processor) notifyCamera(ctx context.Context, stored *StudentSession, ac
 	return p.events.CameraChanged(ctx, stored.Ref(), active)
 }
 
+// notifyMic tells the OWNER teacher that a student's microphone went on or off
+// (§25/§47/§76).
+//
+// The reasoning is notifyCamera's, one source over: §26 forbids a student from learning
+// anything about a classmate, and "classmate opened their microphone" is such a fact; the
+// student themself pressed the button and their own page already renders the local track.
+// The one audience that cannot see any button is the teacher's wall, which renders the
+// §51 "Mic ● / ○" indicator from this message.
+//
+// WHAT the message does NOT say: it never claims the teacher can HEAR that microphone. §32
+// makes the student → teacher direction a media-plane fact (the teacher's own token
+// subscribes to it), and this message is about the publication existing at all.
+func (p *Processor) notifyMic(ctx context.Context, stored *StudentSession, active bool) error {
+	if p.events == nil {
+		return nil
+	}
+	return p.events.MicChanged(ctx, stored.Ref(), active)
+}
+
+// endPrivateTalk runs one private-talk revocation (§31) on a context detached from the
+// caller's.
+//
+// # Why detached, and why bounded
+//
+// The callers are paths that are already finishing something: a webhook LiveKit is waiting
+// on, a student's leave request. The revocation itself is a media-plane call sequence
+// (observe the room, read the roster, update subscriptions), and it must still happen if
+// LiveKit has already closed the connection it delivered the event over — so the caller's
+// cancellation is deliberately ignored, exactly like the classroom close's teardown
+// (§49/§33). The bound exists so a hung media plane cannot hold a request open.
+//
+// A failure is logged and nothing else: the talk is ALREADY over in the control plane (the
+// registry entry is gone), and the monitor's reconciliation pass converges the media plane
+// on its next poll. There is no version of this that may fail a webhook.
+func (p *Processor) endPrivateTalk(ctx context.Context, action string, end func(context.Context) error) {
+	if p == nil || p.talk == nil || end == nil {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), talkEndTimeout)
+	defer cancel()
+	if err := end(cleanupCtx); err != nil {
+		logging.FromContext(ctx).Warn("private talk was not ended",
+			"action", action,
+			"error", err,
+			"consequence", "the monitor reconciliation revokes the subscription on its next poll (§31)",
+		)
+	}
+}
+
+// talkEndTimeout bounds the media-plane work of ending a private talk after the fact.
+const talkEndTimeout = 5 * time.Second
+
 // runRef resolves the run and classroom a close is about.
 //
 // A run that cannot be found is not an error: it means the close path was called with
@@ -796,4 +968,8 @@ func logDebugSkip(ctx context.Context, ev *livekit.WebhookEvent, stored *Student
 var (
 	_ classroom.RuntimeHooks = (*Processor)(nil)
 	_ LifecycleEvents        = (*Processor)(nil)
+	// The private-talk state machine is what the processor reports a target's departure
+	// to (§31), and the session service is what implements it — a structural interface, so
+	// the two halves of this package can be wired in either order from main.
+	_ PrivateTalkEnder = (*Service)(nil)
 )

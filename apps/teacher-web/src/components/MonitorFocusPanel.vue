@@ -3,7 +3,11 @@ import type { MonitorStudent } from '@classwatch/shared-types'
 import { AppBadge, AppButton } from '@classwatch/ui'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { CAMERA_PIP_TEXT, deriveCameraPipState, isCameraPipVisible } from '../lib/camera-pip.ts'
-import type { CameraSubscription, ScreenSubscription } from '../lib/media/media-room.ts'
+import type {
+  CameraSubscription,
+  MicrophoneSubscription,
+  ScreenSubscription,
+} from '../lib/media/media-room.ts'
 import {
   TILE_BODY_HINT,
   TILE_BODY_TEXT,
@@ -12,6 +16,12 @@ import {
   describeTileBody,
   type MonitorMediaState,
 } from '../lib/monitor-status.ts'
+import {
+  canStartPrivateTalk,
+  describeTalkActionText,
+  talkBlockedReason,
+} from '../lib/private-talk.ts'
+import type { TeacherMicState } from '../lib/teacher-mic.ts'
 
 /**
  * Focus View（§30）—— 一个学生的"大画面 + 设备面板"。
@@ -29,7 +39,18 @@ import {
  * Camera 区（§30 右上角）Phase 9 起是**真实画面**：学生开着摄像头时显示订阅到的画面，
  * 没开就说"未开启"，订阅失败就说"订阅失败"——三种情况都是不同的话，
  * 合成一句"暂无画面"会让老师无法判断该不该等。
- * 私密语音（§31）属于 Phase 10，按钮保持禁用。
+ *
+ * 私密语音（§31）在 Phase 10 真正启用：
+ * - 「语音沟通」= POST（切换目标就是再点一次，后端负责撤销旧的）；
+ * - 当前目标是这个学生时，按钮变成「正在与 X 语音沟通 · 结束」——高亮是**界面必须
+ *   替老师记住的事**：音频是看不见的，切到别的卡片之后再回来，他没法凭记忆知道
+ *   自己的麦克风还在对谁广播；
+ * - `TEACHER_MIC_REQUIRED` 时给出「请先开启你的麦克风」+ 一键开麦（§31 的可执行提示）；
+ * - 未进入课堂的学生（`sessionId === null`）按钮**禁用并写出原因**，而不是让老师
+ *   点一个注定被拒绝的按钮。
+ *
+ * 听学生的麦克风（§32）同样必须写出来："正在听该学生的麦克风"这句话是老师
+ * 唯一的线索——耳机里在放什么，他无法从界面上别的地方推断出来。
  */
 const props = withDefaults(
   defineProps<{
@@ -39,19 +60,53 @@ const props = withDefaults(
     /** 摄像头订阅（§24）；null 表示现在没有可播的摄像头画面。 */
     cameraSubscription?: CameraSubscription | null
     cameraMediaState?: MonitorMediaState
+    /** 这个学生是不是当前私密语音目标（§31）。 */
+    talkTarget?: boolean
+    /** 私密语音请求正在进行（按钮 loading）。 */
+    talkBusy?: boolean
+    /** 上一次私密语音失败的说明（由父组件按"是不是这个学生"过滤后传入）。 */
+    talkError?: string | null
+    /** 失败原因是"老师还没开麦"（决定要不要给一键开麦入口）。 */
+    talkMicRequired?: boolean
+    /** 老师自己的麦克风状态（§27）。 */
+    teacherMicState?: TeacherMicState
+    /** 该学生的麦克风订阅（§32）；null 表示现在没有可听的声音。 */
+    microphoneSubscription?: MicrophoneSubscription | null
+    microphoneMediaState?: MonitorMediaState
   }>(),
-  { cameraSubscription: null, cameraMediaState: 'none' },
+  {
+    cameraSubscription: null,
+    cameraMediaState: 'none',
+    talkTarget: false,
+    talkBusy: false,
+    talkError: null,
+    talkMicRequired: false,
+    teacherMicState: 'off',
+    microphoneSubscription: null,
+    microphoneMediaState: 'none',
+  },
 )
 
-const emit = defineEmits<{ close: [] }>()
+const emit = defineEmits<{
+  close: []
+  /** 老师要发起（或切换）与这个学生的私密语音。 */
+  startTalk: []
+  /** 老师要结束当前私密语音。 */
+  stopTalk: []
+  /** 老师在"请先开启你的麦克风"提示里点了一键开麦。 */
+  enableMic: []
+}>()
 
 const videoRef = ref<HTMLVideoElement | null>(null)
 const cameraVideoRef = ref<HTMLVideoElement | null>(null)
+/** 学生麦克风的 `<audio>`（§32）：隐藏、无控件——老师要听的是声音，不是播放器 UI。 */
+const micAudioRef = ref<HTMLAudioElement | null>(null)
 /** 面板容器：打开时把焦点移进来（见 onMounted），关闭时由父组件把焦点还给卡片。 */
 const panelRef = ref<HTMLElement | null>(null)
 
 let detach: (() => void) | null = null
 let detachCamera: (() => void) | null = null
+let detachMicrophone: (() => void) | null = null
 
 watch(
   [() => props.subscription, videoRef],
@@ -76,11 +131,31 @@ watch(
   { immediate: true, flush: 'post' },
 )
 
+/**
+ * 学生麦克风的 attach（§32）。
+ *
+ * WHY 由组件挂而不是由 store 挂：订阅**属于** store 的计划（只订 Focus 那一个），
+ * 而"声音放进哪个元素"是视图的事——同一个订阅将来可能被挂到别处（例如一个音量
+ * 指示组件）。挂载点是隐藏的 `<audio>`，老师不需要、也不该看到一个播放器控件。
+ */
+watch(
+  [() => props.microphoneSubscription, micAudioRef],
+  ([subscription]) => {
+    detachMicrophone?.()
+    detachMicrophone = null
+    if (subscription === null || micAudioRef.value === null) return
+    detachMicrophone = subscription.attach(micAudioRef.value)
+  },
+  { immediate: true, flush: 'post' },
+)
+
 onBeforeUnmount(() => {
   detach?.()
   detach = null
   detachCamera?.()
   detachCamera = null
+  detachMicrophone?.()
+  detachMicrophone = null
 })
 
 /**
@@ -158,6 +233,38 @@ const cameraText = computed(() =>
     ? null
     : CAMERA_PIP_TEXT[cameraPipState.value as 'off' | 'waiting' | 'failed'],
 )
+
+/* -------------------------------------------------------------------------- */
+/* 私密语音（§31）与"正在听谁的麦克风"（§32）                                  */
+/* -------------------------------------------------------------------------- */
+
+/** 能不能发起：未进入 / 已离开的学生连按钮都不该可点（原因由下面那句说明给出）。 */
+const canTalk = computed(() => canStartPrivateTalk(props.student))
+
+/** 不能发起时那句原因（`canTalk` 为真时为 null）。 */
+const talkBlocked = computed(() => talkBlockedReason(props.student))
+
+/** 当前目标：按钮变成"正在与 X 语音沟通 · 结束"（§31 的高亮）。 */
+const talkLabel = computed(() =>
+  props.talkTarget ? describeTalkActionText(props.student.displayName) : '语音沟通',
+)
+
+/**
+ * 麦克风听感状态（§32）：三档各说一句话，而且必须一直显示其中一句——
+ * 音频是看不见的，面板上不写出来，老师就只能靠猜。
+ */
+const listeningText = computed(() => {
+  if (props.microphoneSubscription !== null) {
+    return `正在听${props.student.displayName}的麦克风`
+  }
+  if (props.microphoneMediaState === 'failed') return '该学生的麦克风订阅失败'
+  if (props.microphoneMediaState === 'pending') return '正在连接该学生的麦克风…'
+  if (props.student.microphone.active) return '正在连接该学生的麦克风…'
+  return '该学生未开启麦克风'
+})
+
+/** 已经有声音在放（决定要不要渲染那个隐藏的 `<audio>`）。 */
+const hasMicrophoneAudio = computed(() => props.microphoneSubscription !== null)
 </script>
 
 <template>
@@ -285,15 +392,84 @@ const cameraText = computed(() =>
 
           <div class="rounded-card border border-border-subtle bg-surface px-4 py-3 shadow-card">
             <!--
-              §31 的私密语音属于 Phase 10。按钮**禁用**并写出原因：
-              一个能点但没反应的按钮会让老师在课堂上以为是自己操作错了。
+              §31 的私密语音：当前目标时按钮变成"正在与 X 语音沟通 · 结束"（高亮），
+              否则是「语音沟通」。切换目标 = 对另一个学生再点一次，后端会撤销旧的订阅，
+              界面只需要跟着 `talkTarget` 走。
             -->
-            <AppButton variant="secondary" disabled block data-testid="focus-talk">
-              语音沟通
+            <AppButton
+              v-if="talkTarget"
+              block
+              data-testid="focus-talk"
+              :loading="talkBusy"
+              :disabled="talkBusy"
+              @click="emit('stopTalk')"
+            >
+              {{ talkLabel }}
             </AppButton>
-            <p class="mt-2 text-xs text-ink-muted" data-testid="focus-talk-note">
-              Phase 10 接入：私密语音将在后续版本开放。
+            <AppButton
+              v-else
+              variant="secondary"
+              block
+              data-testid="focus-talk"
+              :loading="talkBusy"
+              :disabled="talkBusy || !canTalk"
+              @click="emit('startTalk')"
+            >
+              {{ talkLabel }}
+            </AppButton>
+
+            <!-- 未进入 / 已离开：按钮禁用，并**在这里**说明原因（不要点了才报错）。 -->
+            <p
+              v-if="!talkTarget && talkBlocked"
+              class="mt-2 text-xs text-ink-muted"
+              data-testid="focus-talk-blocked"
+            >
+              {{ talkBlocked }}
             </p>
+
+            <!--
+              §31 的可执行提示：`TEACHER_MIC_REQUIRED` 时不能只说"失败了"，
+              必须给一个真的能解决问题的按钮。
+            -->
+            <div
+              v-if="talkMicRequired"
+              class="mt-3 space-y-2"
+              data-testid="focus-talk-mic-required"
+            >
+              <p class="text-xs text-ink-muted">请先开启你的麦克风，再发起语音沟通。</p>
+              <AppButton
+                size="sm"
+                data-testid="focus-talk-enable-mic"
+                :loading="teacherMicState === 'requesting'"
+                :disabled="teacherMicState === 'requesting' || teacherMicState === 'on'"
+                @click="emit('enableMic')"
+              >
+                🎤 开启麦克风
+              </AppButton>
+            </div>
+            <!-- 其余失败（学生不在课堂 / 不是 owner / 课堂已结束）只给一句可读的话。 -->
+            <p
+              v-else-if="talkError"
+              class="mt-2 text-xs text-status-danger"
+              data-testid="focus-talk-error"
+            >
+              {{ talkError }}
+            </p>
+
+            <!--
+              §32：老师必须知道自己的耳机里在放什么。这一行**永远**在，而且三档都说清楚
+              （正在听 / 正在连接 / 对方没开麦）——音频没有画面，"什么都没显示"是最糟的状态。
+            -->
+            <p class="mt-3 text-xs text-ink-muted" data-testid="focus-listening">
+              {{ listeningText }}
+            </p>
+            <!-- 有订阅就渲染：隐藏的 <audio> 是真正出声的地方，没有它"正在听"就是一句空话。 -->
+            <audio
+              v-if="hasMicrophoneAudio"
+              ref="micAudioRef"
+              autoplay
+              data-testid="focus-mic-audio"
+            />
           </div>
         </aside>
       </div>

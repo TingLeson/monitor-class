@@ -56,8 +56,8 @@ flowchart TB
 | --- | --- | --- | --- |
 | 学生 | `screen_share` | join 时后端签发学生 Token（§28） | Phase 6/7 生效 |
 | 学生 | `camera` | 同一个学生 Token 的 `canPublishSources`（§75） | ✅ Phase 9 |
-| 学生 | `microphone` | 同一个学生 Token | ⬜ Phase 10（§76），与它的事件路径同时加入 |
-| 老师 | `microphone` | media-token 接口签发（§27） | 权限位已有，Phase 7 客户端**不发布**；Phase 10 用于私密语音 |
+| 学生 | `microphone` | 同一个学生 Token | ✅ Phase 10（§76）已加入，与它的事件路径同时落地 |
+| 老师 | `microphone` | media-token 接口签发（§27） | 权限位自 Phase 6 就有；Phase 10 起客户端**会**发布，用于私密语音 |
 | 老师 | `camera` / `screen_share` | —— | **V1 永不**（§27）。老师发布屏幕会让监督墙把课堂展示给自己 |
 | 任何人 | data channel | `canPublishData=false` | 业务消息走 WebSocket（§47），数据通道是控制面观测不到的旁路 |
 
@@ -65,7 +65,7 @@ flowchart TB
 
 | 订阅者 ↓ / 发布者 → | 学生 B（屏幕） | 学生 B（摄像头） | 老师 |
 | --- | --- | --- | --- |
-| 学生 A | ✗ **由服务端撤销** | ✗ **同样由服务端撤销** | ✓ 允许（Phase 10 只有被选中的学生实际收到） |
+| 学生 A | ✗ **由服务端撤销** | ✗ **同样由服务端撤销** | ✓ 允许（Phase 10 已实现：只有被选中的学生实际收到） |
 | 老师 | ✓ 老师要看到所有学生的屏幕 | ✓ 画中画（§30/§75） | —— |
 
 摄像头没有引入新的订阅规则：第 2 层的对账按**已发布轨道**工作，而 `ObservedTrack.Source`
@@ -142,10 +142,10 @@ identity        = student_sessions.id（= livekit_identity，§44，永远是不
 ```
 
 `canSubscribe=true` 是本文所有"限制"的来源：**订阅权限是房间级的，没法写成"只订阅老师"。**
-把它改成 `false` 会让 §28/§31（老师私密讲话）在 Phase 10 无法实现，把一个本期能解决的问题
+把它改成 `false` 会让 §28/§31（老师私密讲话）实现不了，把一个本期能解决的问题
 换成下一期无法解决的问题。所以第 2 层必须存在。
 
-**为什么这一期只加 camera、麦克风留到 Phase 10：** 摄像头与它的**事件路径**是同一天到达的
+**为什么学生麦克风在 Phase 10 才加：** 摄像头与它的**事件路径**是同一期落地的
 （`CAMERA_STARTED` / `CAMERA_STOPPED` / `CAMERA_CHANGED` / `camera.active`），所以"允许发布"
 和"有人观测"同时成立。麦克风不是：grant 一旦放开，学生就能发布一路**控制面完全不观测**的音频 ——
 没有 `MIC_STARTED`、没有 `MIC_CHANGED`，也没有 §31"老师可以对谁说话"的授权模型。
@@ -416,3 +416,9 @@ CAMERA  ⇒  不改变 student_sessions.status            （§24，Phase 9）
 | 读取订阅状态（真正的"检测"） | ⬜ LiveKit 当前无此 API；见 §4.5 |
 | 协议级恶意客户端隔离 | ❌ 不在 V1 的威胁模型内（§26 末段） |
 | 在真实 LiveKit Cloud 上同时发布 screen + camera 并肉眼确认 | ⬜ 只能真机验证，见 Phase 9 报告 |
+
+---
+
+## 相关文档
+
+- [private-audio.md](private-audio.md)：私密语音的完整设计（状态机、订阅收口、老师未开麦/学生未开麦的行为）

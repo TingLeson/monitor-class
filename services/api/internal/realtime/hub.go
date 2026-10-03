@@ -242,12 +242,28 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, role Role, userID uu
 		return ErrUnavailable
 	}
 
-	h.mu.RLock()
-	closing := h.closing
-	h.mu.RUnlock()
-	if closing {
+	// WHY 用写锁而不是读锁，并且在这里就 wg.Add：Shutdown 先置 closing 再 wg.Wait()。
+	// 如果 Add 发生在 Wait 之后（旧写法：先读锁检查、升级完再 Add），就构成
+	// WaitGroup 的经典误用——`go test -race` 会在"关服时正好有人握手的"场景里报竞争，
+	// 而这类时序在真实部署（滚动重启）里并不罕见。把判定与 Add 放进同一把锁，
+	// 使"进入注册"与"开始关闭"二者必有一个先发生。
+	h.mu.Lock()
+	if h.closing {
+		h.mu.Unlock()
 		return ErrUnavailable
 	}
+	h.wg.Add(1)
+	h.mu.Unlock()
+
+	// Add 之后到"把连接的写泵交给 wg 管理"之间有若干早退路径（升级失败、构造失败…）。
+	// 每一条都必须把计数还回去，否则 Shutdown 的 wg.Wait() 会一直等到超时——
+	// 一次失败的握手就足以让优雅关闭多花几秒并打出一条误导性的超时告警。
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			h.wg.Done()
+		}
+	}()
 
 	ws, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -276,8 +292,8 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, role Role, userID uu
 	h.register(c)
 	c.logger.Info("websocket connected", "action", "ws_connected", "path", r.URL.Path)
 
-	h.wg.Add(1)
 	writeDone := make(chan struct{})
+	handedOff = true
 	go func() {
 		defer h.wg.Done()
 		defer close(writeDone)

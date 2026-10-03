@@ -13,6 +13,7 @@ import { RouterLink, useRoute } from 'vue-router'
 import MonitorFocusPanel from '../components/MonitorFocusPanel.vue'
 import MonitorTile from '../components/MonitorTile.vue'
 import { describeClassroomError } from '../lib/classroom-error.ts'
+import { describeTalkText } from '../lib/private-talk.ts'
 import { describeRealtimeStatus } from '../lib/realtime-status.ts'
 import { useClassroomsStore } from '../stores/classrooms.ts'
 import { useMonitorStore } from '../stores/monitor.ts'
@@ -33,9 +34,9 @@ import { useRealtimeStore } from '../stores/realtime.ts'
  *   让徽章与计数在事件发生的那一刻就变，而不是等下一次快照；
  * - LiveKit 手动订阅：画面有没有到 —— 媒体状态。
  *
- * 刻意**不做**的（都属于后续 Phase，提前做会变成要推翻重写的假实现）：
- * - 摄像头画中画（§29 的 CAM 角标）、Focus 里的摄像头预览 → Phase 9；
- * - 私密语音（§31）→ Phase 10（按钮已就位但**禁用**并写明原因）。
+ * 刻意**不做**的：摄像头画中画（§29 的 CAM 角标）与 Focus 里的摄像头预览在 Phase 9 完成；
+ * 私密语音（§31）与"听学生麦克风"（§32）在 Phase 10 完成——后者只订**Focus 那一个**，
+ * 因为多路音频混在一起之后老师分辨不出是谁在说话。
  */
 const route = useRoute()
 const classrooms = useClassroomsStore()
@@ -154,6 +155,46 @@ const enteredLabel = computed(() => `已进入 ${monitor.enteredCount} / 共 ${m
 
 /** 名单里有学生，但一个都还没进来时给一句解释——一行行灰卡片会让人以为页面坏了。 */
 const nobodyEntered = computed(() => monitor.rosterCount > 0 && monitor.enteredCount === 0)
+
+/* -------------------------------------------------------------------------- */
+/* 私密语音与老师麦克风（§27 / §31 / §32）                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 失败提示只属于**点它的那个学生**。
+ *
+ * 失败信息存在 store 里是全局的，而面板是按学生切换的：不过滤的话，老师对张三发起
+ * 失败之后点开李四，会在李四的面板上看到一句关于张三的错误。
+ * `setFocusedStudent` 也会清掉它（见 store），这里再挡一道。
+ */
+const focusedTalkError = computed(() => {
+  const focused = monitor.focusedStudent
+  if (focused === null || monitor.talkTarget !== null) return null
+  return monitor.talkFailure?.message ?? null
+})
+
+/** 失败原因是不是"老师还没开麦"（决定要不要给一键开麦入口，§31）。 */
+const focusedTalkMicRequired = computed(
+  () => monitor.focusedStudent !== null && monitor.talkFailure?.micRequired === true,
+)
+
+/**
+ * 页头那句"正在与 X 语音沟通"（§31）。
+ *
+ * WHY 放在页头而不是只放在 Focus 面板里：老师退出 Focus 回到网格之后，
+ * 面板就没了——而麦克风还在对那一个人广播。音频是看不见的，
+ * 界面上必须有一处**始终**在回答"我现在在对谁讲话"。
+ */
+const talkTargetText = computed(() =>
+  monitor.talkTarget === null ? null : describeTalkText(monitor.talkTarget.displayName),
+)
+
+/** Focus 面板上的「语音沟通」：目标就是当前 Focus 的学生（不可能是别人）。 */
+function startTalkWithFocused(): void {
+  const focused = monitor.focusedStudent
+  if (focused === null) return
+  void monitor.startTalk(focused)
+}
 </script>
 
 <template>
@@ -190,8 +231,49 @@ const nobodyEntered = computed(() => monitor.rosterCount > 0 && monitor.enteredC
         <span class="text-sm text-ink-muted" data-testid="monitor-entered-count">
           {{ enteredLabel }}
         </span>
+        <!--
+          §31：当前私密语音目标。它是**始终可见**的那一处界面记忆——
+          Focus 面板会随着切换学生消失，而麦克风还在对那一个人广播。
+        -->
+        <span v-if="talkTargetText" class="text-sm text-ink" data-testid="monitor-talk-target">
+          🎤 {{ talkTargetText }}
+        </span>
       </div>
     </header>
+
+    <!--
+      §27/§31：老师自己的麦克风开关。老师 Token 唯一允许发布的源就是 microphone，
+      而私密语音必须先有它——没开麦就点「语音沟通」会被后端以 TEACHER_MIC_REQUIRED
+      拒绝，所以这个入口必须显眼且随时可用（也在 Focus 面板里给了一键开麦）。
+    -->
+    <AppCard data-testid="teacher-mic-panel">
+      <div class="flex flex-wrap items-center gap-3">
+        <span class="text-sm font-medium text-ink">我的麦克风</span>
+        <AppButton
+          size="sm"
+          variant="secondary"
+          data-testid="toggle-teacher-mic"
+          :loading="monitor.isTeacherMicRequesting"
+          :disabled="monitor.isTeacherMicRequesting"
+          @click="monitor.toggleTeacherMicrophone()"
+        >
+          {{ monitor.teacherMicActionLabel }}
+        </AppButton>
+        <span class="text-sm text-ink-muted" data-testid="teacher-mic-status">
+          {{ monitor.isTeacherMicOn ? '已开启' : '未开启' }}
+        </span>
+        <span
+          v-if="monitor.teacherMicFailure"
+          class="text-xs text-status-danger"
+          data-testid="teacher-mic-failure"
+        >
+          {{ monitor.teacherMicFailure }}
+        </span>
+      </div>
+      <p class="mt-2 text-xs leading-relaxed text-ink-muted">
+        私密语音只会让你选中的那一个学生听到；其他学生收不到任何提示。
+      </p>
+    </AppCard>
 
     <!--
       媒体面失败：给明确提示 + 重试入口，绝不白屏。
@@ -298,6 +380,7 @@ const nobodyEntered = computed(() => monitor.rosterCount > 0 && monitor.enteredC
           :camera-subscription="monitor.cameraSubscriptionOf(student)"
           :camera-media-state="monitor.cameraMediaStateOf(student)"
           :selected="monitor.focusedStudentId === student.studentId"
+          :talk-target="monitor.isTalkTarget(student)"
           @open="openFocus(student, $event)"
           @visibility-change="onTileVisibility(student.studentId, $event)"
         />
@@ -316,7 +399,17 @@ const nobodyEntered = computed(() => monitor.rosterCount > 0 && monitor.enteredC
       :media-state="monitor.mediaStateOf(monitor.focusedStudent)"
       :camera-subscription="monitor.cameraSubscriptionOf(monitor.focusedStudent)"
       :camera-media-state="monitor.cameraMediaStateOf(monitor.focusedStudent)"
+      :talk-target="monitor.isTalkTarget(monitor.focusedStudent)"
+      :talk-busy="monitor.talkBusy"
+      :talk-error="focusedTalkError"
+      :talk-mic-required="focusedTalkMicRequired"
+      :teacher-mic-state="monitor.teacherMicState"
+      :microphone-subscription="monitor.microphoneSubscriptionOf(monitor.focusedStudent)"
+      :microphone-media-state="monitor.microphoneMediaStateOf(monitor.focusedStudent)"
       @close="closeFocus"
+      @start-talk="startTalkWithFocused"
+      @stop-talk="monitor.stopTalk()"
+      @enable-mic="monitor.enableTeacherMicrophone()"
     />
   </div>
 </template>

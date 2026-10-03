@@ -64,6 +64,18 @@ func (f *fakeBroadcaster) teacherMessages(kind MessageType) []Message {
 	return messages
 }
 
+// studentMessages reports every message of one type addressed to a student, keeping the
+// recipients next to the envelope so a test can assert BOTH.
+func (f *fakeBroadcaster) studentMessages(kind MessageType) []delivered {
+	var messages []delivered
+	for _, message := range f.sent {
+		if message.audience == "students" && message.message.Type == kind {
+			messages = append(messages, message)
+		}
+	}
+	return messages
+}
+
 // fakeAudience answers the roster questions from memory.
 type fakeAudience struct {
 	byClassroom map[uuid.UUID]*AudienceView
@@ -443,5 +455,188 @@ func TestServiceWithoutAHubStillResolvesTheAudience(t *testing.T) {
 	if err := service.ScreenLost(context.Background(),
 		session.SessionRef{SessionID: uuid.New(), StudentID: alice.StudentID, RunID: runID}); err != nil {
 		t.Fatalf("ScreenLost(): %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Private talk (§31): the audience rule that matters most
+// ---------------------------------------------------------------------------
+
+// TestMicChangedGoesToTheOwnerAndNobodyElse is the microphone's half of the camera rule:
+// the wall learns, no student connection does.
+func TestMicChangedGoesToTheOwnerAndNobodyElse(t *testing.T) {
+	service, hub, audience := newServiceUnderTest()
+	ctx := context.Background()
+
+	classroomID, runID, owner := uuid.New(), uuid.New(), uuid.New()
+	alice := StudentRef{StudentID: uuid.New(), DisplayName: "张三"}
+	bob := StudentRef{StudentID: uuid.New(), DisplayName: "李四"}
+	audience.forRun(runID, audience.seed(classroomID, "C++", owner, alice, bob))
+
+	ref := session.SessionRef{SessionID: uuid.New(), StudentID: alice.StudentID, RunID: runID}
+	if err := service.MicChanged(ctx, ref, true); err != nil {
+		t.Fatalf("MicChanged(): %v", err)
+	}
+
+	messages := hub.teacherMessages(TypeMicChanged)
+	if len(messages) != 1 {
+		t.Fatalf("teacher messages = %d, want 1", len(messages))
+	}
+	if messages[0].Data["studentId"] != alice.StudentID.String() ||
+		messages[0].Data["sessionId"] != ref.SessionID.String() ||
+		messages[0].Data["active"] != true {
+		t.Fatalf("data = %+v", messages[0].Data)
+	}
+	if hub.sent[0].teacher != owner {
+		t.Fatalf("sent to %s, want the owner %s", hub.sent[0].teacher, owner)
+	}
+	if recipients := hub.studentsWith(TypeMicChanged); len(recipients) != 0 {
+		t.Fatalf("MIC_CHANGED reached student connections %v, want none (§26)", recipients)
+	}
+}
+
+// TestPrivateTalkStartedReachesTheTargetAndTheOwnerWithDifferentData is the §31 audience
+// rule spelled out: the target student is told the teacher's name, the owner teacher is told
+// which student, and no other student is told ANYTHING.
+func TestPrivateTalkStartedReachesTheTargetAndTheOwnerWithDifferentData(t *testing.T) {
+	service, hub, audience := newServiceUnderTest()
+	ctx := context.Background()
+
+	classroomID, runID, owner := uuid.New(), uuid.New(), uuid.New()
+	alice := StudentRef{StudentID: uuid.New(), DisplayName: "张三"}
+	bob := StudentRef{StudentID: uuid.New(), DisplayName: "李四"}
+	audience.forRun(runID, audience.seed(classroomID, "C++", owner, alice, bob))
+
+	ref := session.SessionRef{SessionID: uuid.New(), StudentID: alice.StudentID, RunID: runID}
+	if err := service.PrivateTalkStarted(ctx, ref, "王老师"); err != nil {
+		t.Fatalf("PrivateTalkStarted(): %v", err)
+	}
+
+	// The teacher's copy addresses the card.
+	teacherMessages := hub.teacherMessages(TypePrivateTalkStarted)
+	if len(teacherMessages) != 1 {
+		t.Fatalf("teacher messages = %d, want 1", len(teacherMessages))
+	}
+	if teacherMessages[0].Data["studentId"] != alice.StudentID.String() ||
+		teacherMessages[0].Data["sessionId"] != ref.SessionID.String() ||
+		teacherMessages[0].Data["displayName"] != "张三" {
+		t.Fatalf("teacher data = %+v", teacherMessages[0].Data)
+	}
+	if hub.sent[0].teacher != owner {
+		t.Fatalf("sent to %s, want the owner %s", hub.sent[0].teacher, owner)
+	}
+
+	// The student's copy carries the teacher's name and NOTHING about the class.
+	studentMessages := hub.studentMessages(TypePrivateTalkStarted)
+	if len(studentMessages) != 1 {
+		t.Fatalf("student messages = %d, want 1", len(studentMessages))
+	}
+	if studentMessages[0].students[0] != alice.StudentID {
+		t.Fatalf("addressed to %v, want the target %s", studentMessages[0].students, alice.StudentID)
+	}
+	if studentMessages[0].message.Data["teacherDisplayName"] != "王老师" {
+		t.Fatalf("student data = %+v", studentMessages[0].message.Data)
+	}
+	if len(studentMessages[0].message.Data) != 1 {
+		t.Fatalf("student data = %+v, want exactly teacherDisplayName", studentMessages[0].message.Data)
+	}
+	// THE assertion of this phase: the classmate receives nothing, on no channel.
+	for _, recipient := range hub.studentsWith(TypePrivateTalkStarted) {
+		if recipient == bob.StudentID {
+			t.Fatal("a classmate was told a private talk started (§31: 其他人不接收任何东西)")
+		}
+	}
+}
+
+// TestPrivateTalkRequestGoesOnlyToTheTarget covers §25's dialog: it is for the student, it
+// carries the teacher's name, and the teacher's console does not need an echo of its own
+// request.
+func TestPrivateTalkRequestGoesOnlyToTheTarget(t *testing.T) {
+	service, hub, audience := newServiceUnderTest()
+	ctx := context.Background()
+
+	classroomID, runID, owner := uuid.New(), uuid.New(), uuid.New()
+	alice := StudentRef{StudentID: uuid.New(), DisplayName: "张三"}
+	bob := StudentRef{StudentID: uuid.New(), DisplayName: "李四"}
+	audience.forRun(runID, audience.seed(classroomID, "C++", owner, alice, bob))
+
+	ref := session.SessionRef{SessionID: uuid.New(), StudentID: alice.StudentID, RunID: runID}
+	if err := service.PrivateTalkRequested(ctx, ref, "王老师"); err != nil {
+		t.Fatalf("PrivateTalkRequested(): %v", err)
+	}
+
+	if len(hub.sent) != 1 {
+		t.Fatalf("sent = %+v, want exactly one message", hub.sent)
+	}
+	message := hub.sent[0]
+	if message.audience != "students" || len(message.students) != 1 || message.students[0] != alice.StudentID {
+		t.Fatalf("audience = %+v, want the target student alone", message)
+	}
+	if message.message.Data["teacherDisplayName"] != "王老师" {
+		t.Fatalf("data = %+v", message.message.Data)
+	}
+	if len(hub.teacherMessages(TypePrivateTalkRequest)) != 0 {
+		t.Fatal("the teacher received an echo of their own request")
+	}
+}
+
+// TestPrivateTalkEndedReachesTheTargetAndTheOwner: both sides have to clear the state they
+// were told about, and the data is the same pair of identifiers for both.
+func TestPrivateTalkEndedReachesTheTargetAndTheOwner(t *testing.T) {
+	service, hub, audience := newServiceUnderTest()
+	ctx := context.Background()
+
+	classroomID, runID, owner := uuid.New(), uuid.New(), uuid.New()
+	alice := StudentRef{StudentID: uuid.New(), DisplayName: "张三"}
+	bob := StudentRef{StudentID: uuid.New(), DisplayName: "李四"}
+	audience.forRun(runID, audience.seed(classroomID, "C++", owner, alice, bob))
+
+	ref := session.SessionRef{SessionID: uuid.New(), StudentID: alice.StudentID, RunID: runID}
+	if err := service.PrivateTalkEnded(ctx, ref); err != nil {
+		t.Fatalf("PrivateTalkEnded(): %v", err)
+	}
+
+	teacherMessages := hub.teacherMessages(TypePrivateTalkEnded)
+	if len(teacherMessages) != 1 {
+		t.Fatalf("teacher messages = %d, want 1", len(teacherMessages))
+	}
+	if len(hub.studentMessages(TypePrivateTalkEnded)) != 1 {
+		t.Fatalf("student messages = %d, want 1", len(hub.studentMessages(TypePrivateTalkEnded)))
+	}
+	for _, message := range append(teacherMessages, hub.studentMessages(TypePrivateTalkEnded)[0].message) {
+		if message.Data["studentId"] != alice.StudentID.String() || message.Data["sessionId"] != ref.SessionID.String() {
+			t.Fatalf("data = %+v", message.Data)
+		}
+		if len(message.Data) != 2 {
+			t.Fatalf("data = %+v, want exactly studentId and sessionId", message.Data)
+		}
+	}
+	// A "reason" would tell a student that the teacher moved on to a classmate (§26).
+	if _, leaked := teacherMessages[0].Data["reason"]; leaked {
+		t.Fatalf("the end message carries a reason: %+v", teacherMessages[0].Data)
+	}
+}
+
+// TestPrivateTalkMessagesForAnUnrosteredStudentAreNotSent reuses the roster guard: a session
+// that outlived a roster entry must not produce a message about a person the teacher does not
+// supervise.
+func TestPrivateTalkMessagesForAnUnrosteredStudentAreNotSent(t *testing.T) {
+	service, hub, audience := newServiceUnderTest()
+	classroomID, runID, owner := uuid.New(), uuid.New(), uuid.New()
+	alice := StudentRef{StudentID: uuid.New(), DisplayName: "张三"}
+	audience.forRun(runID, audience.seed(classroomID, "C++", owner, alice))
+
+	stranger := session.SessionRef{SessionID: uuid.New(), StudentID: uuid.New(), RunID: runID}
+	for name, call := range map[string]func() error{
+		"started": func() error { return service.PrivateTalkStarted(context.Background(), stranger, "王老师") },
+		"request": func() error { return service.PrivateTalkRequested(context.Background(), stranger, "王老师") },
+		"ended":   func() error { return service.PrivateTalkEnded(context.Background(), stranger) },
+	} {
+		if err := call(); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if len(hub.sent) != 0 {
+		t.Fatalf("sent = %+v, want nothing", hub.sent)
 	}
 }

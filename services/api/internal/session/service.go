@@ -31,6 +31,18 @@ type Service struct {
 	// correct without it, and a deployment with no realtime layer must not lose the
 	// ability to record a session — it only loses the messages.
 	lifecycle LifecycleEvents
+	// talk is the private-talk message path of §31/§47. Optional for the same reason as
+	// lifecycle: the state machine and the media plane still work without a hub, and only
+	// the two browsers that would have been told are not.
+	talk PrivateTalkEvents
+	// talkAudit is the event log as the private talk state machine sees it (§13). Optional:
+	// a deployment without a database cannot record anything, and the talk itself is a
+	// media-plane fact.
+	talkAudit PrivateTalkAudit
+	// talkState is the process-local "who is being talked to" registry. It is never nil for
+	// a service built by NewService, so no method has to guard against it; see
+	// privatetalk.go for why it is not a database table in Phase 10 (§52/§77).
+	talkState *privateTalkRegistry
 }
 
 // NewService wires the service. media may be nil in a degraded deployment (the API
@@ -38,7 +50,10 @@ type Service struct {
 // token paths then answer MEDIA_TOKEN_FAILED instead of pretending to have a media
 // plane, which is the honest answer for a process that cannot talk to LiveKit.
 func NewService(repo Repository, classrooms Directory, mediaPlane MediaPlane, cfg Config) *Service {
-	return &Service{repo: repo, classrooms: classrooms, media: mediaPlane, cfg: cfg}
+	return &Service{
+		repo: repo, classrooms: classrooms, media: mediaPlane, cfg: cfg,
+		talkState: newPrivateTalkRegistry(),
+	}
 }
 
 // WithLifecycleEvents attaches the runtime event path (§13/§74).
@@ -50,6 +65,20 @@ func NewService(repo Repository, classrooms Directory, mediaPlane MediaPlane, cf
 // state instead of making it visible at the one wiring site that matters.
 func (s *Service) WithLifecycleEvents(events LifecycleEvents) *Service {
 	s.lifecycle = events
+	return s
+}
+
+// WithPrivateTalk attaches the private-talk layer of §31: the messages (the realtime
+// service) and the audit log (the session repository).
+//
+// WHY a setter with two collaborators instead of a wider constructor: the private-talk
+// state machine is complete without either of them — the media plane is what actually
+// decides who hears the teacher — and this keeps the fact that a deployment may have no
+// hub (or no event store) visible at the one wiring site that matters, exactly like
+// WithLifecycleEvents.
+func (s *Service) WithPrivateTalk(events PrivateTalkEvents, audit PrivateTalkAudit) *Service {
+	s.talk = events
+	s.talkAudit = audit
 	return s
 }
 
@@ -174,22 +203,24 @@ func (s *Service) Join(ctx context.Context, in JoinInput) (*JoinResult, error) {
 		// §47: business messages go over a WebSocket, so the WebRTC data channel is
 		// switched off rather than left as an unobserved side channel.
 		CanPublishData: false,
-		// §28: a student may publish their screen and — from Phase 9 — their camera.
+		// §28: a student may publish their screen, their camera and — from Phase 10 —
+		// their microphone. Phase 10 is the phase in which all three are finally granted
+		// together, and the order mirrors §28's own list: screen first because it is the
+		// MANDATORY track (§21), camera second because it is optional (§24), microphone
+		// third because it is optional and, unlike the camera, it is also the student's
+		// half of a private conversation the teacher can hear (§25/§32).
 		//
-		// WHY the camera joins the grant now: §75 makes the camera the student's
-		// OPTIONAL second track, and the publish permission has to be in the TOKEN
-		// (LiveKit enforces sources, so a camera track published without this entry is
-		// refused by the media plane before any webhook could describe it). The order
-		// mirrors §28: screen first because it is mandatory, camera second because it
-		// is not.
+		// WHY the microphone arrives now and not earlier: the grant is not the missing
+		// piece — the CONTROL PLANE is. A microphone published without MIC_STARTED /
+		// MIC_STOPPED, MIC_CHANGED and the §31 question "who may hear the teacher?" is
+		// media nobody observes. §33 keeps the media plane behind the control plane, never
+		// ahead of it, so the permission is granted in the same phase as its event path.
 		//
-		// WHY the microphone is still absent (Phase 10, §76): the grant is not the
-		// missing piece — the CONTROL PLANE is. A microphone published today would
-		// produce no MIC_STARTED/MIC_STOPPED event, no MIC_CHANGED message, and no
-		// answer to the §31 question "who is the teacher allowed to talk to?". §33
-		// keeps the media plane behind the control plane, never ahead of it, so the
-		// permission is granted in the same phase as its event path.
-		PublishSources: []media.PublishSource{media.PublishScreenShare, media.PublishCamera},
+		// WHAT this permission does NOT mean: `canPublishSources` is about publishing, and
+		// `canSubscribe` (true, above) is room-wide. Hearing the TEACHER's microphone is a
+		// per-student decision made at runtime by RoomService.UpdateSubscriptions (§31), not
+		// a token bit — see media.EnforcePrivateTalk.
+		PublishSources: []media.PublishSource{media.PublishScreenShare, media.PublishCamera, media.PublishMicrophone},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrMediaUnavailable, err)
@@ -460,9 +491,16 @@ func (s *Service) Monitor(ctx context.Context, classroomID, teacherID uuid.UUID)
 		return unobservedView(roster), nil
 	}
 
-	// §26: the same observation, one reconciliation pass. Deliberately before the
-	// response is built and deliberately not fatal — see the method.
-	s.enforceStudentIsolation(ctx, classroomID, run, roster, observed)
+	// §26 and §31: the same observation, two reconciliation passes. Deliberately before
+	// the response is built and deliberately not fatal — see the methods.
+	//
+	// The non-student identities are derived ONCE and handed to both, because both need to
+	// know which participant is the teacher: the §26 pass whitelists that owner's tracks,
+	// and the §31 pass looks for that owner's microphone to grant it to exactly one
+	// student. Two derivations would eventually disagree about who the teacher is.
+	teacherIdentities := nonStudentIdentities(roster, observed)
+	s.enforceStudentIsolation(ctx, classroomID, run, roster, observed, teacherIdentities)
+	s.enforcePrivateTalk(ctx, classroomID, run, roster, observed, teacherIdentities)
 
 	// One warning per poll that skipped work: a session whose status changed under us
 	// (a leave that landed while we were observing) is normal, but a burst of them is
@@ -544,12 +582,10 @@ func (s *Service) Monitor(ctx context.Context, classroomID, teacherID uuid.UUID)
 //
 // A student may keep receiving tracks from a participant that is NOT a student of this
 // run. The only other token this control plane mints for a run belongs to the teacher
-// (§27), who publishes nothing in Phase 7 — so in practice students are unsubscribed to
-// nothing at all. The whitelist is an explicit argument and not an assumption, which is
-// where Phase 10 attaches: it will narrow the allowance to (the teacher, MICROPHONE),
-// and the observation already carries each track's source. Deriving it as "not a student
-// of this run" also means a student who LEFT but whose participant is still lingering
-// stays in the student set, so a classmate is still unsubscribed from their tracks.
+// (§27), so in practice that is the teacher — and Phase 10's microphone is handled one
+// level deeper, by EnforcePrivateTalk. Deriving the list as "not a student of this run"
+// also means a student who LEFT but whose participant is still lingering stays in the
+// student set, so a classmate is still unsubscribed from their tracks.
 //
 // # Failure discipline
 //
@@ -561,26 +597,11 @@ func (s *Service) enforceStudentIsolation(
 	run *classroom.Run,
 	roster []RosterEntry,
 	observed map[string]media.ParticipantTracks,
+	allowedTrackOwners []string,
 ) {
 	if s.media == nil || len(observed) == 0 {
 		return
 	}
-
-	// Every identity that belongs to a student of this run, terminal sessions included:
-	// this is what makes "not a student" mean "the teacher" and not "somebody we forgot".
-	studentIdentities := make(map[string]struct{}, len(roster))
-	for _, entry := range roster {
-		if entry.Session != nil {
-			studentIdentities[entry.Session.LiveKitIdentity] = struct{}{}
-		}
-	}
-	allowed := make([]string, 0, len(observed))
-	for identity := range observed {
-		if _, isStudent := studentIdentities[identity]; !isStudent {
-			allowed = append(allowed, identity)
-		}
-	}
-	sort.Strings(allowed)
 
 	// Only sessions that are still open are reconciled: a terminal session's participant
 	// has already been disconnected (§50), and asking LiveKit to update subscriptions for
@@ -593,7 +614,7 @@ func (s *Service) enforceStudentIsolation(
 		students = append(students, entry.Session.LiveKitIdentity)
 	}
 
-	revoked, err := s.media.EnforceNoPeerSubscriptions(ctx, run.LiveKitRoomName, students, observed, allowed)
+	revoked, err := s.media.EnforceNoPeerSubscriptions(ctx, run.LiveKitRoomName, students, observed, allowedTrackOwners)
 	for _, revocation := range revoked {
 		// Warn, not Info: this line is the evidence that a client tried to receive a
 		// classmate's media. It is the only trace there is — LiveKit offers no API to read
@@ -623,6 +644,33 @@ func (s *Service) enforceStudentIsolation(
 			"consequence", "the monitor response is unaffected and the next poll retries",
 		)
 	}
+}
+
+// nonStudentIdentities lists the participants of a room observation that do not belong to
+// any student of this run, sorted.
+//
+// WHY it is a free function used by two passes: the teacher is the only participant this
+// control plane mints a non-student token for (§27/§44), so "not a student of this run" IS
+// "the teacher" — and both §26 (which tracks a student may keep) and §31 (whose microphone
+// may reach a student) have to agree on that answer.
+//
+// Terminal sessions count as students on purpose: a student who LEFT but whose participant
+// is still lingering must not be mistaken for a second teacher and become whitelisted.
+func nonStudentIdentities(roster []RosterEntry, observed map[string]media.ParticipantTracks) []string {
+	studentIdentities := make(map[string]struct{}, len(roster))
+	for _, entry := range roster {
+		if entry.Session != nil {
+			studentIdentities[entry.Session.LiveKitIdentity] = struct{}{}
+		}
+	}
+	identities := make([]string, 0, len(observed))
+	for identity := range observed {
+		if _, isStudent := studentIdentities[identity]; !isStudent {
+			identities = append(identities, identity)
+		}
+	}
+	sort.Strings(identities)
+	return identities
 }
 
 // ownedOpenClassroom loads a classroom for its owner and requires it to be OPEN with

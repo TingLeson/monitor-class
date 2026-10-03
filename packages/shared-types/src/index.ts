@@ -98,7 +98,9 @@ export {
 } from './realtime'
 export type {
   DeviceActiveChangedData,
-  PrivateTalkData,
+  PrivateTalkEndedData,
+  PrivateTalkRequestData,
+  PrivateTalkStartedData,
   RealtimeEvent,
   RealtimeEventDataMap,
   RealtimeEventType,
@@ -108,9 +110,13 @@ export type {
   StudentOfflineData,
   StudentOfflineReason,
   StudentOnlineData,
+  StudentPrivateTalkStartedData,
   StudentScreenStateData,
+  TeacherPrivateTalkStartedData,
   TeacherScreenStateData,
 } from './realtime'
+
+export type { PrivateTalkResponse, PrivateTalkTarget } from './private-talk'
 
 export { CONNECTION_QUALITIES, MONITOR_TILE_STATES, isConnectionQuality } from './monitor'
 export type {

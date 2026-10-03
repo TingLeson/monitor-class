@@ -36,7 +36,7 @@ import ClassroomMonitorView from '../ClassroomMonitorView.vue'
  * 2. **画面由 LiveKit 订阅提供**（媒体状态）：只有订阅到位的卡片才有 `<video>`，
  *    而且它必须 `autoplay + playsinline + muted`——少一个 `muted`，老师一开口
  *    就会把学生桌面的声音放出来形成回声；
- * 3. **Focus**（§30）：点开大画面、右侧设备面板、Esc 退出、语音按钮禁用；
+ * 3. **Focus**（§30）：点开大画面、右侧设备面板、Esc 退出、私密语音按钮（§31）；
  * 4. **订阅策略**（§52）：可见才订、不可见就退、网格低画质、Focus 高画质、
  *    页面隐藏即停。
  *
@@ -52,6 +52,16 @@ const { getMonitorMock, requestMediaTokenMock, getClassroomMock } = vi.hoisted((
 vi.mock('../../lib/teacher-monitor-api.ts', () => ({
   getMonitor: getMonitorMock,
   requestMediaToken: requestMediaTokenMock,
+}))
+
+/**
+ * 私密语音接口（§31）。`load()` 会读一次"当前目标"来恢复界面记忆，
+ * 不替身的话每个用例都会真的去 fetch 一次（既慢又会打出连接失败的噪音）。
+ */
+vi.mock('../../lib/private-talk-api.ts', () => ({
+  startPrivateTalk: vi.fn(),
+  stopPrivateTalk: vi.fn(),
+  getPrivateTalk: vi.fn().mockResolvedValue(null),
 }))
 
 vi.mock('../../lib/teacher-classrooms-api.ts', () => ({
@@ -355,7 +365,7 @@ describe('课堂监督墙', () => {
     expect(wrapper.find('[data-testid="monitor-focus"]').exists()).toBe(true)
   })
 
-  it('§31：Focus 的"语音沟通"按钮处于禁用态，并写明 Phase 10 接入', async () => {
+  it('§31：Focus 的「语音沟通」按钮在进入课堂的学生上**可用**（Phase 10 真正启用）', async () => {
     installFakeMonitorRoom()
     installFakeVisibility()
     const { wrapper } = await mountView()
@@ -363,9 +373,10 @@ describe('课堂监督墙', () => {
     await flushPromises()
 
     const talk = wrapper.find('[data-testid="focus-talk"]')
-    expect((talk.element as HTMLButtonElement).disabled).toBe(true)
-    expect(talk.attributes('disabled')).toBeDefined()
-    expect(wrapper.find('[data-testid="focus-talk-note"]').text()).toContain('Phase 10')
+    expect(talk.text()).toBe('语音沟通')
+    expect((talk.element as HTMLButtonElement).disabled).toBe(false)
+    // 旧的"Phase 10 接入"占位说明必须消失：一个能点的按钮配一句"还没做"最让人困惑。
+    expect(wrapper.find('[data-testid="focus-talk-note"]').exists()).toBe(false)
   })
 
   it('§30：未进入的学生点开 Focus 只讲原因，不产生任何订阅（也不给空窗）', async () => {

@@ -309,6 +309,58 @@ type SessionEvents interface {
 	// server's copy would arrive after the fact and could only contradict it). The wall,
 	// on the other hand, has no way to see the button: the teacher learns it here.
 	CameraChanged(ctx context.Context, ref SessionRef, active bool) error
+	// MicChanged is CameraChanged for the microphone (§25/§47/§76). Same audience, same
+	// reasoning: the teacher's wall is the only place that cannot see the button.
+	MicChanged(ctx context.Context, ref SessionRef, active bool) error
+}
+
+// PrivateTalkEvents is the private-talk state machine of §31 as the runtime layer sees it
+// (§47).
+//
+// # Why this is not part of SessionEvents
+//
+// SessionEvents is the vocabulary of the polling state machine: every method is the
+// message one OBSERVED state change produces. Private talk is a different kind of fact —
+// a teacher's deliberate action with a target — and it is produced by a different part of
+// this package (Service, not Processor). Two ports keep the audiences separately
+// reviewable, and neither one can widen the other's.
+//
+// # The audiences are absolute
+//
+// §31: other students receive NOTHING. Every method here names ONE session, and the
+// implementation resolves the recipient from it; there is no argument through which a
+// caller could name a classroom. That is what makes "no classmate learns that a private
+// talk exists" a property of the signature rather than of a review.
+type PrivateTalkEvents interface {
+	// PrivateTalkStarted tells the TARGET student and the OWNER teacher that the teacher
+	// is now talking to that student. Data differs per audience (see the realtime layer):
+	// the student learns the teacher's display name, the teacher learns which student.
+	PrivateTalkStarted(ctx context.Context, ref SessionRef, teacherDisplayName string) error
+	// PrivateTalkRequested asks the TARGET student to open their microphone (§25).
+	//
+	// It is sent ONLY when the target's microphone is not already on: a student who is
+	// already publishing does not need a dialog asking them to do what they did. Deciding
+	// that needs a media-plane observation, which is why the CALLER decides and this
+	// method simply delivers what it is told — see Service.StartPrivateTalk.
+	PrivateTalkRequested(ctx context.Context, ref SessionRef, teacherDisplayName string) error
+	// PrivateTalkEnded tells the TARGET student and the OWNER teacher that the talk is
+	// over. It is idempotent from the caller's point of view: the state machine only calls
+	// it for a talk that was actually in progress.
+	PrivateTalkEnded(ctx context.Context, ref SessionRef) error
+}
+
+// PrivateTalkAudit is the event log as the private-talk state machine sees it (§13/§31).
+//
+// WHY it is not EventStore: the two event types of a private talk are NOT "once per
+// session" — a teacher may talk to 张三, stop, and talk to them again five minutes later,
+// and each of those is a real TEACHER_TALK_STARTED that a lesson report must show. The
+// guard EventStore exposes (RecordEventOnce, once per (session, type)) would silently
+// swallow the second one, so this port is an unconditional append and is deliberately a
+// separate interface: a store that only satisfies the guarded one cannot be passed here.
+type PrivateTalkAudit interface {
+	// AppendEvent appends one event row of a session. The payload is diagnostic metadata
+	// (identifiers, a reason) and never audio, a transcript or a person's name (§13/§59).
+	AppendEvent(ctx context.Context, sessionID uuid.UUID, event EventType, payload map[string]any) error
 }
 
 // LifecycleEvents is what the join and leave endpoints tell the runtime layer (§74).

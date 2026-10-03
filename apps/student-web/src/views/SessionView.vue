@@ -4,6 +4,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { describeConnectionQuality } from '../lib/connection-quality'
 import { describeSessionPhase } from '../lib/media-session-state.ts'
+import { PRIVATE_TALK_DECLINE_NOTE } from '../lib/private-talk.ts'
 import { describeRealtimeStatus } from '../lib/realtime-status.ts'
 import { describeScreenGateState } from '../lib/screen-capture-messages'
 import { useMediaSessionStore } from '../stores/media-session.ts'
@@ -11,7 +12,8 @@ import { useRealtimeStore } from '../stores/realtime.ts'
 import { useScreenShareStore } from '../stores/screen-share'
 
 /**
- * 课堂会话页（§55 / §56 / §22 / §49）—— Phase 6 的真实实现，Phase 9 追加摄像头。
+ * 课堂会话页（§55 / §56 / §22 / §49）—— Phase 6 的真实实现，Phase 9 追加摄像头，
+ * Phase 10 追加麦克风与私密语音提示。
  *
  * 这一页只做五件事，别的一概不做：
  *
@@ -32,6 +34,12 @@ import { useScreenShareStore } from '../stores/screen-share'
  *    实时通道断线期间，学生仍必须能发现课堂已经关闭。
  * 5. **如实显示实时通道状态**（§47）：连不上时明说"正在重连 / 可能不是最新"。
  *    这一页显示的是"老师能不能看到我"，界面假装一切正常是这里最不能犯的错。
+ *
+ * Phase 10 追加的两块（§25/§31）都在同一个原则下：
+ * - `🎤 开启麦克风` 是**真开关**（点击才 `getUserMedia`），开/关/再开各自独立；
+ *   老师发起的请求只显示提示与两个按钮——**不能**替他点"开启麦克风"。
+ * - 老师的私密语音只用两种形态出现：一个"要不要开麦"的请求卡片，和一条
+ *   "正在与 X 语音沟通"的持续指示。两种形态都**不提**任何其他学生（§26）。
  *
  * 刷新页面的行为是刻意设计的：token 只存在内存里，刷新即丢失。页面因此显示
  * 「会话信息已丢失」并给回列表的入口——而不是拿一个过期的 token 去反复重连，
@@ -129,6 +137,34 @@ watch(
 
 /** §24：入口只在**进入课堂之后**出现；没进课堂时连按钮都不该有。 */
 const canToggleCamera = computed(() => session.canUseCamera)
+
+/** §25：麦克风与摄像头同一条规则——进入课堂之后才显示入口（点击才申请权限）。 */
+const canToggleMicrophone = computed(() => session.canUseMicrophone)
+
+/** 麦克风的一行状态文字（与"正在共享整个屏幕"是两件独立的事）。 */
+const microphoneStatusText = computed(() => {
+  switch (session.micState) {
+    case 'on':
+      return session.micMuted ? '已开启（已静音）' : '已开启'
+    case 'requesting':
+      return '正在请求麦克风…'
+    case 'error':
+      return '未开启'
+    default:
+      return '未开启'
+  }
+})
+
+/**
+ * §25：「暂不开启」之后必须说明"老师仍能单向讲话"。
+ *
+ * 显示条件是"沟通在进行、而老师听不到我"，并且**已经回答过**（提示卡片不在了）：
+ * 提示卡片在场时它自己已经解释过"开启麦克风后老师才能听到你"，两句话说两遍
+ * 只会把真正重要的那一句淹掉。回答之后（拒绝或静音）就轮到这句话值班了。
+ */
+const showOneWayNote = computed(
+  () => session.isTalkingWithTeacher && !session.hasTalkRequest && !session.isMicrophoneAudible,
+)
 
 /** 摄像头的一行状态文字（与"正在共享整个屏幕"是两件独立的事）。 */
 const cameraStatusText = computed(() => {
@@ -367,7 +403,25 @@ watch(sessionId, (next) => {
             </div>
             <div class="space-y-1" data-testid="microphone-row">
               <dt class="text-xs tracking-wide text-ink-muted uppercase">麦克风</dt>
-              <dd class="text-ink">未启用（Phase 10 接入）</dd>
+              <dd class="flex flex-wrap items-center gap-2 text-ink">
+                <!--
+                  §25：与摄像头逐字同构的开关——**点击才** getUserMedia，
+                  开 / 关 / 再开 各自是一次独立的设备请求。入口只在课堂里出现。
+                -->
+                <AppButton
+                  v-if="canToggleMicrophone"
+                  size="sm"
+                  variant="secondary"
+                  :loading="session.isMicRequesting"
+                  :disabled="session.isMicRequesting"
+                  data-testid="toggle-microphone"
+                  @click="session.toggleMicrophone()"
+                >
+                  {{ session.micActionLabel }}
+                </AppButton>
+                <span v-else class="text-ink-muted">未启用</span>
+                <span data-testid="microphone-status">{{ microphoneStatusText }}</span>
+              </dd>
             </div>
             <div class="space-y-1" data-testid="network-row">
               <dt class="text-xs tracking-wide text-ink-muted uppercase">网络</dt>
@@ -419,6 +473,95 @@ watch(sessionId, (next) => {
               @click="realtime.restart()"
             >
               重试实时连接
+            </AppButton>
+          </div>
+        </div>
+      </AppCard>
+
+      <!--
+        §25：老师的私密语音请求。提示里只说**老师是谁**与两个动作——没有任何
+        其他学生的信息（§26），也没有"课堂里还有谁在听"这种问题（§31：其他人不接收）。
+      -->
+      <AppCard v-if="session.hasTalkRequest" data-testid="private-talk-request">
+        <div class="space-y-3">
+          <p class="text-base font-medium" data-testid="private-talk-request-title">
+            {{ session.talkRequestTitle }}
+          </p>
+          <div class="flex flex-wrap gap-2">
+            <!--
+              「开启麦克风」必须走完整的一次 getUserMedia：§25 明确老师不能绕过
+              浏览器权限远程开麦，所以这个按钮是**唯一**能打开麦克风的入口之一
+              （另一个是上面那个开关）。它不会在收到事件时被自动触发。
+            -->
+            <AppButton
+              size="sm"
+              :loading="session.isMicRequesting"
+              :disabled="session.isMicRequesting"
+              data-testid="private-talk-accept"
+              @click="session.acceptTalkRequest()"
+            >
+              开启麦克风
+            </AppButton>
+            <AppButton
+              size="sm"
+              variant="secondary"
+              data-testid="private-talk-decline"
+              @click="session.declineTalk()"
+            >
+              暂不开启
+            </AppButton>
+          </div>
+          <p class="text-xs leading-relaxed text-ink-muted">
+            开启麦克风后老师才能听到你。拒绝不会让你退出课堂，也不会停止屏幕共享。
+          </p>
+        </div>
+      </AppCard>
+
+      <!--
+        §25/§31：老师正在与我语音沟通的**持续指示**。它不随提示关闭而消失——
+        因为老师仍然可以单向讲话（`showOneWayNote` 就是为这件事准备的那句话）。
+      -->
+      <AppCard v-if="session.isTalkingWithTeacher" data-testid="private-talk-active">
+        <div class="space-y-3">
+          <p class="text-base font-medium" data-testid="private-talk-active-text">
+            {{ session.talkActiveText }}
+          </p>
+          <!-- 开着麦克风时给一个"静音自己"的入口（§31：本地静音即可）。 -->
+          <AppButton
+            v-if="session.isMicOn"
+            size="sm"
+            variant="secondary"
+            data-testid="private-talk-self-mute"
+            @click="session.toggleSelfMute()"
+          >
+            {{ session.micMuted ? '取消静音' : '静音自己' }}
+          </AppButton>
+          <p
+            v-if="showOneWayNote"
+            class="text-sm leading-relaxed text-ink-muted"
+            data-testid="private-talk-one-way-note"
+          >
+            {{ PRIVATE_TALK_DECLINE_NOTE }}
+          </p>
+          <!--
+            音频被自动播放策略拦住时**必须说出来**：界面显示"正在与老师语音沟通"、
+            学生却什么都听不到，是本 Phase 最严重的一种界面撒谎。点击是浏览器要求的
+            用户手势，所以恢复入口只能是一个按钮。
+          -->
+          <div
+            v-if="session.teacherAudio === 'blocked'"
+            class="space-y-2"
+            data-testid="private-talk-audio-blocked"
+          >
+            <p class="text-sm leading-relaxed text-ink-muted">
+              老师的语音已经就绪，但浏览器要求你先点击一次才能播放声音。
+            </p>
+            <AppButton
+              size="sm"
+              data-testid="private-talk-resume-audio"
+              @click="session.resumeTeacherAudio()"
+            >
+              点击播放声音
             </AppButton>
           </div>
         </div>
@@ -483,6 +626,20 @@ watch(sessionId, (next) => {
         data-testid="camera-failure"
       >
         {{ session.cameraFailure?.message }}
+      </AppAlert>
+
+      <!--
+        麦克风失败（§25）。与摄像头用**完全一样**的呈现方式：info 色调、
+        标题里明说"不影响上课"。文案来自词表，已包含下一步动作，并且说清
+        "仍然能听到老师讲话"——否则学生会以为拒绝开麦就等于整段沟通结束。
+      -->
+      <AppAlert
+        v-if="session.hasMicFailure"
+        tone="info"
+        title="麦克风没有开启（不影响上课）"
+        data-testid="microphone-failure"
+      >
+        {{ session.micFailure?.message }}
       </AppAlert>
 
       <!--

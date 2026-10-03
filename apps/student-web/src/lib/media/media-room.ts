@@ -13,9 +13,10 @@
  * 2. **不把 SDK 拖进测试环境**。SDK 在 import 期就会触碰浏览器 API（webrtc-adapter
  *    等），静态 import 会让每个跑 store 测试的文件都去执行它。默认工厂用
  *    `import()`，所以只要注入了替身，SDK 就一个字节都不会被加载。
- * 3. **接口面窄**。SDK 有上百个成员；会话页真正需要的只有"连、发布屏幕、断开、
- *    质量与断线事件"。窄接口让"学生端不会偷偷订阅别人"这件事在类型层面就成立：
- *    这里根本没有 subscribe 方法（§26）。
+ * 3. **接口面窄**。SDK 有上百个成员；会话页真正需要的只有"连、发布屏幕/摄像头/麦克风、
+ *    播放老师私密语音、断开、质量与断线事件"。窄接口让"学生端不会偷偷订阅别人"这件事
+ *    在类型层面就成立：这里根本没有 subscribe 方法（§26）。老师私密语音的订阅权在
+ *    **服务端**（§31 的 `UpdateSubscriptions`），客户端只播放被推下来的那条音频。
  *
  * 同名的老师端文件在 `apps/teacher-web/src/lib/media/`：两边刻意不共享，
  * 因为学生端只需要"发布"，老师端只需要"按需订阅"，唯一的重叠是连接选项。
@@ -49,7 +50,17 @@ export interface MediaCredentials {
 export type MediaDisconnectReason = string | null
 
 /**
- * 学生端的媒体房间：只发布，不订阅（见文件头第 3 点）。
+ * 老师私密语音的音频播放状态（§31 / §32）。
+ *
+ * WHY 需要一个状态而不是"订到就播"：订阅成功与**能听到声音**是两件事。
+ * 浏览器的自动播放策略会在没有用户手势的页面上拦住音频，此时轨道已经推下来、
+ * 界面也显示"正在与老师语音沟通"，学生却什么都听不到——那是本 Phase 最严重的
+ * 一种界面撒谎。`blocked` 让界面能说"点一下才能听到"，并给一个真实的恢复动作。
+ */
+export type TeacherAudioState = 'idle' | 'playing' | 'blocked'
+
+/**
+ * 学生端的媒体房间：只发布 + 播放老师私密语音（见文件头第 3 点）。
  *
  * 所有 `on*` 方法都返回**取消订阅**函数，与 `screen-capture.ts` 的 `onEnded`
  * 保持同一种风格：调用方（store）只负责保存取消函数并在退出时调用。
@@ -57,6 +68,8 @@ export type MediaDisconnectReason = string | null
  * 摄像头（§24）是**追加**在这个端口上的两个方法，不是第二套端口：摄像头与屏幕是
  * 同一个 participant 的两条轨道，共用同一条连接、同一份凭据、同一个断开动作。
  * 拆成两个 room 会让"离开课堂时到底断开哪个连接"变成一个需要回答的问题。
+ * 老师私密语音的音频同样挂在这里：它也是"同一个房间里的另一条轨道"，
+ * 而且它的**订阅权在服务端**（§31 的 UpdateSubscriptions），这个端口只负责播放。
  */
 export interface ScreenPublisherRoom {
   /** `autoSubscribe=false` 由适配层负责（§26/§28），调用方不需要也无法改变它。 */
@@ -85,6 +98,30 @@ export interface ScreenPublisherRoom {
    * 由 store 在"关闭摄像头"的同一段逻辑里调用。适配层只负责信令面。
    */
   unpublishCameraTrack(): Promise<void>
+  /**
+   * 把麦克风轨道发布成 `microphone` 源（§25）。
+   *
+   * 与摄像头那两条的规则完全一致：`userProvidedTrack = true`（SDK 不得重新采集）、
+   * unpublish 时不停轨道（释放点只有一个，见 store 里的 `disableMicrophone`）。
+   */
+  publishMicrophoneTrack(track: MediaStreamTrack): Promise<void>
+  /** 撤下麦克风轨道；不 rejoin、不停止轨道（stop 由采集层负责，指示灯才会灭）。 */
+  unpublishMicrophoneTrack(): Promise<void>
+  /**
+   * 老师私密语音的音频状态（§31/§32）。
+   *
+   * 老师麦克风的**订阅**由服务端用 LiveKit `UpdateSubscriptions` 决定（只有被选中的
+   * 那一个学生会被订阅），所以这个端口里没有"订阅老师"的方法——§26 的不变量
+   * （学生端不主动订阅任何轨道）因此在类型层面就是成立的。客户端要做的只有
+   * 把服务端推下来的那条音频轨道播出来，并如实报告播放状态。
+   */
+  onTeacherAudioChanged(listener: (state: TeacherAudioState) => void): () => void
+  /**
+   * 尽力恢复音频播放；返回是否已经能出声。
+   *
+   * 必须在**用户手势**里调用才会成功（自动播放策略），所以只有界面上的按钮会调它。
+   */
+  resumeTeacherAudio(): Promise<boolean>
   /** 断开连接。刻意返回 Promise，但 `beforeunload` 里调用方会不 await 地发起它。 */
   disconnect(): Promise<void>
   connectionQuality(): ConnectionQualityLevel

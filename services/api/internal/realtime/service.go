@@ -238,17 +238,139 @@ func (s *Service) ScreenRestored(ctx context.Context, ref session.SessionRef) er
 // problem — it cannot see anybody's button — so it is the one audience that needs the
 // message.
 func (s *Service) CameraChanged(ctx context.Context, ref session.SessionRef, active bool) error {
-	view, student, err := s.resolveStudent(ctx, ref, "camera_changed")
+	return s.studentMediaChanged(ctx, ref, active, TypeCameraChanged, "camera_changed")
+}
+
+// MicChanged tells the owner that a student turned their microphone on or off
+// (§25/§47/§76).
+//
+// It is CameraChanged one source over, with the same audience and the same reasoning: a
+// classroom broadcast would tell every student who in the room has a microphone open, and
+// the student themself does not need a copy of the button they just pressed.
+//
+// WHAT it does not say: that the teacher can hear this student. The teacher subscribes to
+// student microphones as a matter of its own token (§27), and the reverse direction (the
+// student hearing the teacher) is §31's private talk, which has its own messages.
+func (s *Service) MicChanged(ctx context.Context, ref session.SessionRef, active bool) error {
+	return s.studentMediaChanged(ctx, ref, active, TypeMicChanged, "mic_changed")
+}
+
+// studentMediaChanged is the shared body of the camera and microphone messages: one
+// student, one owner, one boolean.
+func (s *Service) studentMediaChanged(
+	ctx context.Context,
+	ref session.SessionRef,
+	active bool,
+	kind MessageType,
+	action string,
+) error {
+	view, student, err := s.resolveStudent(ctx, ref, action)
 	if err != nil || view == nil || !student {
 		return err
 	}
-	msg := newMessage(TypeCameraChanged, map[string]any{
+	msg := newMessage(kind, map[string]any{
 		"studentId": ref.StudentID.String(),
 		"sessionId": ref.SessionID.String(),
 		"active":    active,
 	})
-	s.sendToTeacher(ctx, view.OwnerTeacherID, msg, "camera_changed", ref.RunID)
+	s.sendToTeacher(ctx, view.OwnerTeacherID, msg, action, ref.RunID)
 	return nil
+}
+
+// PrivateTalkStarted tells the TARGET student and the OWNER teacher that the teacher is
+// now talking to that student (§31/§47).
+//
+// # The two audiences get DIFFERENT data, and that is the scoping rule
+//
+//   - The target student gets `{teacherDisplayName}`. Their page renders "王老师正在与你
+//     进行语音沟通", and it must contain nothing about anybody else — not the session id
+//     (they have it), not the classroom's roster, not another student.
+//   - The owner teacher gets `{studentId, sessionId, displayName}`. Their console has to
+//     mark the card the talk belongs to, and it addresses that card by student. Every
+//     connection of that teacher receives it, which is what keeps two open tabs of the
+//     same console consistent.
+//
+// # Who is NOT told, and why it is not an omission
+//
+// No other student receives anything (§31: "其他人不接收任何东西"). There is no classroom
+// broadcast anywhere in this method, and the signature cannot express one — it takes a
+// session reference, not a classroom. A classmate learning that a private talk exists
+// would be a §26 violation of exactly the kind this product is built to avoid.
+func (s *Service) PrivateTalkStarted(ctx context.Context, ref session.SessionRef, teacherDisplayName string) error {
+	view, student, err := s.resolveStudent(ctx, ref, "private_talk_started")
+	if err != nil || view == nil || !student {
+		return err
+	}
+	s.sendToTeacher(ctx, view.OwnerTeacherID,
+		newMessage(TypePrivateTalkStarted, map[string]any{
+			"studentId":   ref.StudentID.String(),
+			"sessionId":   ref.SessionID.String(),
+			"displayName": s.displayName(view, ref.StudentID),
+		}), "private_talk_started", ref.RunID)
+
+	s.sendToStudents(ctx, []uuid.UUID{ref.StudentID},
+		newMessage(TypePrivateTalkStarted, map[string]any{
+			"teacherDisplayName": teacherDisplayName,
+		}), "private_talk_started", ref.RunID)
+	return nil
+}
+
+// PrivateTalkRequested asks the TARGET student to open their microphone (§25/§47/§76).
+//
+// The message is the data behind the student's dialog: "王老师希望与你进行语音沟通。
+// [开启麦克风][暂不开启]" (§25). The CALLER decides whether to send it — the server only
+// sends it when the student's microphone is not already published, because a student who is
+// already sharing their microphone does not need to be asked to share it.
+//
+// It is addressed to the target alone. The teacher's console does not need it (it is the
+// teacher's own request being relayed, and the console shows the talk's state from
+// PRIVATE_TALK_STARTED), and no classmate may see it (§26/§31).
+func (s *Service) PrivateTalkRequested(ctx context.Context, ref session.SessionRef, teacherDisplayName string) error {
+	view, student, err := s.resolveStudent(ctx, ref, "private_talk_request")
+	if err != nil || view == nil || !student {
+		return err
+	}
+	s.sendToStudents(ctx, []uuid.UUID{ref.StudentID},
+		newMessage(TypePrivateTalkRequest, map[string]any{
+			"teacherDisplayName": teacherDisplayName,
+		}), "private_talk_request", ref.RunID)
+	return nil
+}
+
+// PrivateTalkEnded tells the TARGET student and the OWNER teacher that the talk is over
+// (§31/§47).
+//
+// Both audiences get the same pair of identifiers: the student's page has to close its
+// "talking" state, and the teacher's console has to clear the card it marked. There is no
+// "reason" in the message — a student does not need to be told whether the teacher pressed
+// stop, switched to a classmate, or closed the lesson, and telling them "the teacher is now
+// talking to somebody else" would leak a fact about a classmate (§26).
+func (s *Service) PrivateTalkEnded(ctx context.Context, ref session.SessionRef) error {
+	view, student, err := s.resolveStudent(ctx, ref, "private_talk_ended")
+	if err != nil || view == nil || !student {
+		return err
+	}
+	data := map[string]any{
+		"studentId": ref.StudentID.String(),
+		"sessionId": ref.SessionID.String(),
+	}
+	s.sendToTeacher(ctx, view.OwnerTeacherID, newMessage(TypePrivateTalkEnded, copyOf(data)), "private_talk_ended", ref.RunID)
+	s.sendToStudents(ctx, []uuid.UUID{ref.StudentID}, newMessage(TypePrivateTalkEnded, data), "private_talk_ended", ref.RunID)
+	return nil
+}
+
+// copyOf duplicates a message's data block so the two audiences cannot share one map.
+//
+// WHY it matters even though the Hub serialises immediately: the two messages are built
+// here and handed to the hub, and a shared map would make a future field added for one
+// audience appear in the other's message as well — the kind of leak that is invisible in a
+// test that only looks at one recipient.
+func copyOf(data map[string]any) map[string]any {
+	out := make(map[string]any, len(data))
+	for key, value := range data {
+		out[key] = value
+	}
+	return out
 }
 
 func (s *Service) screenChanged(ctx context.Context, ref session.SessionRef, restored bool) error {
@@ -371,4 +493,7 @@ func (s *Service) sendToTeacher(ctx context.Context, teacherID uuid.UUID, msg Me
 }
 
 // Compile-time assertion: the runtime service is what the session domain talks to.
-var _ session.SessionEvents = (*Service)(nil)
+var (
+	_ session.SessionEvents     = (*Service)(nil)
+	_ session.PrivateTalkEvents = (*Service)(nil)
+)

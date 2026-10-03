@@ -98,6 +98,18 @@ export const BACKEND_API_ERROR_CODES = [
   'SESSION_ALREADY_ACTIVE',
   'SESSION_NOT_FOUND',
   'MEDIA_TOKEN_FAILED',
+  /**
+   * 私密语音（Phase 10，§25/§31；两块契约里的 409）。
+   *
+   * WHY 必须是两个独立的码而不是复用 INVALID_REQUEST / CLASSROOM_CLOSED：
+   * 它们各自有**完全不同**的下一步动作，而 §58 规定客户端按 `code` 分支。
+   * - `TEACHER_MIC_REQUIRED`：老师自己还没开麦。可修正——界面要给一键开麦入口，
+   *   而不是让他去猜哪里出了问题；
+   * - `PRIVATE_TALK_UNAVAILABLE`：目标学生不在课堂里（§32 的"Mic OFF"那一侧），
+   *   老师能做的只有换一个人或等学生回来，重试同一个目标是没意义的。
+   */
+  'TEACHER_MIC_REQUIRED',
+  'PRIVATE_TALK_UNAVAILABLE',
 ] as const
 
 /**
@@ -182,6 +194,13 @@ export const API_ERROR_MESSAGES: Record<ApiErrorCode, string> = {
   SESSION_NOT_FOUND: '课堂会话不存在或已结束。',
 
   MEDIA_TOKEN_FAILED: '获取媒体凭证失败，请稍后重试。',
+
+  /**
+   * 私密语音的 409。文案必须直接说出**下一步动作**（开麦 / 换人），
+   * 因为这两句话会出现在 Focus 面板里，老师不会去别处找原因。
+   */
+  TEACHER_MIC_REQUIRED: '请先开启你的麦克风，再发起语音沟通。',
+  PRIVATE_TALK_UNAVAILABLE: '该学生当前不在课堂中，无法进行语音沟通。',
 
   SCREEN_PERMISSION_DENIED: '未获得屏幕共享权限。进入课堂必须共享整个屏幕。',
   SCREEN_NOT_MONITOR: '必须选择"整个屏幕"，共享窗口或浏览器标签页无法进入课堂。',

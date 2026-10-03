@@ -54,8 +54,18 @@ const props = withDefaults(
     cameraMediaState?: MonitorMediaState
     /** 这张卡片是不是当前 Focus 的对象（只影响 aria 与高亮，不影响订阅）。 */
     selected?: boolean
+    /**
+     * 这张卡片是不是**当前私密语音目标**（§31）。
+     *
+     * WHY 在网格上也标出来：私密语音是"老师自己的界面必须记住"的状态——
+     * 音频看不见，老师从 Focus 回到网格、看一会儿别的学生之后，
+     * 如果网格上没有任何标记，他就再也想不起来自己的麦克风还在对谁广播。
+     * 注意这个标记**只出现在老师自己的界面上**：其他学生收不到任何提示（§31），
+     * 它不是一个"老师正在讲话"的全局横幅。
+     */
+    talkTarget?: boolean
   }>(),
-  { cameraSubscription: null, cameraMediaState: 'none', selected: false },
+  { cameraSubscription: null, cameraMediaState: 'none', selected: false, talkTarget: false },
 )
 
 const emit = defineEmits<{
@@ -274,13 +284,27 @@ const cameraOn = computed(() => cameraPipState.value !== 'off')
       <span class="text-xs text-ink-muted" data-testid="tile-connection">
         连接：{{ connectionHint }}
       </span>
-      <!--
-        角标说的是**业务事实**（DTO 的 camera.active，§51），与上面那个小窗不是一回事：
-        学生开着摄像头但老师端还没订到画面时，这里显示"已开启"而小窗不出现——
-        这恰好是老师需要知道的区别（他开着了，只是画面还没到）。
-      -->
-      <span v-if="cameraOn" class="text-xs text-ink-muted" data-testid="tile-camera-flag">
-        摄像头已开启
+      <span class="flex items-center gap-2">
+        <!--
+          §31：当前私密语音目标。只有这一张卡片会有它——老师一眼就能确认
+          "我的麦克风现在只对这一个人开着"。
+        -->
+        <span
+          v-if="talkTarget"
+          class="text-xs text-ink"
+          data-testid="tile-talk-flag"
+          aria-label="当前语音沟通对象"
+        >
+          🎤 语音沟通中
+        </span>
+        <!--
+          角标说的是**业务事实**（DTO 的 camera.active，§51），与上面那个小窗不是一回事：
+          学生开着摄像头但老师端还没订到画面时，这里显示"已开启"而小窗不出现——
+          这恰好是老师需要知道的区别（他开着了，只是画面还没到）。
+        -->
+        <span v-if="cameraOn" class="text-xs text-ink-muted" data-testid="tile-camera-flag">
+          摄像头已开启
+        </span>
       </span>
     </footer>
   </article>

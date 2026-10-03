@@ -29,8 +29,9 @@ type PeerSubscriptionRevocation struct {
 	TrackSid string
 }
 
-// revokedSubscription is the bookkeeping key of one revocation that is already in
-// effect. See Client.revoked for why it exists.
+// revokedSubscription is the bookkeeping key of one subscription change that is already
+// in effect. See Client.revoked for why it exists, and Client.talkApplied for the second
+// book of the same shape that Phase 10 keeps (§31).
 type revokedSubscription struct {
 	// participantSid is the OBSERVER's connection id (ParticipantTracks.ParticipantSid),
 	// not its identity: a student who reloads the page comes back with the same session
@@ -39,6 +40,86 @@ type revokedSubscription struct {
 	// (a media fake that does not report one) simply degrades to "once per lesson".
 	participantSid string
 	trackSid       string
+}
+
+// subscriptionBook is the per-room memory of one kind of subscription change that is
+// already in effect.
+//
+// WHY it is a generic type and not three copies of the same two maps in Client: Phase 7
+// remembers peer REVOCATIONS and Phase 10 remembers private-talk GRANTS and REVOCATIONS,
+// and all of them answer the same question — "was this exact change for this exact
+// connection already issued?" — over their own key. One implementation means the pruning
+// rule (a change whose track is gone must be forgotten) cannot drift between them.
+//
+// The key type differs on purpose: a peer key is (connection, track) because a revocation
+// has only one direction, while a private-talk key is (connection, track, subscribe)
+// because for one track a GRANT and a REVOCATION are different states — collapsing them
+// would make a switch a no-op (the old entry would say "already handled").
+//
+// A book is not goroutine safe on its own: Client.mu guards every book it owns.
+type subscriptionBook[K comparable] map[string]map[K]struct{}
+
+// snapshot copies the changes already in effect for one room.
+//
+// WHY a copy and not the live map: the decision ("is this new?") and the pruning at the
+// end of a pass must be taken against the SAME view, or a concurrent pass could record
+// this one's work as already done.
+func (b subscriptionBook[K]) snapshot(roomName string) map[K]struct{} {
+	snapshot := make(map[K]struct{}, len(b[roomName]))
+	for key := range b[roomName] {
+		snapshot[key] = struct{}{}
+	}
+	return snapshot
+}
+
+// replace sets one room's book to "what is still relevant": the changes that were already
+// in effect AND still match a live candidate, plus the ones this pass actually issued.
+//
+// WHY a replacement and not an append: a track that is no longer published can never come
+// back under the same sid, so keeping its key would only grow the map for the lifetime of
+// the process.
+//
+// WHY a failed change is deliberately NOT remembered: the next pass retries it, which is
+// the only self-healing this best-effort control has. That is also why the pruning is
+// driven by the SNAPSHOT taken before the calls and not by the candidate set: a candidate
+// that was never successfully applied must stay outstanding.
+func (b *subscriptionBook[K]) replace(
+	roomName string,
+	inEffect map[K]struct{},
+	visible map[K]struct{},
+	succeeded map[K]struct{},
+) {
+	next := make(map[K]struct{})
+	for key := range visible {
+		if _, already := inEffect[key]; already {
+			next[key] = struct{}{}
+		}
+	}
+	for key := range succeeded {
+		next[key] = struct{}{}
+	}
+	if *b == nil {
+		*b = subscriptionBook[K]{}
+	}
+	if len(next) == 0 {
+		// A room with nothing to reconcile must not leave an empty entry behind: the map
+		// is keyed by room name for the lifetime of the process.
+		delete(*b, roomName)
+		return
+	}
+	(*b)[roomName] = next
+}
+
+// forget drops one room's book entirely, which is what "there is nothing left to
+// reconcile" means when the tracks themselves are gone.
+func (b subscriptionBook[K]) forget(roomName string) { delete(b, roomName) }
+
+// talkSubscription is the bookkeeping key of one private-talk change already in effect
+// (§31). See subscriptionBook for why the subscribe flag is part of the key.
+type talkSubscription struct {
+	participantSid string
+	trackSid       string
+	subscribe      bool
 }
 
 // peerTrackRef is one (owner, track) pair a student must be unsubscribed from.
@@ -82,11 +163,18 @@ type peerTrackRef struct{ owner, sid string }
 //
 // allowedTrackOwners is the EXPLICIT whitelist of track owners a student may keep
 // receiving. Phase 7 passes the participants of the room that are not students of the
-// run — the teacher, whose token is the only other one this control plane mints — and
-// the teacher publishes nothing yet, so in practice students are unsubscribed to
-// nothing at all. The parameter is what makes that a decision instead of an omission:
-// Phase 10 adds the teacher's microphone by narrowing it to (owner, source), and
-// ObservedTrack.Source already carries the source it would filter on.
+// run — the teacher, whose token is the only other one this control plane mints.
+//
+// WHY the teacher stays whitelisted here AFTER Phase 10, when §31 says only ONE student
+// may receive the teacher's microphone: this call is about §26 (students must not see
+// each other), and it deliberately has no opinion about which of the teacher's tracks a
+// student may keep. Phase 10 expresses the narrower rule in EnforcePrivateTalk, which
+// reconciles exactly one source of exactly one publisher for the whole room. The two
+// passes do not fight, because they name different tracks: this one never touches a
+// track whose owner is whitelisted, and that one only ever touches the teacher's
+// microphone. Keeping the owner-level whitelist here is also what keeps a future
+// teacher track (a screen, if V1 ever allows one) from being revoked by the §26 rule
+// that was never about the teacher.
 //
 // # Idempotency, and why the caller sees a list of revocations
 //
@@ -126,7 +214,7 @@ func (c *Client) EnforceNoPeerSubscriptions(
 	// The revocations already in effect for this room, read once. The same snapshot is
 	// used for the decision ("is this new?") and for the pruning at the end, so a failed
 	// call cannot be recorded as done by a concurrent observation.
-	inEffect := c.revocationsForRoom(roomName)
+	inEffect := c.snapshotRevocations(roomName)
 
 	// Only students that are actually in the room can hold a subscription, and only in a
 	// deterministic order: the caller passes a slice, but map iteration below is random
@@ -203,7 +291,7 @@ func (c *Client) EnforceNoPeerSubscriptions(
 			}
 			return pending[i].sid < pending[j].sid
 		})
-		request := updateSubscriptionsRequest(roomName, student, pending)
+		request := updateSubscriptionsRequest(roomName, student, peerSids(pending), false)
 		if _, err := c.rooms.UpdateSubscriptions(ctx, request); err != nil {
 			// One student's failure must not stop the others: each request is independent,
 			// and the students after this one still deserve to be isolated.
@@ -222,87 +310,71 @@ func (c *Client) EnforceNoPeerSubscriptions(
 		}
 	}
 
-	c.rememberRevocations(roomName, inEffect, visible, succeeded)
+	c.replaceRevocations(roomName, inEffect, visible, succeeded)
 	return revocations, errors.Join(failures...)
+}
+
+// peerSids lists the track sids of one student's pending peer revocations.
+func peerSids(pending []peerTrackRef) []string {
+	sids := make([]string, 0, len(pending))
+	for _, track := range pending {
+		sids = append(sids, track.sid)
+	}
+	return sids
 }
 
 // updateSubscriptionsRequest builds the UpdateSubscriptions call for one student.
 //
 // The tracks are named by sid in one flat list, which is the form the API accepts for
-// "these tracks, this subscriber, no". Grouping them per owner is NOT used, and the
+// "these tracks, this subscriber, yes/no". Grouping them per owner is NOT used, and the
 // reason is worth writing down: the per-owner form (ParticipantTracks.ParticipantSid)
 // is keyed by the PUBLISHER's participant sid, which changes whenever that student
-// reloads, so the revocation would be coupled to a connection id that has nothing to do
-// with it. Phase 10's "keep the teacher's microphone" is expressed one level up, by
-// leaving those sids out of this list, which needs no grouping either.
-func updateSubscriptionsRequest(roomName, observer string, pending []peerTrackRef) *livekit.UpdateSubscriptionsRequest {
-	sids := make([]string, 0, len(pending))
-	for _, track := range pending {
-		sids = append(sids, track.sid)
-	}
+// reloads, so the change would be coupled to a connection id that has nothing to do
+// with it. Phase 10's "only the selected student keeps the teacher's microphone" is
+// expressed one level up, by deciding the single `subscribe` boolean per call, which
+// needs no grouping either.
+//
+// subscribe is the whole point of the call and is passed explicitly for that reason: a
+// forgotten `false` here is the §26 leak, and a forgotten `true` is the §31 teacher who
+// speaks into a room where nobody can hear them. Callers must name one or the other.
+func updateSubscriptionsRequest(roomName, observer string, sids []string, subscribe bool) *livekit.UpdateSubscriptionsRequest {
 	return &livekit.UpdateSubscriptionsRequest{
-		Room:     roomName,
-		Identity: observer,
-		// This single boolean is the whole point of the call: the student must not
-		// RECEIVE a classmate's media (§26).
-		Subscribe: false,
+		Room:      roomName,
+		Identity:  observer,
+		Subscribe: subscribe,
 		TrackSids: sids,
 	}
 }
 
-// revocationsForRoom snapshots the revocations already in effect for one room.
-func (c *Client) revocationsForRoom(roomName string) map[revokedSubscription]struct{} {
+// snapshotRevocations copies the peer revocations already in effect for one room.
+func (c *Client) snapshotRevocations(roomName string) map[revokedSubscription]struct{} {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	snapshot := make(map[revokedSubscription]struct{}, len(c.revoked[roomName]))
-	for key := range c.revoked[roomName] {
-		snapshot[key] = struct{}{}
-	}
-	return snapshot
+	return c.revoked.snapshot(roomName)
 }
 
-// rememberRevocations replaces the bookkeeping of one room with "what is still
-// relevant": revocations that are still in effect AND still match a published track,
-// plus the ones this pass actually issued.
-//
-// WHY a replacement and not an append: a track that is no longer published can never
-// come back under the same sid, so keeping its key would only grow the map for the
-// lifetime of the process.
-//
-// WHY a failed revocation is deliberately NOT remembered: the next poll retries it,
-// which is the only self-healing this best-effort control has. That is also why the
-// pruning is driven by the SNAPSHOT taken before the calls and not by the candidate
-// set: a candidate that was never successfully revoked must stay outstanding.
-func (c *Client) rememberRevocations(
+// replaceRevocations rewrites the peer-revocation book of one room. See
+// subscriptionBook.replace for the rule; this method only adds the lock.
+func (c *Client) replaceRevocations(
 	roomName string,
 	inEffect map[revokedSubscription]struct{},
 	visible map[string]map[revokedSubscription]struct{},
 	succeeded map[string]map[revokedSubscription]struct{},
 ) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.revoked == nil {
-		c.revoked = make(map[string]map[revokedSubscription]struct{})
-	}
-	next := make(map[revokedSubscription]struct{})
+	flatVisible := make(map[revokedSubscription]struct{})
 	for _, keys := range visible {
 		for key := range keys {
-			if _, already := inEffect[key]; already {
-				next[key] = struct{}{}
-			}
+			flatVisible[key] = struct{}{}
 		}
 	}
+	flatSucceeded := make(map[revokedSubscription]struct{})
 	for _, keys := range succeeded {
 		for key := range keys {
-			next[key] = struct{}{}
+			flatSucceeded[key] = struct{}{}
 		}
 	}
-	if len(next) == 0 {
-		// A room with nothing to reconcile must not leave an empty entry behind: the map
-		// is keyed by room name for the lifetime of the process.
-		delete(c.revoked, roomName)
-		return
-	}
-	c.revoked[roomName] = next
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.revoked.replace(roomName, inEffect, flatVisible, flatSucceeded)
 }

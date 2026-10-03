@@ -18,6 +18,10 @@ const lk = vi.hoisted(() => ({
   roomOptions: [] as Record<string, unknown>[],
   connectCalls: [] as { url: string; token: string; options: Record<string, unknown> }[],
   disconnectCalls: [] as (boolean | undefined)[],
+  publishCalls: [] as { track: unknown; options: Record<string, unknown> }[],
+  unpublishCalls: [] as { track: unknown; stop: boolean | undefined }[],
+  localAudioTrackArgs: [] as unknown[][],
+  startAudioCalls: 0,
   listeners: new Map<string, Set<(...args: never[]) => void>>(),
   instances: [] as { remoteParticipants: Map<string, unknown> }[],
 }))
@@ -78,8 +82,29 @@ function makeParticipant(identity: string, publications: FakePublication[]): unk
 }
 
 vi.mock('livekit-client', () => {
+  /** 老师端唯一允许发布的本地轨道类型（§27：canPublishSources = microphone）。 */
+  class LocalAudioTrack {
+    readonly kind = 'audio'
+    constructor(...args: unknown[]) {
+      lk.localAudioTrackArgs.push(args)
+    }
+  }
+
   class Room {
     readonly remoteParticipants = new Map<string, unknown>()
+
+    readonly localParticipant = {
+      connectionQuality: 'good',
+      trackPublications: new Map<string, unknown>(),
+      publishTrack: (track: unknown, options: Record<string, unknown>) => {
+        lk.publishCalls.push({ track, options })
+        return Promise.resolve({ trackSid: 'TR_published' })
+      },
+      unpublishTrack: (track: unknown, stop?: boolean) => {
+        lk.unpublishCalls.push({ track, stop })
+        return Promise.resolve(undefined)
+      },
+    }
 
     constructor(options: Record<string, unknown>) {
       lk.roomOptions.push(options)
@@ -93,6 +118,12 @@ vi.mock('livekit-client', () => {
 
     disconnect(stop?: boolean): Promise<void> {
       lk.disconnectCalls.push(stop)
+      return Promise.resolve()
+    }
+
+    /** 老师端订阅学生麦克风时会顺手恢复音频播放（§32 的自动播放策略）。 */
+    startAudio(): Promise<void> {
+      lk.startAudioCalls += 1
       return Promise.resolve()
     }
 
@@ -115,6 +146,7 @@ vi.mock('livekit-client', () => {
 
   return {
     Room,
+    LocalAudioTrack,
     RoomEvent: {
       ParticipantConnected: 'participantConnected',
       ParticipantDisconnected: 'participantDisconnected',
@@ -177,6 +209,10 @@ describe('LiveKit 适配层（老师端）', () => {
     lk.roomOptions.length = 0
     lk.connectCalls.length = 0
     lk.disconnectCalls.length = 0
+    lk.publishCalls.length = 0
+    lk.unpublishCalls.length = 0
+    lk.localAudioTrackArgs.length = 0
+    lk.startAudioCalls = 0
     lk.listeners.clear()
     lk.instances.length = 0
   })
@@ -331,7 +367,7 @@ describe('LiveKit 适配层（老师端）', () => {
     expect(track.detach).toHaveBeenCalledWith(element)
   })
 
-  it('参与者事件驱动订阅协调：加入/离开、屏幕与摄像头轨道的发布与取消都会通知', () => {
+  it('参与者事件驱动订阅协调：加入/离开、屏幕/摄像头/麦克风轨道的发布与取消都会通知', () => {
     const room = createLiveKitMonitorRoom(CREDENTIALS)
     let changes = 0
     room.onParticipantsChanged(() => {
@@ -359,13 +395,18 @@ describe('LiveKit 适配层（老师端）', () => {
       trackPublications: new Map([['TR_camera', makePublication('TR_camera', 'camera')]]),
     })
     emit('trackUnpublished', makePublication('TR_camera', 'camera'), { identity: 'session-2' })
-    // 麦克风仍然不筛进来：音频属于 Phase 10（§54），通知了只会白白重建一轮订阅。
+    /**
+     * §32（Phase 10）：麦克风轨道也一样。`MIC_CHANGED` 先到、轨道后到时，
+     * Focus 面板会显示"麦克风已开启"却听不到任何声音——老师会以为耳机坏了。
+     * 这条通知是"声音真的可以订了"那一刻。
+     */
     emit('trackPublished', makePublication('TR_mic', 'microphone'), {
       identity: 'session-3',
-      trackPublications: new Map(),
+      trackPublications: new Map([['TR_mic', makePublication('TR_mic', 'microphone')]]),
     })
+    emit('trackUnpublished', makePublication('TR_mic', 'microphone'), { identity: 'session-3' })
 
-    expect(changes).toBe(6)
+    expect(changes).toBe(8)
   })
 
   it('屏幕轨道的订阅上下线事件把 identity 交给调用方（卡片据此更新媒体状态）', () => {
@@ -545,5 +586,163 @@ describe('LiveKit 适配层（老师端）', () => {
 
     expect(camera.subscribedCalls).toEqual([true, false])
     expect(lk.disconnectCalls).toEqual([true])
+  })
+
+  /* ------------------------------------------------------------------------ */
+  /* §32：听学生的麦克风（Phase 10）                                          */
+  /* ------------------------------------------------------------------------ */
+
+  it('§32：subscribeMicrophone 手动订阅麦克风轨道，**不设画质**，并把音频挂到 <audio>', async () => {
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    const mic = makePublication('TR_mic', 'microphone')
+    joinParticipant('session-1', [mic])
+
+    const pending = room.subscribeMicrophone('session-1')
+
+    expect(mic.subscribedCalls).toEqual([true])
+    // 音频没有分辨率：`setVideoQuality` 一次都不该被调用（§52 的分层只针对视频）。
+    expect(mic.qualityCalls).toEqual([])
+    expect(mic.droppedQualityCalls).toEqual([])
+    // 顺手恢复播放：老师点开 Focus 时页面已经有用户手势，通常直接成功。
+    expect(lk.startAudioCalls).toBe(1)
+
+    deliverTrack(mic)
+    const subscription = await pending
+    expect(subscription?.identity).toBe('session-1')
+
+    const element = { srcObject: null } as unknown as HTMLAudioElement
+    const detach = subscription?.attach(element)
+    const track = mic.track as {
+      attach: ReturnType<typeof vi.fn>
+      detach: ReturnType<typeof vi.fn>
+    }
+    expect(track.attach).toHaveBeenCalledWith(element)
+    detach?.()
+    expect(track.detach).toHaveBeenCalledWith(element)
+  })
+
+  it('§32：同一个 participant 不重复订阅麦克风（十秒一轮的刷新不成订阅风暴）', async () => {
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    const mic = makePublication('TR_mic', 'microphone')
+    joinParticipant('session-1', [mic])
+    const first = room.subscribeMicrophone('session-1')
+    deliverTrack(mic)
+    await first
+
+    const second = await room.subscribeMicrophone('session-1')
+
+    expect(mic.subscribedCalls).toEqual([true])
+    expect(second?.identity).toBe('session-1')
+  })
+
+  it('§32：学生没有发布麦克风 → 返回 null（界面说"未开启"，不报错）', async () => {
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    joinParticipant('session-1', [makePublication('TR_screen', 'screen_share')])
+
+    expect(await room.subscribeMicrophone('session-1')).toBeNull()
+    expect(await room.subscribeMicrophone('nobody')).toBeNull()
+  })
+
+  it('§32：三条订阅互相独立（退掉音频绝不动屏幕与摄像头）', async () => {
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    const screen = makePublication('TR_screen', 'screen_share')
+    const camera = makePublication('TR_camera', 'camera')
+    const mic = makePublication('TR_mic', 'microphone')
+    joinParticipant('session-1', [screen, camera, mic])
+    const screenPending = room.subscribeScreen('session-1')
+    const cameraPending = room.subscribeCamera('session-1')
+    const micPending = room.subscribeMicrophone('session-1')
+    deliverTrack(screen)
+    deliverTrack(camera)
+    deliverTrack(mic)
+    await screenPending
+    await cameraPending
+    await micPending
+
+    await room.unsubscribeMicrophone('session-1')
+
+    expect(mic.subscribedCalls).toEqual([true, false])
+    // 另外两条一次都没被碰过（Phase 10 最要盯的性质）。
+    expect(screen.subscribedCalls).toEqual([true])
+    expect(camera.subscribedCalls).toEqual([true])
+  })
+
+  it('§32：麦克风轨道被取消发布 → 本地订阅记录被清掉（学生关麦）', async () => {
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    room.onParticipantsChanged(() => undefined)
+    const mic = makePublication('TR_mic', 'microphone')
+    joinParticipant('session-1', [mic])
+    const pending = room.subscribeMicrophone('session-1')
+    deliverTrack(mic)
+    const subscription = await pending
+    const element = { srcObject: null } as unknown as HTMLAudioElement
+    subscription?.attach(element)
+    const track = mic.track as { detach: ReturnType<typeof vi.fn> }
+
+    emit('trackUnpublished', mic, { identity: 'session-1' })
+
+    // 声音被摘下来：否则老师的耳机里会留着一条已经死掉的音频。
+    expect(track.detach).toHaveBeenCalledWith(element)
+  })
+
+  it('§32：参与者离开时本地麦克风订阅被清掉（不留"正在听"的假象）', async () => {
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    room.onParticipantsChanged(() => undefined)
+    const mic = makePublication('TR_mic', 'microphone')
+    joinParticipant('session-1', [mic])
+    const pending = room.subscribeMicrophone('session-1')
+    deliverTrack(mic)
+    const subscription = await pending
+    const element = { srcObject: null } as unknown as HTMLAudioElement
+    subscription?.attach(element)
+    const track = mic.track as { detach: ReturnType<typeof vi.fn> }
+
+    emit('participantDisconnected', { identity: 'session-1' })
+
+    expect(track.detach).toHaveBeenCalledWith(element)
+    const again = await room.subscribeMicrophone('session-1')
+    expect(again).not.toBe(subscription)
+  })
+
+  /* ------------------------------------------------------------------------ */
+  /* §27：老师自己的麦克风（Phase 10）                                        */
+  /* ------------------------------------------------------------------------ */
+
+  it('§27：老师麦克风用 LocalAudioTrack 包装并发布到 Track.Source.Microphone（name=mic）', async () => {
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    const track = { kind: 'audio' } as unknown as MediaStreamTrack
+
+    await room.publishMicrophoneTrack(track)
+
+    // 第三个参数 true = userProvidedTrack：SDK 不得自己重新采集（否则老师会被弹第二次授权框）。
+    expect(lk.localAudioTrackArgs).toEqual([[track, undefined, true]])
+    expect(lk.publishCalls).toHaveLength(1)
+    expect(lk.publishCalls[0]?.options).toEqual({ source: 'microphone', name: 'mic' })
+  })
+
+  it('§27：unpublish 老师麦克风时不停本地轨道（释放设备是采集层的事）', async () => {
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    await room.publishMicrophoneTrack({ kind: 'audio' } as unknown as MediaStreamTrack)
+
+    await room.unpublishMicrophoneTrack()
+
+    expect(lk.unpublishCalls).toEqual([{ track: expect.anything(), stop: false }])
+
+    // 没有发布过时是空操作（不要对 null 调 SDK）。
+    await room.unpublishMicrophoneTrack()
+    expect(lk.unpublishCalls).toHaveLength(1)
+  })
+
+  it('disconnect 会把麦克风订阅一起取消（一条下行都不留）', async () => {
+    const room = createLiveKitMonitorRoom(CREDENTIALS)
+    const mic = makePublication('TR_mic', 'microphone')
+    joinParticipant('session-1', [mic])
+    const pending = room.subscribeMicrophone('session-1')
+    deliverTrack(mic)
+    await pending
+
+    await room.disconnect()
+
+    expect(mic.subscribedCalls).toEqual([true, false])
   })
 })

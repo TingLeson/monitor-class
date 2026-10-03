@@ -209,6 +209,13 @@ const (
 //	session.ErrClassroomClosed      → 409 CLASSROOM_CLOSED
 //	session.ErrSessionNotFound      → 404 SESSION_NOT_FOUND
 //	session.ErrMediaUnavailable     → 502 MEDIA_TOKEN_FAILED
+//	session.ErrTeacherMicRequired   → 409 TEACHER_MIC_REQUIRED      (Phase 10, §31)
+//	session.ErrPrivateTalkUnavailable → 409 PRIVATE_TALK_UNAVAILABLE (Phase 10, §31)
+//
+// The last two are the private-talk refusals, and they are mapped HERE rather than in the
+// private-talk handlers on purpose: the same rule must not be able to produce two different
+// codes depending on which endpoint reached it, and a future endpoint that starts a talk
+// gets the mapping for free.
 func sessionError(err error) error {
 	switch {
 	case err == nil:
@@ -217,6 +224,14 @@ func sessionError(err error) error {
 		return apperr.Wrap(apperr.CodeClassroomClosed, err)
 	case errors.Is(err, session.ErrSessionNotFound):
 		return apperr.Wrap(apperr.CodeSessionNotFound, err)
+	case errors.Is(err, session.ErrTeacherMicRequired):
+		// 409: the request was fine and the teacher can fix it in their own console by
+		// turning the microphone on. NOT a silent 200 — see the code's comment.
+		return apperr.Wrap(apperr.CodeTeacherMicRequired, err)
+	case errors.Is(err, session.ErrPrivateTalkUnavailable):
+		// 409: the named student has no media session to talk to right now. The fix is to
+		// pick somebody else or wait, not to change the request.
+		return apperr.Wrap(apperr.CodePrivateTalkUnavailable, err)
 	case errors.Is(err, session.ErrMediaUnavailable):
 		// 502: the request was fine and retrying can genuinely succeed. The cause (a
 		// LiveKit endpoint, an SDK error) is logged and never returned — it would leak

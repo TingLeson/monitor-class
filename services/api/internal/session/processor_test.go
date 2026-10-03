@@ -231,11 +231,23 @@ func (f *fakeStore) ApplyTrackState(_ context.Context, change TrackStateChange) 
 }
 
 func (f *fakeStore) appendEvent(sessionID uuid.UUID, event EventType, payload map[string]any) *SessionEvent {
+	// The production statement copies the session's run and student into the payload with
+	// jsonb_build_object (an operator grepping one row out of a log dump should not need a
+	// join, §13). The fake mirrors that, so a test asserting the payload sees what the real
+	// write produces.
+	enriched := make(map[string]any, len(payload)+2)
+	for key, value := range payload {
+		enriched[key] = value
+	}
+	if stored, ok := f.sessions[sessionID]; ok {
+		enriched["runId"] = stored.ClassroomRunID.String()
+		enriched["studentId"] = stored.StudentID.String()
+	}
 	recorded := SessionEvent{
 		ID:        uuid.New(),
 		SessionID: sessionID,
 		Type:      event,
-		Payload:   payload,
+		Payload:   enriched,
 		CreatedAt: f.tick(),
 	}
 	f.events = append(f.events, recorded)
@@ -282,12 +294,19 @@ type cameraMessage struct {
 	active bool
 }
 
+// micMessage is one MIC_CHANGED the processor produced (§25/§76).
+type micMessage struct {
+	ref    SessionRef
+	active bool
+}
+
 type fakeEvents struct {
 	online         []SessionRef
 	offline        []offlineMessage
 	screenLost     []SessionRef
 	screenRestored []SessionRef
 	camera         []cameraMessage
+	mic            []micMessage
 	roomsOpened    [][2]uuid.UUID
 	roomsClosed    [][2]uuid.UUID
 
@@ -347,6 +366,14 @@ func (f *fakeEvents) CameraChanged(_ context.Context, ref SessionRef, active boo
 		return f.err
 	}
 	f.camera = append(f.camera, cameraMessage{ref: ref, active: active})
+	return nil
+}
+
+func (f *fakeEvents) MicChanged(_ context.Context, ref SessionRef, active bool) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.mic = append(f.mic, micMessage{ref: ref, active: active})
 	return nil
 }
 
@@ -1125,31 +1152,287 @@ func TestUnknownEventTypeIsAcceptedAndIgnored(t *testing.T) {
 	}
 }
 
-func TestMicrophoneTrackIsStillIgnored(t *testing.T) {
-	// The microphone is Phase 10 (§76) and its token grant does not exist yet, but a
-	// webhook naming one must still be a no-op rather than an error: the media plane is
-	// allowed to be ahead of the control plane, and a source this phase does not consume
-	// writes neither state nor history.
-	for _, kind := range []string{webhook.EventTrackPublished, webhook.EventTrackUnpublished} {
-		t.Run(kind, func(t *testing.T) {
-			h := newProcessorHarness(t)
-			runID := uuid.New()
-			stored := h.store.seed(runID, uuid.New(), uuid.New(), StatusConnecting)
+// ---------------------------------------------------------------------------
+// track_published / track_unpublished for the MICROPHONE (§25/§76)
+// ---------------------------------------------------------------------------
 
-			event := screenTrackEvent(kind, h.store.room(runID), stored.LiveKitIdentity, "TR_mic", livekit.TrackSource_MICROPHONE)
-			if err := h.process.ProcessWebhook(h.ctx, event); err != nil {
-				t.Fatalf("ProcessWebhook(): %v", err)
-			}
-			if got := h.store.sessions[stored.ID].Status; got != StatusConnecting {
-				t.Fatalf("status = %s, want CONNECTING", got)
-			}
-			if len(h.store.events) != 0 {
-				t.Fatalf("events = %v, want none", h.store.events)
-			}
-			if len(h.events.camera) != 0 {
-				t.Fatalf("CAMERA_CHANGED = %+v, want none", h.events.camera)
-			}
-		})
+// micEvent is the camera's shape for the microphone source (§25/§76).
+func micEvent(kind, room, identity, sid string) *livekit.WebhookEvent {
+	return screenTrackEvent(kind, room, identity, sid, livekit.TrackSource_MICROPHONE)
+}
+
+// TestMicStartedRecordsAndAnnouncesWithoutMovingTheSession is the central assertion of
+// Phase 10's event path: opening a microphone writes MIC_STARTED, tells the owner teacher,
+// and does NOT touch a single column of the session row.
+//
+// The status snapshot is compared field by field (§21/§24/§25): THREE sources can be
+// published now, and exactly one of them — the screen — is allowed to decide whether a
+// student is being supervised. A microphone that moved the row would make a student who
+// stopped sharing their screen look ONLINE again.
+func TestMicStartedRecordsAndAnnouncesWithoutMovingTheSession(t *testing.T) {
+	h := newProcessorHarness(t)
+	runID := uuid.New()
+	studentID := uuid.New()
+	stored := h.store.seed(runID, uuid.New(), studentID, StatusConnecting)
+	before := snapshotOf(stored)
+
+	if err := h.process.ProcessWebhook(h.ctx, micEvent(webhook.EventTrackPublished, h.store.room(runID), stored.LiveKitIdentity, "TR_mic")); err != nil {
+		t.Fatalf("ProcessWebhook(): %v", err)
+	}
+
+	before.assertUnchanged(t, h, stored.ID, "track_published(MICROPHONE)")
+	if got := h.store.eventsOf(stored.ID); len(got) != 1 || got[0] != EventMicStarted {
+		t.Fatalf("events = %v, want [MIC_STARTED]", got)
+	}
+	if len(h.events.mic) != 1 {
+		t.Fatalf("MIC_CHANGED = %+v, want exactly one", h.events.mic)
+	}
+	if message := h.events.mic[0]; !message.active || message.ref.StudentID != studentID {
+		t.Fatalf("MIC_CHANGED = %+v, want active for the student", message)
+	}
+	// The microphone is not a session message: no ONLINE, no screen message.
+	if len(h.events.online) != 0 || len(h.events.screenLost) != 0 || len(h.events.screenRestored) != 0 {
+		t.Fatalf("a microphone produced a session message: online=%v lost=%v restored=%v",
+			h.events.online, h.events.screenLost, h.events.screenRestored)
+	}
+	// The camera's audience rule applies unchanged: no classmate is told.
+	if len(h.events.camera) != 0 {
+		t.Fatalf("CAMERA_CHANGED = %+v, want none", h.events.camera)
+	}
+
+	// §13/§59: the payload names identifiers only. No audio, no transcript, no name — and
+	// the source is the project's own vocabulary, not a vendor enum number.
+	payload := h.store.events[0].Payload
+	if payload["trackSid"] != "TR_mic" || payload["trackSource"] != "MICROPHONE" {
+		t.Fatalf("payload = %+v, want the track sid and the MICROPHONE source", payload)
+	}
+	if payload["runId"] == nil || payload["studentId"] == nil {
+		t.Fatalf("payload = %+v, want the run and student ids every event row carries", payload)
+	}
+	for _, forbidden := range []string{"displayName", "account", "audio", "transcript", "token"} {
+		if _, leaked := payload[forbidden]; leaked {
+			t.Fatalf("payload carries %q: %+v", forbidden, payload)
+		}
+	}
+}
+
+// TestMicWhileTheScreenIsLostKeepsScreenLost: §21 again, from the microphone's side. The
+// microphone is opt-in media; the screen is the supervision.
+func TestMicWhileTheScreenIsLostKeepsScreenLost(t *testing.T) {
+	h := newProcessorHarness(t)
+	runID := uuid.New()
+	stored := h.store.seed(runID, uuid.New(), uuid.New(), StatusOnline)
+
+	if err := h.process.ProcessWebhook(h.ctx, screenShareEvent(webhook.EventTrackUnpublished, h.store.room(runID), stored.LiveKitIdentity, "TR_screen")); err != nil {
+		t.Fatalf("screen unpublish: %v", err)
+	}
+	lost := h.store.sessions[stored.ID]
+	if lost.Status != StatusScreenLost {
+		t.Fatalf("status = %s, want SCREEN_LOST", lost.Status)
+	}
+	before := snapshotOf(lost)
+
+	if err := h.process.ProcessWebhook(h.ctx, micEvent(webhook.EventTrackPublished, h.store.room(runID), stored.LiveKitIdentity, "TR_mic")); err != nil {
+		t.Fatalf("mic publish: %v", err)
+	}
+	before.assertUnchanged(t, h, stored.ID, "track_published(MICROPHONE) on a lost screen")
+	if len(h.events.online) != 0 {
+		t.Fatal("a microphone restored ONLINE")
+	}
+}
+
+func TestMicStoppedWritesTheEventAndBroadcastsInactive(t *testing.T) {
+	h := newProcessorHarness(t)
+	runID := uuid.New()
+	studentID := uuid.New()
+	stored := h.store.seed(runID, uuid.New(), studentID, StatusOnline)
+	before := snapshotOf(stored)
+
+	if err := h.process.ProcessWebhook(h.ctx, micEvent(webhook.EventTrackPublished, h.store.room(runID), stored.LiveKitIdentity, "TR_mic")); err != nil {
+		t.Fatalf("mic publish: %v", err)
+	}
+	if err := h.process.ProcessWebhook(h.ctx, micEvent(webhook.EventTrackUnpublished, h.store.room(runID), stored.LiveKitIdentity, "TR_mic")); err != nil {
+		t.Fatalf("mic unpublish: %v", err)
+	}
+
+	before.assertUnchanged(t, h, stored.ID, "a microphone on/off cycle")
+	want := []EventType{EventMicStarted, EventMicStopped}
+	got := h.store.eventsOf(stored.ID)
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+	if len(h.events.mic) != 2 || !h.events.mic[0].active || h.events.mic[1].active {
+		t.Fatalf("MIC_CHANGED = %+v, want true then false", h.events.mic)
+	}
+	if h.events.mic[1].ref.StudentID != studentID {
+		t.Fatalf("MIC_CHANGED about %s, want %s", h.events.mic[1].ref.StudentID, studentID)
+	}
+}
+
+// TestDuplicateMicDeliveriesWriteOneEventAndOneMessage is the at-least-once rule for the
+// microphone: LiveKit retries, and a retry must not grow the log or produce a second
+// MIC_CHANGED (which would make the teacher's wall flicker).
+func TestDuplicateMicDeliveriesWriteOneEventAndOneMessage(t *testing.T) {
+	h := newProcessorHarness(t)
+	runID := uuid.New()
+	stored := h.store.seed(runID, uuid.New(), uuid.New(), StatusOnline)
+	room := h.store.room(runID)
+
+	started := micEvent(webhook.EventTrackPublished, room, stored.LiveKitIdentity, "TR_mic")
+	stopped := micEvent(webhook.EventTrackUnpublished, room, stored.LiveKitIdentity, "TR_mic")
+	for i := 0; i < 3; i++ {
+		if err := h.process.ProcessWebhook(h.ctx, started); err != nil {
+			t.Fatalf("duplicate publish #%d: %v", i+1, err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if err := h.process.ProcessWebhook(h.ctx, stopped); err != nil {
+			t.Fatalf("duplicate unpublish #%d: %v", i+1, err)
+		}
+	}
+
+	want := []EventType{EventMicStarted, EventMicStopped}
+	if got := h.store.eventsOf(stored.ID); len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+	if len(h.events.mic) != 2 {
+		t.Fatalf("MIC_CHANGED = %+v, want exactly two (one per real change)", h.events.mic)
+	}
+}
+
+// TestMicUnpublishedBeforePublishedChangesNothing is the out-of-order delivery of §22/§24
+// applied to the microphone: OFF is the state a session that has never reported a
+// microphone is in (§25 makes it opt-in), so an early stop writes nothing and the late
+// publish then writes the true end state.
+func TestMicUnpublishedBeforePublishedChangesNothing(t *testing.T) {
+	h := newProcessorHarness(t)
+	runID := uuid.New()
+	stored := h.store.seed(runID, uuid.New(), uuid.New(), StatusOnline)
+	room := h.store.room(runID)
+
+	if err := h.process.ProcessWebhook(h.ctx, micEvent(webhook.EventTrackUnpublished, room, stored.LiveKitIdentity, "TR_mic")); err != nil {
+		t.Fatalf("early mic unpublish: %v", err)
+	}
+	if got := h.store.eventsOf(stored.ID); len(got) != 0 {
+		t.Fatalf("events = %v, want none: there was no microphone to stop", got)
+	}
+	if len(h.events.mic) != 0 {
+		t.Fatalf("MIC_CHANGED = %+v, want none", h.events.mic)
+	}
+
+	if err := h.process.ProcessWebhook(h.ctx, micEvent(webhook.EventTrackPublished, room, stored.LiveKitIdentity, "TR_mic")); err != nil {
+		t.Fatalf("late mic publish: %v", err)
+	}
+	if got := h.store.eventsOf(stored.ID); len(got) != 1 || got[0] != EventMicStarted {
+		t.Fatalf("events = %v, want [MIC_STARTED]", got)
+	}
+}
+
+// TestMicRetryOfAStoppedPublicationDoesNotTurnItBackOn: a retry of `publish(A)` after
+// `unpublish(A)` carries the sid of a publication that is already over. Without the track
+// sid in the guard it would flip the microphone back on (§24's reasoning, one source over).
+func TestMicRetryOfAStoppedPublicationDoesNotTurnItBackOn(t *testing.T) {
+	h := newProcessorHarness(t)
+	runID := uuid.New()
+	stored := h.store.seed(runID, uuid.New(), uuid.New(), StatusOnline)
+	room := h.store.room(runID)
+
+	for _, event := range []*livekit.WebhookEvent{
+		micEvent(webhook.EventTrackPublished, room, stored.LiveKitIdentity, "TR_mic"),
+		micEvent(webhook.EventTrackUnpublished, room, stored.LiveKitIdentity, "TR_mic"),
+		micEvent(webhook.EventTrackPublished, room, stored.LiveKitIdentity, "TR_mic"),
+	} {
+		if err := h.process.ProcessWebhook(h.ctx, event); err != nil {
+			t.Fatalf("%s: %v", event.GetEvent(), err)
+		}
+	}
+
+	want := []EventType{EventMicStarted, EventMicStopped}
+	if got := h.store.eventsOf(stored.ID); len(got) != len(want) {
+		t.Fatalf("events = %v, want %v: a retry is not a new state", got, want)
+	}
+	if len(h.events.mic) != 2 || !h.events.mic[0].active || h.events.mic[1].active {
+		t.Fatalf("MIC_CHANGED = %+v, want true then false", h.events.mic)
+	}
+}
+
+// TestMicRepublishedWithANewTrackIsANewState: a student who closes and reopens their
+// microphone gets a new publication and therefore a new pair of rows.
+func TestMicRepublishedWithANewTrackIsANewState(t *testing.T) {
+	h := newProcessorHarness(t)
+	runID := uuid.New()
+	stored := h.store.seed(runID, uuid.New(), uuid.New(), StatusOnline)
+	room := h.store.room(runID)
+
+	for _, event := range []*livekit.WebhookEvent{
+		micEvent(webhook.EventTrackPublished, room, stored.LiveKitIdentity, "TR_mic_1"),
+		micEvent(webhook.EventTrackUnpublished, room, stored.LiveKitIdentity, "TR_mic_1"),
+		micEvent(webhook.EventTrackPublished, room, stored.LiveKitIdentity, "TR_mic_2"),
+	} {
+		if err := h.process.ProcessWebhook(h.ctx, event); err != nil {
+			t.Fatalf("%s: %v", event.GetEvent(), err)
+		}
+	}
+
+	want := []EventType{EventMicStarted, EventMicStopped, EventMicStarted}
+	got := h.store.eventsOf(stored.ID)
+	if len(got) != len(want) {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("events = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestMicForATerminalSessionIsIgnored: the state machine's terminal rule (§74). A late
+// publication for a student who already left must not append history.
+func TestMicForATerminalSessionIsIgnored(t *testing.T) {
+	h := newProcessorHarness(t)
+	runID := uuid.New()
+	stored := h.store.seed(runID, uuid.New(), uuid.New(), StatusLeft)
+	before := snapshotOf(stored)
+
+	if err := h.process.ProcessWebhook(h.ctx, micEvent(webhook.EventTrackPublished, h.store.room(runID), stored.LiveKitIdentity, "TR_mic")); err != nil {
+		t.Fatalf("ProcessWebhook(): %v", err)
+	}
+	before.assertUnchanged(t, h, stored.ID, "track_published(MICROPHONE) after LEFT")
+	if len(h.store.events) != 0 || len(h.events.mic) != 0 {
+		t.Fatalf("events = %v, MIC_CHANGED = %+v, want none", h.store.events, h.events.mic)
+	}
+}
+
+// TestMicStoreFailureIsReportedSoTheWebhookCanBeRetried: a microphone observation that
+// could not be recorded must make LiveKit retry, exactly like a screen one.
+func TestMicStoreFailureIsReportedSoTheWebhookCanBeRetried(t *testing.T) {
+	h := newProcessorHarness(t)
+	runID := uuid.New()
+	stored := h.store.seed(runID, uuid.New(), uuid.New(), StatusConnecting)
+	h.store.applyErr = errors.New("database is down")
+
+	err := h.process.ProcessWebhook(h.ctx, micEvent(webhook.EventTrackPublished, h.store.room(runID), stored.LiveKitIdentity, "TR_mic"))
+	if err == nil {
+		t.Fatal("ProcessWebhook() returned nil: an observation that could not be recorded must be retried by LiveKit")
+	}
+}
+
+// TestTeacherMicrophoneNeverWritesAStudentEvent: the teacher's own participant has no row
+// in student_sessions (§44), so a microphone webhook about it is dropped. That is what
+// keeps "MIC_CHANGED is about students" true — the teacher's wall learns nothing about the
+// teacher through this path.
+func TestTeacherMicrophoneNeverWritesAStudentEvent(t *testing.T) {
+	h := newProcessorHarness(t)
+	runID := uuid.New()
+	h.store.seed(runID, uuid.New(), uuid.New(), StatusOnline)
+
+	// A login session id: a UUID, but not a student session of this room.
+	teacherIdentity := uuid.NewString()
+	if err := h.process.ProcessWebhook(h.ctx, micEvent(webhook.EventTrackPublished, h.store.room(runID), teacherIdentity, "TR_teacher_mic")); err != nil {
+		t.Fatalf("ProcessWebhook(): %v", err)
+	}
+	if len(h.store.events) != 0 || len(h.events.mic) != 0 {
+		t.Fatalf("events = %v, MIC_CHANGED = %+v, want none", h.store.events, h.events.mic)
 	}
 }
 

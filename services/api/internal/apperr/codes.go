@@ -94,6 +94,22 @@ const (
 	// Media plane.
 	CodeMediaTokenFailed Code = "MEDIA_TOKEN_FAILED"
 
+	// Private talk (§31/§76).
+	//
+	// WHY these two are codes of their own instead of one "PRIVATE_TALK_FAILED": the
+	// teacher's next action is different for each, and both are refusals of a request
+	// that was perfectly well formed.
+	//
+	//   - TEACHER_MIC_REQUIRED means the teacher has not published a microphone track.
+	//     Nothing is wrong with the student or the lesson; the teacher has to press
+	//     "开启麦克风" in their own console. Silently succeeding here would be the worst
+	//     outcome of the whole phase: the teacher would believe a student can hear them
+	//     while nobody is subscribed to anything (§31).
+	//   - PRIVATE_TALK_UNAVAILABLE means the named student cannot be talked to right now
+	//     (no active session). The teacher has to pick somebody else or wait.
+	CodeTeacherMicRequired     Code = "TEACHER_MIC_REQUIRED"
+	CodePrivateTalkUnavailable Code = "PRIVATE_TALK_UNAVAILABLE"
+
 	// Generic transport-level failures.
 	CodeInvalidRequest Code = "INVALID_REQUEST"
 	CodeInternal       Code = "INTERNAL"
@@ -144,6 +160,12 @@ var defaultMessages = map[Code]string{
 	CodeLastAdminProtected:      "At least one administrator must stay active.",
 
 	CodeMediaTokenFailed: "Unable to join the media room. Please try again.",
+
+	// Written as instructions, not as diagnoses: the teacher can act on both without
+	// knowing anything about LiveKit. The frontend renders its own localised text; these
+	// are the fallbacks (§58).
+	CodeTeacherMicRequired:     "Turn on your microphone before starting a private talk.",
+	CodePrivateTalkUnavailable: "This student is not available for a private talk right now.",
 
 	CodeInvalidRequest: "The request is invalid.",
 	CodeInternal:       "An internal error occurred.",

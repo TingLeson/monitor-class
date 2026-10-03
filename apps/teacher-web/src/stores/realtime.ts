@@ -129,7 +129,10 @@ export const useRealtimeStore = defineStore('teacher-realtime', () => {
    * 老师自己开课走的是 HTTP，响应里已经带着新的课堂状态。因此这里落在 default
    * 分支——不做"顺手也支持一下"的扩展，那会掩盖契约与实现的分歧。
    *
-   * `PRIVATE_TALK_*` 属于 Phase 10（§31），本 Phase 只定义了类型，不处理。
+   * `PRIVATE_TALK_*`（§31）**必须**进监督 store：目标可能是在另一个标签页里
+   * 发起的，而后端在沟通结束时也会广播 `PRIVATE_TALK_ENDED`。少了这条路由，
+   * 老师的界面就会停在一个与服务端不一致的"我正在对谁讲话"上——
+   * 而那句话关系到他的麦克风正被谁听见。
    */
   function handleEvent(event: RealtimeEvent): void {
     lastEventAt.value = event.at
@@ -146,6 +149,8 @@ export const useRealtimeStore = defineStore('teacher-realtime', () => {
       case 'SCREEN_RESTORED':
       case 'CAMERA_CHANGED':
       case 'MIC_CHANGED':
+      case 'PRIVATE_TALK_STARTED':
+      case 'PRIVATE_TALK_ENDED':
         monitor.applyRealtimeEvent(event)
         break
       default:

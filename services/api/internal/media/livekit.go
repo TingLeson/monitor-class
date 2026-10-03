@@ -66,8 +66,16 @@ type Client struct {
 	// monitor endpoint is served concurrently — and it is best-effort by design: it is
 	// not persisted, so a restart (or a second API instance) re-issues one revocation
 	// per live track, which is harmless and actually desirable after a redeploy.
-	mu      sync.Mutex
-	revoked map[string]map[revokedSubscription]struct{}
+	//
+	// talkApplied is the same kind of memory for §31's second, narrower rule: which
+	// private-talk subscription changes (the target's grant, everybody else's revocation)
+	// are already in effect for one (connection, track, subscribe) key. It is a book of
+	// its own and NOT part of `revoked`, because the two rules reconcile different tracks
+	// — sharing one map would make each pass prune the other's work and re-issue it on
+	// every poll.
+	mu          sync.Mutex
+	revoked     subscriptionBook[revokedSubscription]
+	talkApplied subscriptionBook[talkSubscription]
 }
 
 // NewClient builds a RoomService client from the API URL, key and secret.

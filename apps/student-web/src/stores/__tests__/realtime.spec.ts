@@ -3,10 +3,14 @@ import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   installFakeRealtimeSocket,
+  makePrivateTalkEndedEvent,
+  makePrivateTalkRequestEvent,
   makeRoomClosedEvent,
   makeRoomOpenedEvent,
   makeScreenLostEvent,
   makeScreenRestoredEvent,
+  makeStudentPrivateTalkStartedEvent,
+  makeTeacherShapedPrivateTalkStartedEvent,
   type RealtimeHarness,
 } from '../../__tests__/realtime-fixtures.ts'
 import { makeStudentClassroom } from '../../__tests__/fixtures.ts'
@@ -163,6 +167,62 @@ describe('学生端实时通道', () => {
     // 本地轨道还在 → 服务端确认恢复后回到正常显示。
     expect(session.phase).toBe('online')
     expect(session.screenLostByServer).toBe(false)
+  })
+
+  it('§25/§31：PRIVATE_TALK_* 只交给在课会话，并且报告里只有老师自己（§26）', async () => {
+    const { useMediaSessionStore } = await import('../media-session.ts')
+    const session = useMediaSessionStore()
+    session.prepare({
+      sessionId: 'session-1',
+      classroomId: 'room-1',
+      credentials: { livekitUrl: 'wss://classwatch-test.livekit.cloud', token: 't' },
+      capture: makeFakeCapture(),
+    })
+    session.phase = 'online'
+
+    const realtime = useRealtimeStore()
+    realtime.start()
+    harness.open()
+
+    harness.emit(makePrivateTalkRequestEvent({ teacherDisplayName: '王老师' }))
+    expect(session.hasTalkRequest).toBe(true)
+    expect(session.talkRequestTitle).toBe('王老师希望与你进行语音沟通。')
+
+    harness.emit(makeStudentPrivateTalkStartedEvent({ teacherDisplayName: '王老师' }))
+    expect(session.isTalkingWithTeacher).toBe(true)
+
+    harness.emit(makePrivateTalkEndedEvent({ sessionId: 'session-1' }))
+    expect(session.isTalkingWithTeacher).toBe(false)
+  })
+
+  it('§26：老师那版的 PRIVATE_TALK_STARTED 到了学生端也不会被接受', async () => {
+    const { useMediaSessionStore } = await import('../media-session.ts')
+    const session = useMediaSessionStore()
+    session.prepare({
+      sessionId: 'session-1',
+      classroomId: 'room-1',
+      credentials: { livekitUrl: 'wss://classwatch-test.livekit.cloud', token: 't' },
+      capture: makeFakeCapture(),
+    })
+    session.phase = 'online'
+
+    const realtime = useRealtimeStore()
+    realtime.start()
+    harness.open()
+
+    // 老师版载荷（目标学生的身份，没有老师姓名）：学生端**没有**老师名字可显示，
+    // 也绝不该从别的字段猜一个（§26 的"没有字段就无从推断"）。
+    harness.emit(
+      makeTeacherShapedPrivateTalkStartedEvent({
+        studentId: 'student-1',
+        sessionId: 'session-1',
+        displayName: '张三',
+      }),
+    )
+
+    expect(session.privateTalk).toBeNull()
+    expect(session.isTalkingWithTeacher).toBe(false)
+    expect(realtime.state).toBe('open')
   })
 
   it('不可信报文被忽略，不会打断通道（§47 的"解析失败只计数"）', () => {

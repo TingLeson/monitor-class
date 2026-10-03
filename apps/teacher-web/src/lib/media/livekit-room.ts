@@ -19,18 +19,21 @@
  * 三条硬约束：
  * 1. `autoSubscribe: false`：老师端绝不自动订阅整个房间。一个 30 人的班
  *    自动订阅就是同时下载 30 路视频（§52 明确禁止）。
- * 2. 只认购 `source === screen_share` 的轨道：摄像头 / 麦克风属于 Phase 9/10，
- *    这里连看都不看（老师端 Token 也只允许发布 microphone，§27）。
+ * 2. 只认购**被业务逻辑确认过**的轨道：屏幕（§29/§52 的可见性 + Focus）、
+ *    摄像头（§24 的画中画）、以及**至多一个**学生的麦克风（§32 的 Focus）。
+ *    三条订阅各自独立，互不牵连——这是 Phase 9/10 反复踩到的那个坑。
  * 3. 用非 deprecated 的 `RemoteTrackPublication.setSubscribed()`，
  *    而不是直接改 `publication.subscribed` 这种内部字段。
  */
 
 import {
+  LocalAudioTrack,
   Room,
   RoomEvent,
   Track,
   VideoQuality,
   type DisconnectReason,
+  type RemoteAudioTrack,
   type RemoteParticipant,
   type RemoteTrack,
   type RemoteTrackPublication,
@@ -41,6 +44,7 @@ import type {
   MediaCredentials,
   MediaDisconnectReason,
   MediaRemoteParticipant,
+  MicrophoneSubscription,
   MonitorRoom,
   ScreenQuality,
   ScreenSubscription,
@@ -69,6 +73,13 @@ function findScreenPublication(participant: RemoteParticipant): RemoteTrackPubli
 /** 这条参与者有没有在发布摄像头轨道（§24）。 */
 function findCameraPublication(participant: RemoteParticipant): RemoteTrackPublication | undefined {
   return findPublication(participant, Track.Source.Camera)
+}
+
+/** 这条参与者有没有在发布麦克风轨道（§32）。 */
+function findMicrophonePublication(
+  participant: RemoteParticipant,
+): RemoteTrackPublication | undefined {
+  return findPublication(participant, Track.Source.Microphone)
 }
 
 function findPublication(
@@ -136,6 +147,32 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
   >()
 
   /**
+   * 已建立的**麦克风**订阅（§32）。
+   *
+   * 第三张表，理由与第二张完全相同：麦克风是同一个 participant 的第三条独立
+   * publication（学生可以只开麦、可以在共享屏幕时说话、也可以在老师听的时候关掉摄像头）。
+   * 合并任何两张表，都会让"取消一条订阅顺手拆掉另一条"变成一个必然发生的 bug。
+   *
+   * 没有画质档：音频没有分辨率的概念，§52 的分层只针对视频。
+   */
+  const microphoneSubscriptions = new Map<
+    string,
+    {
+      publication: RemoteTrackPublication
+      track: RemoteAudioTrack
+      elements: Set<HTMLAudioElement>
+    }
+  >()
+
+  /**
+   * 老师自己已发布的麦克风轨道（§27/§31）。
+   *
+   * `LocalAudioTrack`（而不是 Video）：老师 Token 只允许发布 microphone，
+   * 用错类型会在 `publishTrack` 时被 SDK 拒绝，而那时错误信息离"权限"很远。
+   */
+  let publishedMicrophoneTrack: LocalAudioTrack | null = null
+
+  /**
    * 切换某条订阅的画质档（§30 / §52）。
    *
    * WHY 在这里再判一次"档位没变就返回"：SDK 的 `setVideoQuality` 内部已经去重，
@@ -152,16 +189,16 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
   }
 
   /**
-   * 拆掉一条订阅：把画面从所有元素上摘下来，并 `setSubscribed(false)`。
+   * 拆掉一条订阅：把画面/声音从所有元素上摘下来，并 `setSubscribed(false)`。
    *
    * WHY 取消订阅而不只是 detach：让服务端**停止下行**才是省带宽的那一步（§52）。
-   * 两种订阅共用这一段，避免"屏幕那边记得 setSubscribed(false)、摄像头那边忘了"
-   * 这种只会在真机上表现为"摄像头一直偷偷在下行"的漏。
+   * 三种订阅共用这一段（元素类型放宽成 `HTMLMediaElement`：视频挂 `<video>`、
+   * 音频挂 `<audio>`，而"摘下来 + 退订"这两步对两者完全一样）。
    */
   function dropSubscription(entry: {
     publication: RemoteTrackPublication
-    track: RemoteVideoTrack
-    elements: Set<HTMLVideoElement>
+    track: RemoteTrack
+    elements: Set<HTMLMediaElement>
   }): void {
     for (const element of [...entry.elements]) entry.track.detach(element)
     entry.elements.clear()
@@ -173,10 +210,13 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
    *
    * 监听房间级的 `TrackSubscribed` 而不是 publication 自己的事件：
    * 后者在部分版本里会漏事件，而房间级事件始终会到（它就是 SDK 通知应用的入口）。
+   *
+   * 返回 `RemoteTrack`（不区分音视频）：三条订阅路径都要用它，而各自的调用点
+   * 比谁都清楚自己在等的是哪一种轨道。
    */
-  function waitForTrack(publication: RemoteTrackPublication): Promise<RemoteVideoTrack> {
-    if (publication.track) return Promise.resolve(publication.track as RemoteVideoTrack)
-    return new Promise<RemoteVideoTrack>((resolve, reject) => {
+  function waitForTrack(publication: RemoteTrackPublication): Promise<RemoteTrack> {
+    if (publication.track) return Promise.resolve(publication.track)
+    return new Promise<RemoteTrack>((resolve, reject) => {
       const cleanup = (): void => {
         clearTimeout(timer)
         room.off(RoomEvent.TrackSubscribed, onSubscribed)
@@ -189,7 +229,7 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
       const onSubscribed = (track: RemoteTrack, subscribed: RemoteTrackPublication): void => {
         if (subscribed.trackSid !== publication.trackSid) return
         cleanup()
-        resolve(track as RemoteVideoTrack)
+        resolve(track)
       }
       const onFailed = (trackSid: string): void => {
         if (trackSid !== publication.trackSid) return
@@ -250,6 +290,33 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
     }
   }
 
+  /**
+   * 麦克风订阅对象（§32）：与摄像头同形，但挂的是 `<audio>`。
+   *
+   * 元素类型必须分开：`<video srcObject=audioTrack>` 在部分浏览器里能响、在另一些
+   * 里完全无声——一个"在老师的机器上能用"的音频实现是最难被发现的一类缺陷。
+   */
+  function toMicrophoneSubscription(
+    identity: string,
+    entry: {
+      publication: RemoteTrackPublication
+      track: RemoteAudioTrack
+      elements: Set<HTMLAudioElement>
+    },
+  ): MicrophoneSubscription {
+    return {
+      identity,
+      attach(element: HTMLAudioElement): () => void {
+        entry.track.attach(element)
+        entry.elements.add(element)
+        return () => {
+          entry.track.detach(element)
+          entry.elements.delete(element)
+        }
+      },
+    }
+  }
+
   return {
     async connect(): Promise<void> {
       // §52：老师端 autoSubscribe 必须为 false，且不能由调用方改写。
@@ -265,6 +332,11 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
         dropSubscription(entry)
         cameraSubscriptions.delete(identity)
       }
+      for (const [identity, entry] of [...microphoneSubscriptions]) {
+        dropSubscription(entry)
+        microphoneSubscriptions.delete(identity)
+      }
+      publishedMicrophoneTrack = null
       await room.disconnect(true)
     },
 
@@ -312,7 +384,7 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
        */
       if (!publication.isSubscribed) publication.setSubscribed(true)
       publication.setVideoQuality(toVideoQuality(quality))
-      const track = await waitForTrack(publication)
+      const track = (await waitForTrack(publication)) as RemoteVideoTrack
 
       // 等待期间可能已经被取消（学生停止共享 / 老师关掉了这个 tile）。
       if (!publication.isSubscribed) return null
@@ -353,7 +425,7 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
        */
       if (!publication.isSubscribed) publication.setSubscribed(true)
       publication.setVideoQuality(VideoQuality.LOW)
-      const track = await waitForTrack(publication)
+      const track = (await waitForTrack(publication)) as RemoteVideoTrack
 
       // 等待期间可能已经被取消（学生关了摄像头 / 卡片滚出视口 / 页面切走了）。
       if (!publication.isSubscribed) return null
@@ -368,6 +440,78 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
       if (!entry) return
       cameraSubscriptions.delete(identity)
       // 只动摄像头那条：屏幕订阅与它没有任何关系。
+      dropSubscription(entry)
+    },
+
+    /* ---------------------------------------------------------------------- */
+    /* 老师自己的麦克风（§27/§31）                                             */
+    /* ---------------------------------------------------------------------- */
+
+    async publishMicrophoneTrack(track: MediaStreamTrack): Promise<void> {
+      /**
+       * `userProvidedTrack = true`：与另外两条本地轨道同一条纪律——重连时 SDK
+       * 不得自己重新采集麦克风，否则老师会在课堂中途被弹第二次授权框。
+       *
+       * `name: 'mic'` 与后端契约里那条轨迹的名字逐字一致（排障时能一眼区分
+       * 三条轨道；归属仍然靠 `source`）。
+       */
+      const local = new LocalAudioTrack(track, undefined, true)
+      await room.localParticipant.publishTrack(local, {
+        source: Track.Source.Microphone,
+        name: 'mic',
+      })
+      publishedMicrophoneTrack = local
+    },
+
+    async unpublishMicrophoneTrack(): Promise<void> {
+      const local = publishedMicrophoneTrack
+      publishedMicrophoneTrack = null
+      if (!local) return
+      // 第二个参数 false：不 stop 本地轨道，释放设备由采集层负责（指示灯才会灭）。
+      await room.localParticipant.unpublishTrack(local, false)
+    },
+
+    /* ---------------------------------------------------------------------- */
+    /* 听学生的麦克风（§32）                                                   */
+    /* ---------------------------------------------------------------------- */
+
+    async subscribeMicrophone(identity: string): Promise<MicrophoneSubscription | null> {
+      // 幂等：Focus 里每 10 秒一轮的刷新、以及 MIC_CHANGED 事件都会重算计划。
+      const existing = microphoneSubscriptions.get(identity)
+      if (existing) return toMicrophoneSubscription(identity, existing)
+
+      const participant = room.getParticipantByIdentity(identity) as RemoteParticipant | undefined
+      if (!participant) return null
+      const publication = findMicrophonePublication(participant)
+      if (!publication) return null
+
+      /**
+       * **不**调用 `setVideoQuality`：音频没有分辨率。§52 的"网格低 / Focus 高"
+       * 是视频的概念，给一条 audio publication 设画质要么被 SDK 忽略、
+       * 要么在将来的版本里变成一个无意义的信令。
+       */
+      if (!publication.isSubscribed) publication.setSubscribed(true)
+      /**
+       * 自动播放策略：老师点开 Focus / 开自己的麦克风都发生在用户手势之后的页面里，
+       * 所以这里顺手 `startAudio()` 通常直接成功。失败不抛——它只意味着老师需要
+       * 再点一次页面，而这条路不该把整个订阅流程打断。
+       */
+      void room.startAudio().catch(() => undefined)
+      const track = (await waitForTrack(publication)) as RemoteAudioTrack
+
+      // 等待期间可能已经被取消（学生关麦 / 退出 Focus / 切走标签页）。
+      if (!publication.isSubscribed) return null
+
+      const entry = { publication, track, elements: new Set<HTMLAudioElement>() }
+      microphoneSubscriptions.set(identity, entry)
+      return toMicrophoneSubscription(identity, entry)
+    },
+
+    async unsubscribeMicrophone(identity: string): Promise<void> {
+      const entry = microphoneSubscriptions.get(identity)
+      if (!entry) return
+      microphoneSubscriptions.delete(identity)
+      // 只动音频那条：屏幕与摄像头一个都不碰（§32 的隔离）。
       dropSubscription(entry)
     },
 
@@ -390,6 +534,15 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
         cameraSubscriptions.delete(identity)
       }
 
+      /** 麦克风那一半（§32）：同上，但只动音频。 */
+      const dropMicrophoneSubscription = (identity: string): void => {
+        const entry = microphoneSubscriptions.get(identity)
+        if (!entry) return
+        for (const element of [...entry.elements]) entry.track.detach(element)
+        entry.elements.clear()
+        microphoneSubscriptions.delete(identity)
+      }
+
       const onParticipantConnected = (): void => listener()
       /**
        * 参与者离开（学生关掉页面、网络断了、老师把他移出课堂……）。
@@ -402,11 +555,17 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
       const onParticipantDisconnected = (participant: RemoteParticipant): void => {
         dropScreenSubscription(participant.identity)
         dropCameraSubscription(participant.identity)
+        /**
+         * 麦克风同样必须在这里清掉（§32）：参与者走了之后那条 publication 不会再推
+         * 数据，而 map 里留着它，下一次 `subscribeMicrophone` 会**直接返回这条死订阅**
+         * ——老师的耳机里从此一片安静，而 Focus 面板还写着"正在听该学生的麦克风"。
+         */
+        dropMicrophoneSubscription(participant.identity)
         listener()
       }
 
       /**
-       * 屏幕与摄像头轨道的发布/取消都要通知。
+       * 屏幕、摄像头与麦克风轨道的发布/取消都要通知。
        *
        * WHY 屏幕：学生重新共享时（§22）就是"先 unpublish 再 publish"，老师端要借此
        * 把卡片从"屏幕中断"切回"有画面"。
@@ -414,14 +573,17 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
        * 这条 publication 可能还没出现在老师端的 participant 上（webhook 与 SFU 的
        * 传播本来就有先后）。不在这里再通知一次，画中画就要等到下一次快照（60 秒）
        * 才会出现——而老师盯着的是一个"学生说开了摄像头却什么都没有"的卡片。
-       * 麦克风仍然不筛进来：音频属于 Phase 10（§54）。
+       * WHY 麦克风（Phase 10）：同一条理由，代价更直接——`MIC_CHANGED` 先到、
+       * 轨道后到时，Focus 面板会显示"麦克风已开启"却听不到任何声音，
+       * 而老师会以为自己耳机坏了。
        *
        * 判据用 `publication.source`（而不是在 participant 的 trackPublications 里找）：
        * 事件到达时 participant 的轨道表**可能还没有**这条新轨道，用后者会漏掉事件。
        */
       const isTrackedSource = (publication: RemoteTrackPublication): boolean =>
         publication.source === Track.Source.ScreenShare ||
-        publication.source === Track.Source.Camera
+        publication.source === Track.Source.Camera ||
+        publication.source === Track.Source.Microphone
 
       const onTrackPublished = (publication: RemoteTrackPublication): void => {
         if (!isTrackedSource(publication)) return
@@ -434,10 +596,12 @@ export function createLiveKitMonitorRoom(credentials: MediaCredentials): Monitor
         if (!isTrackedSource(publication)) return
         /**
          * 轨道没了：把对应的本地订阅记录清掉，否则下次订阅会返回一条死轨道。
-         * 按 source 分开清——摄像头关掉不该把屏幕那条也拆了（反之亦然）。
+         * 按 source 分开清——关麦克风不该把屏幕或摄像头那条也拆了（反之亦然）。
          */
         if (publication.source === Track.Source.Camera) {
           dropCameraSubscription(participant.identity)
+        } else if (publication.source === Track.Source.Microphone) {
+          dropMicrophoneSubscription(participant.identity)
         } else {
           dropScreenSubscription(participant.identity)
         }

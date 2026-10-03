@@ -38,6 +38,16 @@ vi.mock('../../lib/teacher-monitor-api.ts', () => ({
     .mockResolvedValue({ livekitUrl: 'wss://example.invalid', token: 'test-token' }),
 }))
 
+/**
+ * 私密语音接口（§31）：`load()` 会读一次"当前目标"恢复界面记忆。
+ * 这里同样替身掉，否则每次冒烟都会真的发一次请求。
+ */
+vi.mock('../../lib/private-talk-api.ts', () => ({
+  startPrivateTalk: vi.fn(),
+  stopPrivateTalk: vi.fn(),
+  getPrivateTalk: vi.fn().mockResolvedValue(null),
+}))
+
 vi.mock('../../lib/teacher-classrooms-api.ts', () => ({
   listClassrooms: vi
     .fn()

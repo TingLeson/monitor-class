@@ -24,6 +24,14 @@ export type ScreenSurfaceUnderTest =
 export interface FakeTrack {
   kind: string
   readyState: string
+  /**
+   * 本地静音开关（§31）。
+   *
+   * 真实 `MediaStreamTrack` 本来就有这个字段；替身把它显式列出来，是因为
+   * "静音自己"必须能在测试里被断言成"轨道仍然 live、只是 enabled=false"——
+   * 那正是"静音 ≠ 关麦"的全部含义。
+   */
+  enabled: boolean
   onended: ((event: Event) => void) | null
   getSettings(): MediaTrackSettings
   stop(): void
@@ -59,14 +67,18 @@ function settingsFor(surface: ScreenSurfaceUnderTest): MediaTrackSettings {
   }
 }
 
-export function makeFakeTrack(surface: ScreenSurfaceUnderTest = 'monitor'): FakeTrack {
+export function makeFakeTrack(
+  surface: ScreenSurfaceUnderTest = 'monitor',
+  kind = 'video',
+): FakeTrack {
   const listeners = new Set<() => void>()
   let stopCalls = 0
   let settings: MediaTrackSettings | null = settingsFor(surface)
 
   return {
-    kind: 'video',
+    kind,
     readyState: 'live',
+    enabled: true,
     onended: null,
     get stopCalls() {
       return stopCalls
@@ -103,6 +115,7 @@ export interface FakeStream {
   active: boolean
   getTracks(): FakeTrack[]
   getVideoTracks(): FakeTrack[]
+  getAudioTracks(): FakeTrack[]
 }
 
 export function makeFakeStream(tracks: FakeTrack[], withVideo = true): FakeStream {
@@ -110,6 +123,7 @@ export function makeFakeStream(tracks: FakeTrack[], withVideo = true): FakeStrea
     active: true,
     getTracks: () => [...tracks],
     getVideoTracks: () => (withVideo ? tracks.filter((track) => track.kind === 'video') : []),
+    getAudioTracks: () => tracks.filter((track) => track.kind === 'audio'),
   }
 }
 
@@ -141,6 +155,38 @@ export function makeFakeCameraStream(tracks: FakeTrack[] = [makeFakeCameraTrack(
   const stream = new MediaStream(tracks as unknown as MediaStreamTrack[])
   Object.defineProperty(stream, 'getTracks', {
     value: () => [...tracks],
+    configurable: true,
+  })
+  return stream as unknown as FakeStream
+}
+
+/**
+ * 麦克风轨道替身（§25 / §76）。
+ *
+ * `kind: 'audio'` 是这里的全部意义：`requestMicrophone` 用 `getAudioTracks()` 取轨道，
+ * 一个 kind 写错的替身会让"拿到流却没有 audio track"那条分支被误判成正常路径。
+ * settings 仍然刻意没有 `displaySurface`（同摄像头）：麦克风这条路径上不存在、
+ * 也不该出现任何屏幕共享面的判断。
+ */
+export function makeFakeMicTrack(): FakeTrack {
+  return makeFakeTrack('missing', 'audio')
+}
+
+/**
+ * 麦克风流替身：与摄像头一样是**真实的 `MediaStream` 实例**。
+ *
+ * 麦克风这条流不会挂到任何 `<video>` / `<audio>` 元素上（学生端的音频是**远端**的
+ * 老师语音，本地麦克风只发布、不播放）。用真实实例是顺手与摄像头保持一致，
+ * 避免将来有人给本地麦克风加一个"回放"时才发现替身不满足类型。
+ */
+export function makeFakeMicStream(tracks: FakeTrack[] = [makeFakeMicTrack()]): FakeStream {
+  const stream = new MediaStream(tracks as unknown as MediaStreamTrack[])
+  Object.defineProperty(stream, 'getTracks', {
+    value: () => [...tracks],
+    configurable: true,
+  })
+  Object.defineProperty(stream, 'getAudioTracks', {
+    value: () => tracks.filter((track) => track.kind === 'audio'),
     configurable: true,
   })
   return stream as unknown as FakeStream
@@ -181,6 +227,23 @@ export interface MediaDevicesStub {
   /** 让 getUserMedia 抛出这个错误（权限被拒 / 设备被占用）。 */
   cameraFailWith: Error | null
   getUserMedia(constraints?: unknown): Promise<unknown>
+
+  /* ------------------------------------------------------------------ */
+  /* 麦克风（§25）                                                        */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * 每一次**音频** `getUserMedia` 的入参（按 audio 约束分流，见下面的实现）。
+   *
+   * 与 `cameraCalls` 分开记：Phase 10 最核心的一条断言是"麦克风请求只带
+   * `{audio:true}`、并且只在学生点击/点提示按钮之后才发生"。混在一个数组里
+   * 会让"摄像头那次请求被当成麦克风"这种错误悄悄通过。
+   */
+  micCalls: { constraints: unknown }[]
+  /** 每次返回的麦克风流（与 micCalls 一一对应）。 */
+  micStreams: FakeStream[]
+  /** 让音频请求抛出这个错误（权限被拒 / 设备被占用）。与摄像头开关**分开**。 */
+  micFailWith: Error | null
 }
 
 export function makeMediaDevicesStub(
@@ -203,7 +266,25 @@ export function makeMediaDevicesStub(
     cameraCalls: [],
     cameraStreams: [],
     cameraFailWith: null,
+    micCalls: [],
+    micStreams: [],
+    micFailWith: null,
+    /**
+     * 同一个 `getUserMedia` 按约束分流到摄像头 / 麦克风两条记录。
+     *
+     * WHY 替身必须真的看约束：`{video:true}` 与 `{audio:true}` 是本 Phase 两条
+     * 完全独立的路径，而"麦克风那次请求其实带上了 video"这种 bug 只有在替身
+     * 按约束分流时才可能暴露（一个永远返回摄像头流的替身会把它掩盖掉）。
+     */
     getUserMedia(constraints?: unknown): Promise<unknown> {
+      const wantsAudio = (constraints as { audio?: unknown } | undefined | null)?.audio === true
+      if (wantsAudio) {
+        stub.micCalls.push({ constraints })
+        if (stub.micFailWith) return Promise.reject(stub.micFailWith)
+        const micStream = makeFakeMicStream()
+        stub.micStreams.push(micStream)
+        return Promise.resolve(micStream)
+      }
       stub.cameraCalls.push({ constraints })
       if (stub.cameraFailWith) return Promise.reject(stub.cameraFailWith)
       const stream = makeFakeCameraStream()

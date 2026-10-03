@@ -388,6 +388,46 @@ func (p *Postgres) RecordEventOnce(ctx context.Context, sessionID uuid.UUID, eve
 	return true, nil
 }
 
+// AppendEvent appends one event row of a session, unconditionally (§13/§31).
+//
+// # Why this exists next to RecordEventOnce
+//
+// RecordEventOnce is guarded on "once per (session, type)", which is right for the two
+// lifecycle events that can happen at most once in a session's life (a join, a leave —
+// §50: LEFT is terminal and a re-entry is a NEW row). The private-talk rows are the
+// opposite case: a teacher may talk to 张三, stop, and talk to them again later in the same
+// lesson, and each of those is a real TEACHER_TALK_STARTED that a lesson report must be
+// able to show. Guarding them would silently erase the second talk.
+//
+// The row is therefore an honest append with no idempotency of its own: the CALLER decides
+// whether an event happened (the state machine only writes a start when it moves from
+// IDLE or switches target, and only writes an end for a talk that was in progress). It is
+// inserted on its own and not inside a state transaction, because the private-talk state
+// is a media-plane fact that no database transaction can cover.
+//
+// # What the payload may contain
+//
+// Identifiers and a reason: runId, studentId, a teacher id, teacherSessionId, and one of
+// the talk reasons. NEVER audio, a transcript, a name or an account (§13/§53/§59).
+func (p *Postgres) AppendEvent(ctx context.Context, sessionID uuid.UUID, event EventType, payload map[string]any) error {
+	if p == nil || p.pool == nil {
+		return errors.New("session: repository is not connected")
+	}
+	if sessionID == uuid.Nil {
+		return errors.New("session: a session id is required to append an event")
+	}
+	if event == "" {
+		return errors.New("session: an event type is required")
+	}
+	const query = `
+		INSERT INTO session_events (session_id, type, payload)
+		VALUES ($1, $2, $3::jsonb)`
+	if _, err := p.pool.Exec(ctx, query, sessionID, string(event), jsonPayload(payload)); err != nil {
+		return translateWriteError(err)
+	}
+	return nil
+}
+
 // insertEventRow appends one row inside the caller's transaction.
 func insertEventRow(ctx context.Context, tx pgx.Tx, sessionID uuid.UUID, event EventType, payload map[string]any) (*SessionEvent, error) {
 	const query = `

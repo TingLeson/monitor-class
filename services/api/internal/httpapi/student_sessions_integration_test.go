@@ -62,6 +62,13 @@ type fakeMediaPlane struct {
 	enforceCalls []enforceCall
 	enforceErr   error
 	revoked      []media.PeerSubscriptionRevocation
+
+	// The §31 half: the private-talk subscriptions the control plane asked for, modelled
+	// as a real subscription book (identity → track sid → subscribed) so a test can assert
+	// WHO ends up able to hear the teacher, not merely which RPCs were sent.
+	talkCalls     []talkEnforceCall
+	talkErr       error
+	subscriptions map[string]map[string]bool
 }
 
 // enforceCall is one EnforceNoPeerSubscriptions invocation.
@@ -71,8 +78,19 @@ type enforceCall struct {
 	allowed  []string
 }
 
+// talkEnforceCall is one EnforcePrivateTalk invocation.
+type talkEnforceCall struct {
+	room     string
+	students []string
+	teachers []string
+	target   string
+}
+
 func newFakeMediaPlane() *fakeMediaPlane {
-	return &fakeMediaPlane{participants: map[string]media.ParticipantTracks{}}
+	return &fakeMediaPlane{
+		participants:  map[string]media.ParticipantTracks{},
+		subscriptions: map[string]map[string]bool{},
+	}
 }
 
 func (f *fakeMediaPlane) EnsureRoom(_ context.Context, roomName string) error {
@@ -132,6 +150,73 @@ func (f *fakeMediaPlane) EnforceNoPeerSubscriptions(
 		return nil, f.enforceErr
 	}
 	return append([]media.PeerSubscriptionRevocation{}, f.revoked...), nil
+}
+
+// EnforcePrivateTalk is the §31 half of the fake: it applies the subscription change to a
+// book of its own (identity → track sid → subscribed), which is what lets an integration
+// test assert the END STATE — "only this student can hear the teacher" — rather than the
+// RPC that produced it.
+func (f *fakeMediaPlane) EnforcePrivateTalk(
+	_ context.Context,
+	roomName string,
+	students []string,
+	observed map[string]media.ParticipantTracks,
+	teacherIdentities []string,
+	targetIdentity string,
+) (media.PrivateTalkEnforcement, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.talkCalls = append(f.talkCalls, talkEnforceCall{
+		room:     roomName,
+		students: append([]string{}, students...),
+		teachers: append([]string{}, teacherIdentities...),
+		target:   targetIdentity,
+	})
+	if f.talkErr != nil {
+		return media.PrivateTalkEnforcement{}, f.talkErr
+	}
+
+	var micSids []string
+	for _, identity := range teacherIdentities {
+		if _, present := observed[identity]; !present {
+			continue
+		}
+		for _, track := range observed[identity].Tracks {
+			if track.Source == media.PublishMicrophone && track.Sid != "" {
+				micSids = append(micSids, track.Sid)
+			}
+		}
+	}
+	enforcement := media.PrivateTalkEnforcement{TrackSids: micSids}
+	for _, student := range students {
+		if _, present := observed[student]; !present {
+			continue
+		}
+		subscribe := student == targetIdentity
+		for _, sid := range micSids {
+			if f.subscriptions[student] == nil {
+				f.subscriptions[student] = map[string]bool{}
+			}
+			if f.subscriptions[student][sid] == subscribe {
+				continue
+			}
+			f.subscriptions[student][sid] = subscribe
+			change := media.PrivateTalkSubscription{StudentIdentity: student, TrackSid: sid}
+			if subscribe {
+				enforcement.Granted = append(enforcement.Granted, change)
+			} else {
+				enforcement.Revoked = append(enforcement.Revoked, change)
+			}
+		}
+	}
+	return enforcement, nil
+}
+
+// subscribedTo reports whether one student's client would be receiving one track.
+func (f *fakeMediaPlane) subscribedTo(identity, trackSid string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.subscriptions[identity][trackSid]
 }
 
 func (f *fakeMediaPlane) publish(identity string, tracks media.ParticipantTracks) {
@@ -529,10 +614,11 @@ func TestStudentJoinLifecycleEndToEnd(t *testing.T) {
 		t.Errorf("leftAt = %v, want NULL", stored.LeftAt)
 	}
 
-	// The token request carries the permissions of §28/§75 and the run's opaque room:
-	// the screen (mandatory, §21) and the camera (optional, §24), and no microphone — the
-	// microphone is Phase 10 (§76) and the event path that would observe it does not exist
-	// yet.
+	// The token request carries the permissions of §28/§76 and the run's opaque room:
+	// the screen (mandatory, §21), the camera (optional, §24) and — from Phase 10 — the
+	// microphone (optional, §25). Phase 10 is the phase in which the student's three
+	// sources are finally complete, and this list is asserted in ORDER so a fourth source
+	// cannot appear without a deliberate change here.
 	req := e.media.lastTokenRequest(t)
 	if req.Identity != sessionID.String() {
 		t.Errorf("token identity = %q, want %s", req.Identity, sessionID)
@@ -540,7 +626,7 @@ func TestStudentJoinLifecycleEndToEnd(t *testing.T) {
 	if !strings.HasPrefix(req.RoomName, "lk_") || strings.Contains(req.RoomName, "C++") {
 		t.Errorf("token room = %q, want an opaque lk_<run_uuid> name (§8)", req.RoomName)
 	}
-	wantSources := []media.PublishSource{media.PublishScreenShare, media.PublishCamera}
+	wantSources := []media.PublishSource{media.PublishScreenShare, media.PublishCamera, media.PublishMicrophone}
 	if len(req.PublishSources) != len(wantSources) {
 		t.Fatalf("publish sources = %v, want %v", req.PublishSources, wantSources)
 	}

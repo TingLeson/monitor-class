@@ -110,7 +110,11 @@ func run() error {
 	// who receives what, and the processor that turns media-plane observations into
 	// session states, event rows and messages. It is built before the router because the
 	// classroom lifecycle and the session service both report into it.
-	runtime, hub := deps.runtimeLayer(logger, cfg)
+	//
+	// events is the same realtime service handed out a second time, as the private-talk
+	// message path of §31: the session service produces the facts and the realtime layer
+	// decides who may hear them, exactly as it does for the screen and camera messages.
+	runtime, hub, events := deps.runtimeLayer(logger, cfg)
 	if hub != nil {
 		// Close the sockets with a proper "going away" frame before the HTTP server
 		// stops: WebSocket connections are hijacked, so http.Server.Shutdown does not
@@ -123,18 +127,37 @@ func run() error {
 		}()
 	}
 
-	router := httpapi.NewRouter(httpapi.Deps{
+	// The student session service is built before the router because the processor needs
+	// it back: the private-talk state machine is what revokes the subscription of a target
+	// who left or of a lesson that closed (§31), and the two are wired in a cycle on
+	// purpose — the session service reports its lifecycle into the processor, and the
+	// processor reports "the target is gone" back into the state machine.
+	sessions := deps.sessionService(logger, cfg, users, runtime, events)
+	if runtime != nil && sessions != nil {
+		runtime.WithPrivateTalkEnder(sessions)
+	}
+
+	depsForRouter := httpapi.Deps{
 		Logger:    logger,
 		Config:    cfg,
 		Ready:     deps.readiness(),
 		Auth:      deps.authService(logger, cfg, users),
 		Admin:     deps.adminService(logger, cfg, users),
 		Classroom: deps.classroomService(logger, users, runtime),
-		Session:   deps.sessionService(logger, cfg, users, runtime),
 		Webhook:   deps.webhookDeps(cfg, runtime),
 		Socket:    hub,
 		Limiter:   deps.rateLimiter(logger),
-	})
+	}
+	// The two session-shaped fields are interface fields, and a nil *session.Service stored
+	// in one would NOT compare equal to nil: the route groups would register and then call a
+	// method on a nil receiver. Assigning only when there is a service keeps the degraded
+	// deployment (no database) answering 404 there, as it did before Phase 10.
+	if sessions != nil {
+		depsForRouter.Session = sessions
+		depsForRouter.PrivateTalk = sessions
+	}
+
+	router := httpapi.NewRouter(depsForRouter)
 
 	server := &http.Server{
 		Addr:    cfg.APIAddr,
@@ -318,7 +341,18 @@ func (d *dependencies) classroomService(logger *slog.Logger, users user.Reposito
 //
 // The runtime processor is attached as the lifecycle event path (§13): join records
 // SESSION_CREATED, leave records STUDENT_LEFT and tells the teacher's console.
-func (d *dependencies) sessionService(logger *slog.Logger, cfg *config.Config, users user.Repository, runtime *session.Processor) httpapi.SessionService {
+//
+// Phase 10 adds the private-talk collaborators (§31): events is the message path
+// (PRIVATE_TALK_*), and the session repository doubles as the audit log of
+// TEACHER_TALK_STARTED/ENDED. Both may be nil — the state machine and the media plane still
+// work, and only the two browsers and the event log lose their copy.
+func (d *dependencies) sessionService(
+	logger *slog.Logger,
+	cfg *config.Config,
+	users user.Repository,
+	runtime *session.Processor,
+	events *realtime.Service,
+) *session.Service {
 	if users == nil {
 		logger.Warn("postgres is not connected; student session routes are disabled",
 			"hint", "STARTUP_REQUIRE_DEPENDENCIES=false must only be used for local work")
@@ -343,6 +377,10 @@ func (d *dependencies) sessionService(logger *slog.Logger, cfg *config.Config, u
 	if runtime != nil {
 		service.WithLifecycleEvents(runtime)
 	}
+	// The audit log is passed even when the hub is absent: recording a private talk needs
+	// the database, not a websocket, and a deployment without a hub must still be able to
+	// answer "was this student spoken to privately?" months later.
+	service.WithPrivateTalk(events, sessionRepo)
 	return service
 }
 
@@ -350,16 +388,20 @@ func (d *dependencies) sessionService(logger *slog.Logger, cfg *config.Config, u
 // service that resolves who may receive what (§26), and the processor that owns the
 // session state machine and the event log (§13/§45).
 //
-// It returns (nil, nil) when PostgreSQL is not connected, and (processor, hub) otherwise.
-// A nil hub is a valid deployment: the state machine keeps working and only the live
-// messages are skipped (§52's single-instance assumption, and any deployment that has
+// It returns (nil, nil, nil) when PostgreSQL is not connected, and (processor, hub, service)
+// otherwise. A nil hub is a valid deployment: the state machine keeps working and only the
+// live messages are skipped (§52's single-instance assumption, and any deployment that has
 // not enabled the sockets). A nil processor disables the webhook route, because events
 // that cannot be recorded must not be accepted.
-func (d *dependencies) runtimeLayer(logger *slog.Logger, cfg *config.Config) (*session.Processor, *realtime.Hub) {
+//
+// The realtime.Service is returned next to the processor because Phase 10 needs it as a
+// second port: the private-talk state machine lives in internal/session (not in the
+// processor), and it produces messages through the same audience rules.
+func (d *dependencies) runtimeLayer(logger *slog.Logger, cfg *config.Config) (*session.Processor, *realtime.Hub, *realtime.Service) {
 	if d.postgres == nil {
 		logger.Warn("postgres is not connected; runtime events and websockets are disabled",
 			"hint", "STARTUP_REQUIRE_DEPENDENCIES=false must only be used for local work")
-		return nil, nil
+		return nil, nil, nil
 	}
 	hub := realtime.NewHub(realtime.HubConfig{
 		Logger: logger,
@@ -369,7 +411,7 @@ func (d *dependencies) runtimeLayer(logger *slog.Logger, cfg *config.Config) (*s
 		AllowedOrigins: cfg.CORSOrigins(),
 	})
 	runtime := realtime.NewService(hub, realtime.NewAudience(d.postgres.Pool()), logger)
-	return session.NewProcessor(session.NewPostgres(d.postgres.Pool()), runtime), hub
+	return session.NewProcessor(session.NewPostgres(d.postgres.Pool()), runtime), hub, runtime
 }
 
 // webhookDeps builds the LiveKit webhook endpoint's two halves (§45).

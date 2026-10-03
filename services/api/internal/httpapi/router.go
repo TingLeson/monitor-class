@@ -52,6 +52,12 @@ type Deps struct {
 	// cannot record a session, and an endpoint that issued media tokens without one
 	// would produce participants nobody can supervise.
 	Session SessionService
+	// PrivateTalk is the private-talk state machine of §31/§76 (start, stop, read). It is
+	// a field of its own rather than part of SessionService because it is a different
+	// subject with a different authority (the media-plane subscription of ONE student), and
+	// a nil value means the three routes are simply not registered. In production both
+	// fields are satisfied by the same *session.Service.
+	PrivateTalk PrivateTalkService
 	// Webhook is the LiveKit webhook endpoint of §45: signature verification plus the
 	// state machine that consumes the verified event. Both halves must be present for
 	// the route to exist — a verifier without a processor would accept events and drop
@@ -327,7 +333,7 @@ func registerAdminRoutes(v1 *gin.RouterGroup, deps Deps, entries []AuthEntry) {
 // lose the CSRF check — and there is no wrong group to add it to.
 func registerTeacherRoutes(v1 *gin.RouterGroup, deps Deps, entries []AuthEntry) {
 	teacherEntry, ok := entryForRole(entries, user.RoleTeacher)
-	if !ok || deps.Auth == nil || (deps.Classroom == nil && deps.Session == nil) {
+	if !ok || deps.Auth == nil || (deps.Classroom == nil && deps.Session == nil && deps.PrivateTalk == nil) {
 		// No teacher entry (no configuration) or no service behind the routes: the
 		// routes are not registered, so they answer 404 instead of existing without an
 		// authorization chain in front of them.
@@ -366,6 +372,17 @@ func registerTeacherRoutes(v1 *gin.RouterGroup, deps Deps, entries []AuthEntry) 
 		handlers := newTeacherSessionHandlers(deps.Session)
 		group.GET("/classrooms/:id/monitor", handlers.monitor())
 		writes.POST("/classrooms/:id/media-token", handlers.mediaToken())
+	}
+
+	if deps.PrivateTalk != nil {
+		// §31's three endpoints. The read is on the outer group and the two state changes
+		// (start, stop) are on the CSRF-protected write group — the same structure as every
+		// other teacher write, and for the same reason: a page the teacher happens to be
+		// logged into must not be able to start or stop a private talk on their behalf.
+		handlers := newPrivateTalkHandlers(deps.PrivateTalk)
+		group.GET("/classrooms/:id/private-talk", handlers.show())
+		writes.POST("/classrooms/:id/private-talk", handlers.start())
+		writes.DELETE("/classrooms/:id/private-talk", handlers.stop())
 	}
 }
 

@@ -12,10 +12,32 @@ import {
   type CameraState,
 } from '../lib/camera-capture.ts'
 import {
+  applyMicrophoneMute,
+  releaseMicrophoneCapture,
+  requestMicrophone,
+  toMicFailure,
+  toMicFailureKindOf,
+  type MicFailure,
+  type MicState,
+  type MicrophoneCapture,
+} from '../lib/mic-capture.ts'
+import {
+  applyTalkRequest,
+  applyTalkStarted,
+  declineTalkRequest,
+  endPrivateTalk,
+  hasPrivateTalk,
+  markMicrophoneEnabled,
+  privateTalkActiveText,
+  privateTalkRequestTitle,
+  type StudentPrivateTalk,
+} from '../lib/private-talk.ts'
+import {
   createScreenPublisherRoom,
   type ConnectionQualityLevel,
   type MediaCredentials,
   type ScreenPublisherRoom,
+  type TeacherAudioState,
 } from '../lib/media/media-room.ts'
 import {
   classroomFallbackPollMs,
@@ -83,11 +105,15 @@ export interface PrepareInput {
  *    "等待课堂确认"，直到服务端说 `SCREEN_RESTORED` 才算恢复正常。
  * 5. **课堂是否开着以 WebSocket 事件为主、低频轮询兜底**（§47/§49）：
  *    事件负责快，轮询负责"通道断了也不漏"（见 `syncPollTimer`）。
- * 6. **摄像头是可选设备，与课堂状态完全解耦**（§21/§24）。`cameraState` 只回答
- *    "摄像头开没开"，它不是 `phase` 的一部分：摄像头打不开不会把 phase 变成
- *    media-error（学生照样能上课），屏幕丢了也不会因为"摄像头还开着"就显得正常
- *    （SessionView 里那条 ⚠ 提示是独立的）。`on` 的含义被收紧成"已发布、老师看得见"——
- *    连接一断就释放设备，绝不留下亮着灯却无人能看的摄像头。
+ * 6. **摄像头与麦克风是可选设备，与课堂状态完全解耦**（§21/§24/§25）。`cameraState` /
+ *    `micState` 只回答"这个设备开没开"，它们不是 `phase` 的一部分：设备打不开不会把
+ *    phase 变成 media-error（学生照样能上课），屏幕丢了也不会因为"麦克风还开着"就显得
+ *    正常（SessionView 里那条 ⚠ 提示是独立的）。`on` 的含义被收紧成"已发布、老师看得见 /
+ *    听得到"——连接一断就释放设备，绝不留下亮着灯却无人能听/看的设备。
+ * 7. **私密语音的状态只由服务端事件驱动**（§25/§31）。学生端没有"发起/结束语音沟通"
+ *    的入口：老师选择学生、老师麦克风的订阅权限都在服务端。学生会话页能做的只有
+ *    三件事——把提示显示出来、在学生**点击**之后请求麦克风（§25 明令禁止自动开麦）、
+ *    以及如实显示老师麦克风的音频到底能不能出声（自动播放策略可能拦住它）。
  */
 export const useMediaSessionStore = defineStore('student-media-session', () => {
   /* ---------------------------------------------------------------------- */
@@ -146,6 +172,53 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
   const cameraStream = shallowRef<MediaStream | null>(null)
 
   /* ---------------------------------------------------------------------- */
+  /* 麦克风（§25）                                                           */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * 麦克风状态机（`off | requesting | on | error`，定义与迁移图见 mic-capture.ts）。
+   *
+   * 与 `phase` 是两件**互不影响**的事，理由与摄像头完全一致（见上面 cameraState 的
+   * 说明）：麦克风打不开只是"这个可选设备没开"，不是"媒体连接失败"；
+   * 反过来，麦克风开着也不代表屏幕还在共享（§21 的强制规则不受任何可选设备影响）。
+   *
+   * 它与摄像头**各自独立**：学生可以只开麦、也可以只开摄像头，两者互不牵连。
+   */
+  const micState = ref<MicState>('off')
+  /** 麦克风失败的类别 + 中文文案（失败不影响会话，见 mic-capture.ts 的文案表）。 */
+  const micFailure = ref<MicFailure | null>(null)
+  /**
+   * 本地自我静音（§31 的"静音自己"）。
+   *
+   * WHY 单独一个布尔而不是把 `micState` 改成 `muted`：静音时设备仍然开着、
+   * 轨道仍然在发布（老师那端的订阅不会被拆掉），只是声音变成了静音。
+   * 混进状态机会让"未开启"和"已静音"变成一个状态，界面就无法同时说清
+   * "麦克风已开启（系统指示灯亮着）"和"老师现在听不到你"。
+   */
+  const micMuted = ref(false)
+
+  /* ---------------------------------------------------------------------- */
+  /* 老师私密语音（§25 / §31）                                               */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * 与老师的私密语音（null = 没有这段沟通）。
+   *
+   * 状态机（纯函数）在 `lib/private-talk.ts`。它只由服务端事件驱动：
+   * `PRIVATE_TALK_REQUEST`（要我开麦吗）、`PRIVATE_TALK_STARTED`（老师选中了我）、
+   * `PRIVATE_TALK_ENDED`（结束）。学生端**不能**自己开始或结束这段沟通——
+   * §31 的模型是"老师选择学生"，而订阅权限也在服务端。
+   */
+  const privateTalk = ref<StudentPrivateTalk | null>(null)
+  /**
+   * 老师私密语音的音频播放状态（§31/§32）。
+   *
+   * `blocked` 时界面必须说出来并给一个"点击播放"的入口，否则学生会在提示
+   * "正在与老师语音沟通"的情况下什么都听不到（见 TeacherAudioState 的说明）。
+   */
+  const teacherAudio = ref<TeacherAudioState>('idle')
+
+  /* ---------------------------------------------------------------------- */
   /* 只存在于内存的私有内容（绝不进 state，见文件头第 1 点）                  */
   /* ---------------------------------------------------------------------- */
 
@@ -171,6 +244,25 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
    */
   let cameraCapture: CameraCapture | null = null
   let unsubscribeCameraEnded: (() => void) | null = null
+  /**
+   * 当前持有的麦克风采集（§25）。
+   *
+   * 与 `capture` / `cameraCapture` 一样刻意**不是** ref：MediaStreamTrack 是浏览器
+   * 宿主对象，被 Vue 代理后会出现 `Illegal invocation`（详见 screen-share.ts 里那段说明）。
+   * 界面需要的只是"开没开"（`micState`）与"是不是静音"（`micMuted`）——
+   * §56 的线框图里麦克风就只有一个开关，没有音量、没有波形。
+   */
+  let micCapture: MicrophoneCapture | null = null
+  let unsubscribeMicEnded: (() => void) | null = null
+  /**
+   * 麦克风请求序号（与 `cameraSeq` 同一套理由）。
+   *
+   * `getUserMedia` 与随后的 publish 都是异步的，而学生可以在几百毫秒里点开又点关；
+   * 没有序号的话，"关闭"之后才回来的那条轨道会覆盖掉关闭动作的结果——界面显示已关闭，
+   * 而系统麦克风指示灯还亮着（那是学生最敏感的一种状态）。晚到的结果一律作废
+   * 并**立刻释放**它拿到的那条轨道。
+   */
+  let micSeq = 0
   /**
    * 摄像头请求序号。
    *
@@ -227,6 +319,40 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
   /** 按钮文案（§56 的线框图是「摄像头 [开启]」）。 */
   const cameraActionLabel = computed(() => (isCameraOn.value ? '关闭摄像头' : '📷 开启摄像头'))
 
+  /**
+   * 麦克风入口是否可见（§25）。
+   *
+   * 与摄像头同一条判据（进入课堂之后才显示）：§25 的 `🎤 开启麦克风` 出现在会话页，
+   * 而发布一条麦克风轨道必须有房间。**不能**在 PreJoin 就显示它——那会在学生还没
+   * 进课堂、也还没看到 §57 的隐私告知之前诱导他授权麦克风。
+   */
+  const canUseMicrophone = computed(() => phase.value === 'online' || phase.value === 'screen-lost')
+  const isMicOn = computed(() => micState.value === 'on')
+  const isMicRequesting = computed(() => micState.value === 'requesting')
+  const hasMicFailure = computed(() => micFailure.value !== null)
+  /** 按钮文案（§25 的 `🎤 开启麦克风`）。 */
+  const micActionLabel = computed(() => (isMicOn.value ? '关闭麦克风' : '🎤 开启麦克风'))
+
+  /** 是否需要显示"老师请你开麦"的提示（§25 的 `[开启麦克风] [暂不开启]`）。 */
+  const hasTalkRequest = computed(() => privateTalk.value?.requestPending === true)
+  /**
+   * 老师正在与我语音沟通（§25 的持续指示）。
+   *
+   * 判据是"这段沟通存在"，而不是"我已开麦"：老师可以向未开麦的学生单向讲话，
+   * 而 §25 要求这种单向关系被如实显示出来（见 hasPrivateTalk 的说明）。
+   */
+  const isTalkingWithTeacher = computed(() => hasPrivateTalk(privateTalk.value))
+  /** 提示标题：「王老师希望与你进行语音沟通。」 */
+  const talkRequestTitle = computed(() =>
+    privateTalk.value === null ? '' : privateTalkRequestTitle(privateTalk.value),
+  )
+  /** 持续指示：「正在与王老师语音沟通」。 */
+  const talkActiveText = computed(() =>
+    privateTalk.value === null ? '' : privateTalkActiveText(privateTalk.value),
+  )
+  /** 学生的麦克风是否已经被老师听到（开着且没有自我静音）。 */
+  const isMicrophoneAudible = computed(() => isMicOn.value && !micMuted.value)
+
   /* ---------------------------------------------------------------------- */
   /* 内部工具                                                                */
   /* ---------------------------------------------------------------------- */
@@ -265,13 +391,15 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     const current = room
     room = null
     /**
-     * 摄像头跟着连接一起放手（见 dropCamera）。
+     * 摄像头与麦克风跟着连接一起放手（见 dropCamera / dropMicrophone）。
      *
      * WHY 放在这里而不是各个调用点：`teardownRoom` 是"这条媒体连接结束了"的唯一出口
      * （退出、重试、课堂关闭、切课堂都走它）。分开写就一定会漏掉其中一条路径，
-     * 而漏掉的后果是学生的摄像头灯在课堂结束后继续亮着（§65 Case 14 的同一类问题）。
+     * 而漏掉的后果是学生的摄像头灯/麦克风指示灯在课堂结束后继续亮着
+     * （§65 Case 14 的同一类问题）。
      */
     dropCamera()
+    dropMicrophone()
     if (!current) return
     try {
       await current.disconnect()
@@ -355,6 +483,14 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     quality.value = 'unknown'
     screenLostByServer.value = false
     leaveReported = false
+    /**
+     * 可选设备与私密语音都从零开始：`teardownRoom()` 已经同步释放了设备（见那边），
+     * 这里显式把**状态**也归零，否则上一个课堂的"麦克风已开启""正在与老师语音沟通"
+     * 会跟着学生进入下一个课堂。
+     */
+    micState.value = 'off'
+    micFailure.value = null
+    clearPrivateTalk()
     phase.value = 'prepared'
   }
 
@@ -538,6 +674,223 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     else void enableCamera()
   }
 
+  /* ---------------------------------------------------------------------- */
+  /* 麦克风（§25 / §31）                                                     */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * 释放麦克风采集（幂等）。
+   *
+   * WHY 一定要真的 `stop()` 而不是只 unpublish：`stop()` 是唯一能让**操作系统级**
+   * 麦克风指示灯灭掉的动作。只撤下发布的话，学生会看到一个"已关闭"的界面，
+   * 而系统仍在录音——那是最直接的一种信任崩塌（他会认为自己在被偷听）。
+   * 采集层保证 `stop()` 幂等，所以这里可以无脑调用。
+   */
+  function releaseMicrophone(): void {
+    unsubscribeMicEnded?.()
+    unsubscribeMicEnded = null
+    releaseMicrophoneCapture(micCapture)
+    micCapture = null
+    // 设备已经不在了：静音状态没有意义，留着会让下一次开麦继承一个"看起来静音"的界面。
+    micMuted.value = false
+  }
+
+  /**
+   * 连接已经不可用时丢弃麦克风（**不**试图 unpublish：连接没了，没有信令通道）。
+   *
+   * WHY 连接一断就必须放手：`on` 的含义是"已发布、老师听得到"。连接断了还留着
+   * 一条 live 轨道，界面会继续显示"麦克风已开启"，而老师那端什么都没有。
+   */
+  function dropMicrophone(): void {
+    micSeq += 1
+    releaseMicrophone()
+    micState.value = 'off'
+    micFailure.value = null
+  }
+
+  /** 清掉私密语音（老师关课、学生离开、连接断开时都要清）。 */
+  function clearPrivateTalk(): void {
+    privateTalk.value = endPrivateTalk()
+    teacherAudio.value = 'idle'
+  }
+
+  /**
+   * 把"现在是不是静音"写到本地轨道上（§31）。
+   *
+   * 没有麦克风时是空操作：静音只对一条已经存在的采集有意义。
+   */
+  function syncMicrophoneMute(): void {
+    applyMicrophoneMute(micCapture, micMuted.value)
+  }
+
+  /**
+   * 开启麦克风（§25：**只有学生点击**才会走到这里）。
+   *
+   * 顺序不能变：先申请设备 → 再发布。反过来的话，publish 成功而设备授权失败，
+   * 老师那端会先看到一条麦克风发布再消失。
+   *
+   * 这个函数**从不抛出**，也**从不触碰** phase / screen 相关的状态：麦克风失败
+   * 必须完全局限在 `micState` / `micFailure` 里（§21/§25）。
+   */
+  async function enableMicrophone(): Promise<void> {
+    // 重入保护：requesting 期间的重复点击必须是空操作（否则每次点击都是一次设备请求）。
+    if (micState.value === 'requesting' || micState.value === 'on') return
+    const active = room
+    /**
+     * 没有媒体连接时**不**申请设备权限。
+     *
+     * WHY 这条守卫放在最前面：一条没有房间可发布的轨道只会亮着麦克风指示灯，
+     * 却谁也听不到。界面上这个入口本来就只在课堂里出现（见 `canUseMicrophone`），
+     * 这里是那道不变量。§25 也是这个意思：只有学生点击、且课堂在运行时才请求。
+     */
+    if (active === null || !canUseMicrophone.value) return
+
+    const seq = ++micSeq
+    micState.value = 'requesting'
+    micFailure.value = null
+
+    /** 这次开启是否已经被放弃（学生点了关闭、离开课堂、或媒体连接断了）。 */
+    const abandoned = (): boolean => seq !== micSeq || room !== active
+
+    try {
+      const next = await requestMicrophone()
+
+      /**
+       * 请求飞行期间被放弃：这条轨道**没有主人**了，必须立刻释放。
+       * 少了这一句就会出现"学生已经关了麦克风，系统却还在录音"。
+       */
+      if (abandoned()) {
+        releaseMicrophoneCapture(next)
+        return
+      }
+
+      micCapture = next
+      // 新设备从"不静音"开始：上一次的静音状态不该跨设备继承。
+      micMuted.value = false
+      unsubscribeMicEnded = next.onEnded(() => {
+        // 身份判断：回调可能来自一条已经被替换掉的旧轨道。
+        if (micCapture !== next) return
+        /**
+         * 设备被拔出 / 被系统或别的程序抢走。轨道已经死了，界面必须回到"没开"，
+         * 并给出一句解释——继续显示"已开启"会让老师对着一个没有声音的麦克风讲话。
+         */
+        releaseMicrophone()
+        /**
+         * 还要把这条已经死掉的**发布**撤下来（与 §22 的屏幕丢失同一种处理）：
+         * 本地放手之后，SFU 里仍留着一条没有轨道在推流的 microphone 发布，
+         * 服务端的 `track_unpublished` webhook 便永远不会到——老师那端的
+         * `microphone.active` 会一直停在 true。
+         */
+        void active.unpublishMicrophoneTrack().catch(() => undefined)
+        micState.value = 'error'
+        micFailure.value = toMicFailure('track-ended')
+      })
+
+      await active.publishMicrophoneTrack(next.track)
+
+      /**
+       * 发布完成才发现这次开启已经被放弃（学生点得太快）：把刚发布的轨道撤下来。
+       * 不做这一步，服务端会留着一条没有本地轨道在推流的 microphone 发布。
+       */
+      if (abandoned()) {
+        await active.unpublishMicrophoneTrack().catch(() => undefined)
+        return
+      }
+
+      micState.value = 'on'
+      /**
+       * 麦克风真的开了：§25 要求"开启成功后提示会变成老师正在与你语音沟通"，
+       * 而"还在等你决定要不要开麦"这一半必须立刻收掉（见 markMicrophoneEnabled）。
+       */
+      privateTalk.value = markMicrophoneEnabled(privateTalk.value)
+    } catch (cause) {
+      // 晚到的失败同样作废：它属于一次已经被放弃的开启。
+      if (abandoned()) return
+      releaseMicrophone()
+      micState.value = 'error'
+      const kind = toMicFailureKindOf(cause)
+      micFailure.value = toMicFailure(kind)
+      // 只留错误名：异常对象可能带上设备信息（§44 的"凭据不进日志"同样适用于设备）。
+      const name = cause instanceof Error ? cause.name : typeof cause
+      console.error(`[media-session] microphone failed: ${name}`)
+    }
+  }
+
+  /**
+   * 关闭麦克风：**unpublish + 真正 stop 本地轨道**（§25 的"允许 开 / 关 / 再开"）。
+   *
+   * WHY 必须两步都做：
+   * - 只 stop 不 unpublish：老师那端留着一条永远没有声音的发布；
+   * - 只 unpublish 不 stop：系统麦克风指示灯不灭（见 releaseMicrophone 的说明）。
+   *
+   * 先发信令再释放设备：即便 unpublish 卡在网络里，本地也必须在同一个 tick 里放手——
+   * 学生点了"关闭"，录音不能等到一次网络往返之后才停。
+   */
+  function disableMicrophone(): void {
+    if (micState.value === 'off' && micCapture === null) return
+    micSeq += 1
+    const active = room
+    if (active !== null) void active.unpublishMicrophoneTrack().catch(() => undefined)
+    releaseMicrophone()
+    micState.value = 'off'
+    micFailure.value = null
+  }
+
+  /** 学生点击麦克风开关时的唯一入口。 */
+  function toggleMicrophone(): void {
+    if (micState.value === 'on') disableMicrophone()
+    else void enableMicrophone()
+  }
+
+  /**
+   * 「开启麦克风」（老师请求提示里的那个按钮，§25）。
+   *
+   * WHY 与普通的开关分开一个入口：这里的语义是"回应老师的请求"，
+   * 而且**必须由用户点击触发**——§25 明确老师不能绕过浏览器权限远程打开麦克风。
+   * 所以这个函数只做一件事：走一遍 `enableMicrophone()`；它绝不被事件自动调用。
+   * 麦克风已经开着时按钮不该出现，真的出现也只把提示收掉（幂等）。
+   */
+  function acceptTalkRequest(): void {
+    if (micState.value === 'on') {
+      privateTalk.value = markMicrophoneEnabled(privateTalk.value)
+      return
+    }
+    void enableMicrophone()
+  }
+
+  /**
+   * 「暂不开启」（§25）。
+   *
+   * 只关掉提示，**不结束这段沟通**：老师仍然可以单向对学生讲话，
+   * 界面必须如实说明这一点（见 PRIVATE_TALK_DECLINE_NOTE）。
+   */
+  function declineTalk(): void {
+    privateTalk.value = declineTalkRequest(privateTalk.value)
+  }
+
+  /**
+   * 本地静音/取消静音自己（§31 的"静音自己"）。
+   *
+   * 只在真的开着麦克风时有意义；没有设备时按钮本来也不显示，这里是第二道守卫。
+   */
+  function toggleSelfMute(): void {
+    if (!isMicOn.value) return
+    micMuted.value = !micMuted.value
+    syncMicrophoneMute()
+  }
+
+  /**
+   * 在用户手势里恢复老师语音的播放（§31/§32）。
+   *
+   * 浏览器自动播放策略会拦住没有手势的音频；`blocked` 状态下必须由学生点一下。
+   * 没有房间时是空操作。
+   */
+  async function resumeTeacherAudio(): Promise<void> {
+    const active = room
+    if (active === null) return
+    await active.resumeTeacherAudio()
+  }
+
   /** 订阅房间事件：断线、重连、连接质量。 */
   function subscribeRoomEvents(active: ScreenPublisherRoom): void {
     roomUnsubscribers.push(
@@ -563,6 +916,12 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
          * （屏幕轨道刻意**不**在这里释放：它是学生重新共享时要复用的那条，见 §22。）
          */
         dropCamera()
+        /**
+         * 麦克风与私密语音一起放手：连接没了，`on` 就不再成立（"已开启、老师听得到"），
+         * 而且那段语音沟通的音频也已经不可能再出声。
+         */
+        dropMicrophone()
+        clearPrivateTalk()
       }),
       /**
        * 网络抖动时 LiveKit 会自己重连（§52：不要在 V1 自己实现重连策略）。
@@ -579,6 +938,16 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
           failure.value = null
           phase.value = 'online'
         }
+      }),
+      /**
+       * 老师私密语音的播放状态（§31/§32）。
+       *
+       * 这条订阅是**服务端**决定的（UpdateSubscriptions 只让目标学生收到老师的麦克风），
+       * 所以学生端没有任何"订阅老师"的动作；这里只如实反映"能不能听到"。
+       * `blocked` 时界面会给一个"点击播放声音"的入口（自动播放策略的要求）。
+       */
+      active.onTeacherAudioChanged((next) => {
+        teacherAudio.value = next
       }),
     )
   }
@@ -754,9 +1123,11 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
   }
 
   /**
-   * 实时事件 → 会话状态（§46 / §49）。
+   * 实时事件 → 会话状态（§46 / §49 / §25 / §31）。
    *
-   * 只处理"发给学生本人"的三类事件；其余类型根本不进这里（见 realtime store 的路由）。
+   * 只处理"发给学生本人"的事件；其余类型根本不进这里（见 realtime store 的路由）。
+   * `PRIVATE_TALK_*` 是 Phase 10 加进来的三兄弟，它们的共同点是**只描述老师与
+   * 我之间的那段沟通**：载荷里没有任何其他学生的字段（§26）。
    */
   function applyRealtimeEvent(event: RealtimeEvent): void {
     switch (event.type) {
@@ -776,6 +1147,42 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
       case 'SCREEN_RESTORED':
         if (!isCurrentSession(event.data.sessionId)) return
         handleServerScreenRestored()
+        break
+      case 'PRIVATE_TALK_REQUEST':
+        /**
+         * 老师想和我通话，而我还没开麦（§25：服务端只在学生麦克风未开启时才发它）。
+         *
+         * WHY 只在这里**显示提示**：§25 明确老师不能绕过浏览器权限远程打开麦克风，
+         * 所以收到这条事件绝不等于"开麦"——真正的 `getUserMedia` 只能由学生点击触发
+         * （见 acceptTalkRequest）。这里连麦克风状态都不碰。
+         */
+        if (isSessionFinished()) return
+        privateTalk.value = applyTalkRequest(
+          privateTalk.value,
+          event.data.teacherDisplayName,
+          micState.value === 'on',
+        )
+        break
+      case 'PRIVATE_TALK_STARTED':
+        /**
+         * 老师选中了我（§31）。老师那版的载荷没有 `teacherDisplayName`，学生端只认
+         * 学生版——拿到老师版说明这条消息不该发给我，忽略比猜一个姓名诚实。
+         */
+        if (isSessionFinished()) return
+        if (!('teacherDisplayName' in event.data)) return
+        privateTalk.value = applyTalkStarted(
+          privateTalk.value,
+          event.data.teacherDisplayName,
+          micState.value === 'on',
+        )
+        break
+      case 'PRIVATE_TALK_ENDED':
+        /**
+         * 结束（§31 的 TALKING → IDLE）。按 `sessionId` 匹配（就是我自己的会话），
+         * 与 SCREEN_LOST 用同一把键：老师版载荷里的 `studentId` 对学生端没有意义。
+         */
+        if (!isCurrentSession(event.data.sessionId)) return
+        clearPrivateTalk()
         break
       default:
         break
@@ -834,6 +1241,9 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     phase.value = 'closed'
     failure.value = null
     screenLostByServer.value = false
+    // 先清掉那段语音沟通：`teardownRoom()` 释放设备与连接，但"正在与老师语音沟通"
+    // 是**界面状态**，课堂都结束了还挂着它就是撒谎。
+    clearPrivateTalk()
     void teardownRoom()
     releaseCapture()
     credentials = null
@@ -915,6 +1325,7 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     if (!closedByTeacher) await settleWithin(reportLeave(), 1500)
     await teardownRoom()
     releaseCapture()
+    clearPrivateTalk()
     credentials = null
     classroomId = null
     failure.value = null
@@ -946,10 +1357,13 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     }
     releaseCapture()
     /**
-     * 摄像头必须在这里同步释放。`stop()` 是同步的，所以卸载路径能真正做到"灯立刻灭"；
-     * 而断开连接是异步的、很可能跑不完（浏览器会在请求完成前销毁页面）。
+     * 摄像头与麦克风必须在这里同步释放。`stop()` 是同步的，所以卸载路径能真正做到
+     * "灯立刻灭"；而断开连接是异步的、很可能跑不完（浏览器会在请求完成前销毁页面）。
+     * 麦克风比摄像头更需要这一步：设备不能被后台占着（§25/§31）。
      */
     dropCamera()
+    dropMicrophone()
+    clearPrivateTalk()
     credentials = null
     classroomId = null
     if (phase.value !== 'closed') phase.value = 'left'
@@ -975,6 +1389,9 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     reconnecting.value = false
     screenLostByServer.value = false
     leaveReported = false
+    micState.value = 'off'
+    micFailure.value = null
+    clearPrivateTalk()
     phase.value = 'idle'
   }
 
@@ -1006,6 +1423,27 @@ export const useMediaSessionStore = defineStore('student-media-session', () => {
     cameraActionLabel,
     toggleCamera,
     disableCamera,
+    micState,
+    micFailure,
+    micMuted,
+    canUseMicrophone,
+    isMicOn,
+    isMicRequesting,
+    hasMicFailure,
+    micActionLabel,
+    isMicrophoneAudible,
+    hasTalkRequest,
+    isTalkingWithTeacher,
+    talkRequestTitle,
+    talkActiveText,
+    privateTalk,
+    teacherAudio,
+    toggleMicrophone,
+    disableMicrophone,
+    acceptTalkRequest,
+    declineTalk,
+    toggleSelfMute,
+    resumeTeacherAudio,
     prepare,
     begin,
     publishCapture,

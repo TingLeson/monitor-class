@@ -24,6 +24,7 @@
 | [media/webrtc-basics.md](media/webrtc-basics.md) | Track/Source、为什么课堂是 1 上行 N 下行、`autoSubscribe=false` 的理由、客户端与服务端各自能证明什么 | Phase 6 |
 | [media/livekit-architecture.md](media/livekit-architecture.md) | Room/Participant/Track、Token 权限位逐字段依据、identity 为什么必须 opaque、Room 生命周期、Cloud 与本地容器两种模式 | Phase 6 |
 | [media/track-permissions.md](media/track-permissions.md) | 谁能发布/订阅什么：Token 权限位、服务端 `UpdateSubscriptions` 撤销、客户端 `autoSubscribe=false` 三层落点，以及「合作型客户端可强制、恶意客户端不可强制」的边界 | Phase 7 |
+| [media/private-audio.md](media/private-audio.md) | 私密语音设计：IDLE→TALKING(student)→IDLE 状态机、`UpdateSubscriptions` 如何在 SFU 收口"只有被选中的学生听到老师"、学生→老师单向、双向未开麦时的行为、切换与撤销时机、单实例限制与威胁模型边界 | Phase 10 |
 | [media/sfu.md](media/sfu.md) | SFU 与 Mesh/MCU 的取舍、规模假设与带宽量级、为什么不能用假 `<video>` 标签压测 | Phase 6 |
 
 ## 计划中的文档（按 Phase 产出）
@@ -32,7 +33,6 @@
 | --- | --- | --- |
 | `labs/browser-screen-capture.md` | Screen Capture API、MediaStream/Track、`displaySurface`、浏览器隐私边界 | 5 |
 | `architecture/media-plane.md` | 媒体面边界的完整论述（当前要点已分布在 overview / control-plane / realtime-flow 中） | 待定 |
-| `media/private-audio.md` | 老师私密语音状态机、订阅权限切换、学生未授权麦克风时的行为 | 10 |
 | `deployment/local.md` | 本地环境细节（与 setup.md 互链） | 0/11 |
 | `deployment/production.md` | HTTPS、TURN/TLS、反代、限流、指标、多网络测试 | 11 |
 

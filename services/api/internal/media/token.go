@@ -27,10 +27,13 @@ const (
 	// Optional is the load-bearing word: a camera may appear, disappear and come back
 	// while the session stays ONLINE, so nothing in the state machine may depend on it.
 	PublishCamera PublishSource = "CAMERA"
-	// PublishMicrophone is Phase 10 (§76) for both roles: the student's own microphone
-	// and the teacher's private talk. It is deliberately still NOT granted to a student
-	// token — a source that can be published before the control plane handles its events
-	// is media nobody observes, which is exactly the kind of gap §33 exists to prevent.
+	// PublishMicrophone is Phase 10 (§76) for both roles: the student's own microphone and
+	// the teacher's private talk. The student grant arrives in the same phase as the
+	// events it produces (§13/§25: MIC_STARTED / MIC_STOPPED and MIC_CHANGED), because a
+	// source that can be published before the control plane handles its events is media
+	// nobody observes — exactly the gap §33 exists to prevent. Subscribing to the
+	// teacher's microphone is a separate question: it is decided per student, at runtime,
+	// by RoomService.UpdateSubscriptions (§31, see privatetalk.go).
 	PublishMicrophone PublishSource = "MICROPHONE"
 )
 

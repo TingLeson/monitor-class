@@ -6,6 +6,7 @@ import {
   type MediaCredentials,
   type MediaDisconnectReason,
   type ScreenPublisherRoom,
+  type TeacherAudioState,
 } from '../lib/media/media-room.ts'
 
 /**
@@ -33,6 +34,16 @@ export interface FakePublisherRoom {
   readonly unpublishCalls: number
   /** 撤下摄像头的次数（断言"关闭 = unpublish + stop"里的前一半）。 */
   readonly unpublishCameraCalls: number
+  /** 发布过的麦克风轨道（§25）。与屏幕/摄像头**分开记**：三条轨道必须独立开关。 */
+  readonly publishedMicrophoneTracks: MediaStreamTrack[]
+  /** 撤下麦克风的次数。 */
+  readonly unpublishMicrophoneCalls: number
+  /** §31：老师私密语音的音频状态（`blocked` 时界面要给"点击播放"）。 */
+  onTeacherAudioChanged(listener: (state: TeacherAudioState) => void): () => void
+  resumeTeacherAudio(): Promise<boolean>
+  readonly resumeAudioCalls: number
+  /** 测试专用：模拟"服务端把老师麦克风推下来了 / 收走了"。 */
+  emitTeacherAudio(state: TeacherAudioState): void
   readonly disconnectCalls: number
   /**
    * 让接下来的 connect / publish 失败。
@@ -44,6 +55,8 @@ export interface FakePublisherRoom {
   publishError: Error | null
   /** 发布摄像头时的失败开关（与屏幕分开：摄像头失败不能污染屏幕那条路径）。 */
   publishCameraError: Error | null
+  /** 发布麦克风时的失败开关（同上：麦克风失败不能污染另外两条路径）。 */
+  publishMicrophoneError: Error | null
   emitQuality(quality: ConnectionQualityLevel): void
   emitDisconnected(reason?: MediaDisconnectReason): void
   emitReconnecting(): void
@@ -60,6 +73,7 @@ export interface PublisherRoomHarness {
     connectError: Error | null
     publishError: Error | null
     publishCameraError: Error | null
+    publishMicrophoneError: Error | null
     /**
      * 让 publish 在"成功"的同时把轨道结束掉。
      *
@@ -87,6 +101,7 @@ export function installFakePublisherRoom(
     connectError: options.connectError ?? null,
     publishError: options.publishError ?? null,
     publishCameraError: null as Error | null,
+    publishMicrophoneError: null as Error | null,
     endTrackOnPublish: false,
   }
 
@@ -113,19 +128,25 @@ function makeFakePublisherRoom(flags: {
   connectError: Error | null
   publishError: Error | null
   publishCameraError: Error | null
+  publishMicrophoneError: Error | null
   endTrackOnPublish: boolean
 }): FakePublisherRoom {
   const qualityListeners: ((quality: ConnectionQualityLevel) => void)[] = []
   const disconnectedListeners: ((reason: MediaDisconnectReason) => void)[] = []
   const reconnectingListeners: (() => void)[] = []
   const reconnectedListeners: (() => void)[] = []
+  const teacherAudioListeners: ((state: TeacherAudioState) => void)[] = []
 
   const publishedTracks: MediaStreamTrack[] = []
   const publishedCameraTracks: MediaStreamTrack[] = []
+  const publishedMicrophoneTracks: MediaStreamTrack[] = []
   let connectCalls = 0
   let unpublishCalls = 0
   let unpublishCameraCalls = 0
+  let unpublishMicrophoneCalls = 0
   let disconnectCalls = 0
+  let resumeAudioCalls = 0
+  let teacherAudio: TeacherAudioState = 'idle'
   let quality: ConnectionQualityLevel = 'good'
 
   const self: FakePublisherRoom = {
@@ -154,6 +175,27 @@ function makeFakePublisherRoom(flags: {
         unpublishCameraCalls += 1
         return Promise.resolve()
       },
+      publishMicrophoneTrack(track: MediaStreamTrack): Promise<void> {
+        if (flags.publishMicrophoneError) return Promise.reject(flags.publishMicrophoneError)
+        publishedMicrophoneTracks.push(track)
+        return Promise.resolve()
+      },
+      unpublishMicrophoneTrack(): Promise<void> {
+        unpublishMicrophoneCalls += 1
+        return Promise.resolve()
+      },
+      onTeacherAudioChanged(listener) {
+        teacherAudioListeners.push(listener)
+        listener(teacherAudio)
+        return () => removeFrom(teacherAudioListeners, listener)
+      },
+      resumeTeacherAudio(): Promise<boolean> {
+        resumeAudioCalls += 1
+        // 与真实适配层一致：手势之后就能出声（`blocked` → `playing`）。
+        teacherAudio = teacherAudio === 'idle' ? 'idle' : 'playing'
+        for (const listener of [...teacherAudioListeners]) listener(teacherAudio)
+        return Promise.resolve(teacherAudio === 'playing')
+      },
       disconnect(): Promise<void> {
         disconnectCalls += 1
         return Promise.resolve()
@@ -181,11 +223,33 @@ function makeFakePublisherRoom(flags: {
     },
     publishedTracks,
     publishedCameraTracks,
+    publishedMicrophoneTracks,
     get unpublishCalls() {
       return unpublishCalls
     },
     get unpublishCameraCalls() {
       return unpublishCameraCalls
+    },
+    get unpublishMicrophoneCalls() {
+      return unpublishMicrophoneCalls
+    },
+    get resumeAudioCalls() {
+      return resumeAudioCalls
+    },
+    onTeacherAudioChanged(listener) {
+      teacherAudioListeners.push(listener)
+      listener(teacherAudio)
+      return () => removeFrom(teacherAudioListeners, listener)
+    },
+    resumeTeacherAudio() {
+      resumeAudioCalls += 1
+      teacherAudio = teacherAudio === 'idle' ? 'idle' : 'playing'
+      for (const listener of [...teacherAudioListeners]) listener(teacherAudio)
+      return Promise.resolve(teacherAudio === 'playing')
+    },
+    emitTeacherAudio(state: TeacherAudioState) {
+      teacherAudio = state
+      for (const listener of [...teacherAudioListeners]) listener(state)
     },
     get disconnectCalls() {
       return disconnectCalls
@@ -207,6 +271,12 @@ function makeFakePublisherRoom(flags: {
     },
     set publishCameraError(next: Error | null) {
       flags.publishCameraError = next
+    },
+    get publishMicrophoneError() {
+      return flags.publishMicrophoneError
+    },
+    set publishMicrophoneError(next: Error | null) {
+      flags.publishMicrophoneError = next
     },
     emitQuality(next) {
       quality = next

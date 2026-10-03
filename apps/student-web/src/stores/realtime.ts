@@ -158,10 +158,13 @@ export const useRealtimeStore = defineStore('student-realtime', () => {
   /**
    * 事件路由（§47 的收件人表）。
    *
-   * `STUDENT_*` / `CAMERA_*` / `MIC_*` / `PRIVATE_TALK_*` 都不该发给学生：
-   * 服务端按 §26 只会推"学生自己被授权的那间课堂 + 自己的会话"。
-   * 万一收到，这里**什么也不做**——不是因为懒，而是因为学生端多一条别的学生的
-   * 数据，就等于把"谁在线、谁屏幕断了"泄漏给了同学（§26 的学生间隔离）。
+   * `STUDENT_*` / `CAMERA_*` / `MIC_*` 都不该发给学生：服务端按 §26 只会推
+   * "学生自己被授权的那间课堂 + 自己的会话"。万一收到，这里**什么也不做**——
+   * 不是因为懒，而是因为学生端多一条别的学生的数据，就等于把"谁在线、谁屏幕断了、
+   * 谁的麦克风开着"泄漏给了同学（§26 的学生间隔离）。
+   *
+   * `PRIVATE_TALK_*` 是唯一发给学生的"关于别人"的事件，而它说的其实只有老师自己：
+   * 谁在和我讲话（§31）。它的载荷里没有任何其他学生的字段，这正是它安全的原因。
    */
   function handleEvent(event: RealtimeEvent): void {
     lastEventAt.value = event.at
@@ -178,6 +181,9 @@ export const useRealtimeStore = defineStore('student-realtime', () => {
         break
       case 'SCREEN_LOST':
       case 'SCREEN_RESTORED':
+      case 'PRIVATE_TALK_REQUEST':
+      case 'PRIVATE_TALK_STARTED':
+      case 'PRIVATE_TALK_ENDED':
         mediaSession.applyRealtimeEvent(event)
         break
       default:

@@ -141,7 +141,7 @@ export function makeScreenRestoredEvent(
   }
 }
 
-/** `CAMERA_CHANGED` / `MIC_CHANGED`（Phase 9/10 才会有，§24/§25）。 */
+/** `CAMERA_CHANGED`（Phase 9 才会有，§24）。 */
 export function makeCameraChangedEvent(
   overrides: Partial<{ studentId: string; sessionId: string; active: boolean }> = {},
 ): RealtimeEvent<'CAMERA_CHANGED'> {
@@ -149,6 +149,53 @@ export function makeCameraChangedEvent(
     type: 'CAMERA_CHANGED',
     at: AT,
     data: { studentId: 'student-1', sessionId: 'session-1', active: true, ...overrides },
+  }
+}
+
+/**
+ * `MIC_CHANGED`（Phase 10，§25）：**只有 owner 老师**会收到。
+ *
+ * 注意 §26：这条消息永远不会发给学生——同学之间连"谁的麦克风开着"都不该知道。
+ */
+export function makeMicChangedEvent(
+  overrides: Partial<{ studentId: string; sessionId: string; active: boolean }> = {},
+): RealtimeEvent<'MIC_CHANGED'> {
+  return {
+    type: 'MIC_CHANGED',
+    at: AT,
+    data: { studentId: 'student-1', sessionId: 'session-1', active: true, ...overrides },
+  }
+}
+
+/**
+ * `PRIVATE_TALK_STARTED`：**老师**收到的形状（§47 的收件人表：带目标学生身份）。
+ *
+ * 学生那一版只有 `teacherDisplayName`；老师版没有它——两种形状刻意不同，
+ * 让"事件发错了人"在类型层面就看得出来。
+ */
+export function makeTeacherPrivateTalkStartedEvent(
+  overrides: Partial<{ studentId: string; sessionId: string; displayName: string }> = {},
+): RealtimeEvent<'PRIVATE_TALK_STARTED'> {
+  return {
+    type: 'PRIVATE_TALK_STARTED',
+    at: AT,
+    data: {
+      studentId: 'student-1',
+      sessionId: 'session-1',
+      displayName: '张三',
+      ...overrides,
+    },
+  }
+}
+
+/** `PRIVATE_TALK_ENDED`：目标学生与老师都会收到（§31）。 */
+export function makePrivateTalkEndedEvent(
+  overrides: Partial<{ studentId: string; sessionId: string }> = {},
+): RealtimeEvent<'PRIVATE_TALK_ENDED'> {
+  return {
+    type: 'PRIVATE_TALK_ENDED',
+    at: AT,
+    data: { studentId: 'student-1', sessionId: 'session-1', ...overrides },
   }
 }
 

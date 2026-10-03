@@ -4,11 +4,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { makeClassroom, makeOpenClassroom } from '../../__tests__/fixtures.ts'
 import {
   installFakeRealtimeSocket,
+  makeMicChangedEvent,
+  makePrivateTalkEndedEvent,
   makeRoomClosedEvent,
   makeScreenLostEvent,
   makeStudentOnlineEvent,
+  makeTeacherPrivateTalkStartedEvent,
   type RealtimeHarness,
 } from '../../__tests__/realtime-fixtures.ts'
+import { makeMonitorStudent } from '../../__tests__/monitor-fixtures.ts'
 import { TEACHER_REALTIME_PATH } from '../../lib/realtime-channel.ts'
 import { useClassroomsStore } from '../classrooms.ts'
 import { useMonitorStore } from '../monitor.ts'
@@ -33,6 +37,16 @@ const { getMonitorMock, requestMediaTokenMock } = vi.hoisted(() => ({
 vi.mock('../../lib/teacher-monitor-api.ts', () => ({
   getMonitor: getMonitorMock,
   requestMediaToken: requestMediaTokenMock,
+}))
+
+/**
+ * 私密语音接口（§31）。`load()` 会读一次"当前目标"来恢复界面记忆，
+ * 不替身的话每个用例都会真的去 fetch 一次（既慢又会打出连接失败的噪音）。
+ */
+vi.mock('../../lib/private-talk-api.ts', () => ({
+  startPrivateTalk: vi.fn(),
+  stopPrivateTalk: vi.fn(),
+  getPrivateTalk: vi.fn().mockResolvedValue(null),
 }))
 
 const { getClassroomMock, listClassroomsMock } = vi.hoisted(() => ({
@@ -171,6 +185,34 @@ describe('老师端实时通道', () => {
     expect(monitor.students[0]?.sessionStatus).toBe('SCREEN_LOST')
     // 课堂列表的状态没有被这些学生事件带偏。
     expect(classrooms.items[0]?.status).toBe('OPEN')
+  })
+
+  it('§31/§32：MIC_CHANGED 与 PRIVATE_TALK_* 都路由到监督 store', async () => {
+    const monitor = useMonitorStore()
+    await monitor.load('room-1')
+    getMonitorMock.mockResolvedValue([makeMonitorStudent({ microphone: { active: false } })])
+    await monitor.refresh()
+
+    const realtime = useRealtimeStore()
+    realtime.start()
+    harness.open()
+
+    harness.emit(makeMicChangedEvent({ active: true }))
+    expect(monitor.students[0]?.microphone).toEqual({ active: true })
+
+    // 目标可能是在另一个标签页里发起的：这条事件必须真的走进 store。
+    harness.emit(
+      makeTeacherPrivateTalkStartedEvent({
+        studentId: 'student-1',
+        sessionId: 'session-1',
+        displayName: '张三',
+      }),
+    )
+    expect(monitor.talkTarget?.studentId).toBe('student-1')
+
+    // 沟通结束时后端会广播 ENDED：界面必须能回到"无目标"。
+    harness.emit(makePrivateTalkEndedEvent({ sessionId: 'session-1' }))
+    expect(monitor.talkTarget).toBeNull()
   })
 
   it('§47：重连成功后自动补一次快照（断线期间的事件补不回来）', async () => {

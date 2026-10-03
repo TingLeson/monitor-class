@@ -2,6 +2,7 @@ import { ApiError, isApiError, type RealtimeConnectionState } from '@classwatch/
 import type {
   MonitorStudent,
   MonitorTileState,
+  PrivateTalkTarget,
   RealtimeEvent,
   ScreenStateData,
   StudentOfflineReason,
@@ -14,6 +15,7 @@ import {
   createMonitorRoom,
   type CameraSubscription,
   type MediaCredentials,
+  type MicrophoneSubscription,
   type MonitorRoom,
   type ScreenQuality,
   type ScreenSubscription,
@@ -23,11 +25,26 @@ import {
   deriveMonitorTileState,
   isStudentEntered,
   monitorFallbackPollMs,
+  shouldSubscribeMicrophone,
   shouldSubscribeScreen,
   type MonitorBadge,
   type MonitorMediaState,
   describeMonitorBadge,
 } from '../lib/monitor-status.ts'
+import {
+  describeTeacherMicFailure,
+  releaseTeacherMicrophone,
+  requestTeacherMicrophone,
+  toTeacherMicFailureKindOf,
+  type TeacherMicrophoneCapture,
+  type TeacherMicState,
+} from '../lib/teacher-mic.ts'
+import {
+  canStartPrivateTalk,
+  toPrivateTalkFailure,
+  type PrivateTalkFailure,
+} from '../lib/private-talk.ts'
+import { getPrivateTalk, startPrivateTalk, stopPrivateTalk } from '../lib/private-talk-api.ts'
 import { getMonitor, requestMediaToken } from '../lib/teacher-monitor-api.ts'
 
 /**
@@ -65,6 +82,14 @@ import { getMonitor, requestMediaToken } from '../lib/teacher-monitor-api.ts'
  *    真正的新增学生一律走快照刷新（名单只有后端说了算）。
  * 8. **Focus 放在 store 而不是视图**：它不是纯视图开关，而是直接决定订阅画质
  *    （§30 的"Focus 优先较高画质"）。放在视图里，画质决策就会分裂成两处。
+ * 9. **音频只订一路，而且只订 Focus 那一个**（§32）。`desiredMicrophoneIdentity()`
+ *    返回单值而不是集合，让"网格里绝不同时开多路音频"这条不变量在结构上成立——
+ *    多路混在一起之后老师分辨不出是谁在说话，这条能力本身就没有意义了。
+ *    页面上必须**写出来**在听谁：音频是看不见的，界面得替老师记住这件事。
+ * 10. **私密语音是服务端状态**（§31）：`talkTarget` 只会被 POST/GET 响应与
+ *    `PRIVATE_TALK_STARTED/ENDED` 改写，切换目标就是再 POST 一次（后端负责撤销旧的）。
+ *    本地绝不拼一个目标出来——拼错 sessionId 会让界面显示"正在与张三讲话"，
+ *    而声音发给了别人。
  */
 export const useMonitorStore = defineStore('teacher-monitor', () => {
   /** 兜底快照的合并窗口：一次事件风暴（10 个人同时进来）只换一次请求。 */
@@ -138,6 +163,40 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
    */
   const cameraMediaStates = ref<Record<string, MonitorMediaState>>({})
 
+  /**
+   * 已建立的**麦克风**订阅：sessionId → MicrophoneSubscription（§32）。
+   *
+   * 第三张表。§32 的核心不变量是"网格里绝不同时开多路音频"，而这条不变量由
+   * **计划**保证（`desiredMicrophoneSubscriptions()` 最多返回一个 identity），
+   * 不是因为这里只存得下一个。
+   */
+  const microphoneSubscriptions = shallowRef<Record<string, MicrophoneSubscription>>({})
+
+  /** 麦克风订阅的媒体状态（与屏幕/摄像头各记一份，避免互相污染）。 */
+  const microphoneMediaStates = ref<Record<string, MonitorMediaState>>({})
+
+  /* ---------------------------------------------------------------------- */
+  /* 老师自己的麦克风与私密语音（§27 / §31）                                  */
+  /* ---------------------------------------------------------------------- */
+
+  /** 老师麦克风的状态机（与学生端同形：off / requesting / on / error）。 */
+  const teacherMicState = ref<TeacherMicState>('off')
+  /** 老师麦克风失败的中文文案（来自 teacher-mic.ts 的词表，含下一步动作）。 */
+  const teacherMicFailure = ref<string | null>(null)
+
+  /**
+   * 当前私密语音目标（§31：同一时刻只有一个）。
+   *
+   * 它是**服务端状态**的镜像：只会被 POST/GET 的响应、以及
+   * `PRIVATE_TALK_STARTED` / `PRIVATE_TALK_ENDED` 事件改写。
+   * 绝不从 `MonitorStudent` 推断——见 private-talk-api.ts 的说明。
+   */
+  const talkTarget = ref<PrivateTalkTarget | null>(null)
+  /** 正在发请求（按钮 loading；防止老师连点导致两次 POST）。 */
+  const talkBusy = ref(false)
+  /** 上一次私密语音操作的失败（成功时清空）。 */
+  const talkFailure = ref<PrivateTalkFailure | null>(null)
+
   /** 老师正在 Focus 看的学生（§30）；null = 在网格视图。 */
   const focusedStudentId = ref<string | null>(null)
 
@@ -178,6 +237,28 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
    * 而屏幕上一切正常。
    */
   const pendingCamera = new Set<string>()
+  /**
+   * 正在订阅麦克风中的 sessionId（同样与另外两个集合分开）。
+   *
+   * WHY 三个集合：屏幕、摄像头、麦克风是三次互相独立的请求。共用一个集合会让
+   * "屏幕正在订阅"把麦克风那次挡掉——表现是 Focus 面板上说"正在听"，耳机里没有声音。
+   */
+  const pendingMicrophone = new Set<string>()
+  /**
+   * 老师自己的麦克风采集。
+   *
+   * 与订阅表一样：持有的是浏览器宿主对象（MediaStreamTrack），放进响应式 state
+   * 会被 Vue 深度代理。界面需要的只是 `teacherMicState`。
+   */
+  let teacherMicCapture: TeacherMicrophoneCapture | null = null
+  /**
+   * 老师麦克风请求序号。
+   *
+   * WHY：`getUserMedia` 与 publish 都是异步的，而老师可以在几百毫秒里点开又点关。
+   * 没有序号的话，"关闭"之后才回来的那条轨道会覆盖关闭动作的结果——界面显示已关闭，
+   * 而系统麦克风指示灯还亮着（而且他可能真的还在被那一个学生听见）。
+   */
+  let teacherMicSeq = 0
   /**
    * 当前在视口里的学生（studentId，不是 sessionId）。
    *
@@ -272,6 +353,234 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
     return cameraMediaStates.value[student.sessionId] ?? 'none'
   }
 
+  /**
+   * 某个学生的麦克风订阅（§32）；没有订阅时是 null。
+   *
+   * 视图**必须**用它来说"正在听谁的麦克风"：音频是看不见的，界面上不写出来，
+   * 老师就没有任何办法知道自己的耳机里正在放什么（以及是不是正在被别人听见）。
+   */
+  function microphoneSubscriptionOf(student: MonitorStudent): MicrophoneSubscription | null {
+    if (student.sessionId === null) return null
+    return microphoneSubscriptions.value[student.sessionId] ?? null
+  }
+
+  /** 某个学生麦克风订阅的媒体状态（没有记录时是 'none'）。 */
+  function microphoneMediaStateOf(student: MonitorStudent): MonitorMediaState {
+    if (student.sessionId === null) return 'none'
+    return microphoneMediaStates.value[student.sessionId] ?? 'none'
+  }
+
+  /**
+   * 老师**现在**是不是正在听这个学生的麦克风。
+   *
+   * 判据是"有订阅"而不是"DTO 说他开着麦"：两者在切换的那几秒里会不一致，
+   * 而老师需要的是"我耳机里现在真的有他的声音吗"这个事实。
+   */
+  function isListeningToMicrophone(student: MonitorStudent): boolean {
+    return microphoneSubscriptionOf(student) !== null
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* 老师自己的麦克风（§27 / §31）                                           */
+  /* ---------------------------------------------------------------------- */
+
+  const isTeacherMicOn = computed(() => teacherMicState.value === 'on')
+  const isTeacherMicRequesting = computed(() => teacherMicState.value === 'requesting')
+  const teacherMicActionLabel = computed(() =>
+    isTeacherMicOn.value ? '关闭麦克风' : '🎤 开启麦克风',
+  )
+
+  /**
+   * 释放老师麦克风采集（幂等）。
+   *
+   * WHY 必须真的 `stop()`：它是唯一能让**操作系统级**麦克风指示灯灭掉的动作。
+   * 老师点了"关闭麦克风"而灯还亮着，等于让他在不知情的情况下继续被采集。
+   */
+  function releaseTeacherMic(): void {
+    releaseTeacherMicrophone(teacherMicCapture)
+    teacherMicCapture = null
+  }
+
+  /** 连接已经不可用时丢弃老师麦克风（不试图 unpublish：没有信令通道）。 */
+  function dropTeacherMicrophone(): void {
+    teacherMicSeq += 1
+    releaseTeacherMic()
+    teacherMicState.value = 'off'
+    teacherMicFailure.value = null
+  }
+
+  /**
+   * 开启老师麦克风（§27/§31）。
+   *
+   * 顺序与音频订阅无关，只有一条纪律：**先申请设备、再发布**。反过来的话，
+   * publish 成功而设备授权失败，服务端会先看到一条麦克风发布再消失。
+   *
+   * 这个函数**从不抛出**：失败写在 `teacherMicState` / `teacherMicFailure` 里，
+   * 由界面显示一句可执行的话。
+   */
+  async function enableTeacherMicrophone(): Promise<void> {
+    if (teacherMicState.value === 'requesting' || teacherMicState.value === 'on') return
+    const active = room
+    /**
+     * 没有媒体连接时不申请设备权限：一条没有房间可发布的轨道只会亮着麦克风指示灯，
+     * 而谁也听不到（§31 的语音沟通根本建立不起来）。
+     */
+    if (active === null) return
+
+    const seq = ++teacherMicSeq
+    teacherMicState.value = 'requesting'
+    teacherMicFailure.value = null
+    const abandoned = (): boolean => seq !== teacherMicSeq || room !== active
+
+    try {
+      const next = await requestTeacherMicrophone()
+      if (abandoned()) {
+        // 请求飞行期间被放弃：这条轨道没有主人了，必须立刻释放（灯必须灭）。
+        releaseTeacherMicrophone(next)
+        return
+      }
+      teacherMicCapture = next
+      next.onEnded(() => {
+        if (teacherMicCapture !== next) return
+        /**
+         * 设备被拔出 / 被别的程序抢走：界面必须回到"没开"，并撤下那条已经死掉的发布
+         * （否则服务端会一直认为老师的麦克风还在，`TEACHER_MIC_REQUIRED` 也不会再出现）。
+         */
+        releaseTeacherMic()
+        void active.unpublishMicrophoneTrack().catch(() => undefined)
+        teacherMicState.value = 'error'
+        teacherMicFailure.value = describeTeacherMicFailure('track-ended')
+      })
+
+      await active.publishMicrophoneTrack(next.track)
+      if (abandoned()) {
+        await active.unpublishMicrophoneTrack().catch(() => undefined)
+        return
+      }
+      teacherMicState.value = 'on'
+      /**
+       * 开麦成功之后，上一次那条"请先开启你的麦克风"的提示已经不成立了：
+       * 继续把它留在 Focus 面板上，老师会以为还需要再点一次。
+       */
+      if (talkFailure.value?.micRequired) talkFailure.value = null
+    } catch (cause) {
+      if (abandoned()) return
+      releaseTeacherMic()
+      teacherMicState.value = 'error'
+      teacherMicFailure.value = describeTeacherMicFailure(toTeacherMicFailureKindOf(cause))
+    }
+  }
+
+  /**
+   * 关闭老师麦克风：**unpublish + 真正 stop**。
+   *
+   * 两步都要做，理由与学生端完全一致（只 unpublish 灯不灭；只 stop 服务端留着
+   * 一条没有声音的发布）。先发信令再释放设备：老师点了"关闭"，录音必须立刻停。
+   */
+  function disableTeacherMicrophone(): void {
+    if (teacherMicState.value === 'off' && teacherMicCapture === null) return
+    teacherMicSeq += 1
+    const active = room
+    if (active !== null) void active.unpublishMicrophoneTrack().catch(() => undefined)
+    releaseTeacherMic()
+    teacherMicState.value = 'off'
+    teacherMicFailure.value = null
+  }
+
+  /** 监督墙上的麦克风开关入口。 */
+  function toggleTeacherMicrophone(): void {
+    if (teacherMicState.value === 'on') disableTeacherMicrophone()
+    else void enableTeacherMicrophone()
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* 私密语音（§31）                                                         */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * 发起（或切换）与某个学生的私密语音（§31）。
+   *
+   * 切换**不需要**先结束：后端在设置新目标之前会撤销旧的订阅（§31 的"切换"），
+   * 前端多发一次 DELETE 只会在中间留下一个"没有目标"的窗口——那个窗口里老师的
+   * 麦克风可能被整个房间听到，而这正是本 Phase 最不能出现的情况。
+   *
+   * 未进入课堂的学生在这里直接拒绝（`canStartPrivateTalk`）：让老师点一个注定
+   * 失败的按钮，等于把产品事实变成一次故障提示。
+   */
+  async function startTalk(student: MonitorStudent): Promise<void> {
+    const classroomId = currentClassroomId
+    if (classroomId === null || talkBusy.value) return
+    if (!canStartPrivateTalk(student)) return
+    talkBusy.value = true
+    talkFailure.value = null
+    try {
+      const target = await startPrivateTalk(classroomId, student.studentId)
+      /**
+       * 响应里的 `target` 就是权威答案。理论上它一定非空（POST 成功 ⇒ 有目标），
+       * 但契约允许 null，所以这里按"没有目标"处理并给一句解释，而不是留一个
+       * 半信半疑的高亮状态。
+       */
+      talkTarget.value = target
+      if (target === null) talkFailure.value = toPrivateTalkFailure(new Error('empty-target'))
+    } catch (cause) {
+      talkFailure.value = toPrivateTalkFailure(cause)
+    } finally {
+      talkBusy.value = false
+    }
+  }
+
+  /** 结束私密语音（§31 的 TALKING → IDLE）。 */
+  async function stopTalk(): Promise<void> {
+    const classroomId = currentClassroomId
+    if (classroomId === null || talkBusy.value) return
+    talkBusy.value = true
+    talkFailure.value = null
+    try {
+      await stopPrivateTalk(classroomId)
+      talkTarget.value = null
+    } catch (cause) {
+      talkFailure.value = toPrivateTalkFailure(cause)
+    } finally {
+      talkBusy.value = false
+    }
+  }
+
+  /**
+   * 读取服务端当前目标（页面加载时）。
+   *
+   * WHY 必须读：私密语音是服务端状态。老师刷新页面、或在另一个标签页里开过语音沟通，
+   * 不读一次就会出现"声音正在发出去，而界面上的按钮写着「语音沟通」"。
+   * 读取失败**不改变**界面（保持无目标），也不报错：它只是一次恢复尝试，
+   * 真正的目标会在下一次 `PRIVATE_TALK_STARTED` 或 `refresh()` 里对齐。
+   */
+  async function restoreTalkTarget(classroomId: string): Promise<void> {
+    try {
+      const target = await getPrivateTalk(classroomId)
+      /**
+       * 服务端说有个目标，而名单里没有这个人：他是被移出课堂之后才结束的。
+       * 这种情况下界面必须回到"无目标"——显示一个不在名单里的人只会让老师困惑。
+       */
+      talkTarget.value =
+        target !== null && students.value.some((student) => student.studentId === target.studentId)
+          ? target
+          : null
+    } catch {
+      // 见上：恢复失败保持"无目标"。
+    }
+  }
+
+  /** 清掉私密语音的界面状态（课堂结束、媒体断开、离开页面）。 */
+  function clearTalk(): void {
+    talkTarget.value = null
+    talkFailure.value = null
+    talkBusy.value = false
+  }
+
+  /** 某个学生是不是当前私密语音目标（Focus 面板与卡片高亮都用它）。 */
+  function isTalkTarget(student: MonitorStudent): boolean {
+    return talkTarget.value?.studentId === student.studentId
+  }
+
   /* ---------------------------------------------------------------------- */
   /* 订阅计划的输入（§52）                                                   */
   /* ---------------------------------------------------------------------- */
@@ -297,6 +606,11 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
    */
   function setFocusedStudent(studentId: string | null): void {
     focusedStudentId.value = studentId
+    /**
+     * 换一个学生看时清掉上一次的私密语音失败提示：那条错误说的是**上一个人**
+     * 发生了什么（"他不在课堂里"），留在新面板上会让老师以为这个学生也有问题。
+     */
+    talkFailure.value = null
     void reconcileSubscriptions()
   }
 
@@ -347,6 +661,13 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
         // 学生还在不在课堂上不是 LiveKit 能回答的问题（§51）。
         mediaConnected.value = false
         mediaError.value = '与课堂的媒体连接已经中断。请重试；重试会重新申请一次媒体凭据。'
+        /**
+         * 老师的麦克风必须在这里释放（§31）：连接没了，`on` 就不再成立
+         * （"已发布、学生听得到"），而且设备不能被后台占着。
+         * 那段私密语音也随之失效——继续显示"正在与张三语音沟通"就是撒谎。
+         */
+        dropTeacherMicrophone()
+        clearTalk()
         // 刻意**不**停掉兜底快照：画面断了不代表"谁在上课"这件事不再重要，
         // 而且它与媒体面完全独立（§33 的 Control Plane / Media Plane 分离）。
       }),
@@ -381,6 +702,18 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
       if (present.has(identity)) continue
       dropLocalCameraSubscription(identity)
       await active.unsubscribeCamera(identity)
+    }
+    /**
+     * 麦克风那一半同样（§32）。
+     *
+     * WHY 这一条比另外两条更急：音频**看不见**。学生已经离开、而订阅还挂在本地时，
+     * Focus 面板上仍然写着"正在听该学生的麦克风"——老师会以为设备坏了，
+     * 而实际上对面早就没人了。媒体层说人没了，界面上的这句话必须立刻消失。
+     */
+    for (const identity of Object.keys(microphoneSubscriptions.value)) {
+      if (present.has(identity)) continue
+      dropLocalMicrophoneSubscription(identity)
+      await active.unsubscribeMicrophone(identity)
     }
     await reconcileSubscriptions()
   }
@@ -480,6 +813,27 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
   }
 
   /**
+   * 现在**该**听谁的麦克风（§32）。
+   *
+   * 返回类型是 `string | null` 而不是集合，这是本函数存在的全部意义：
+   * §32 禁止网格里同时开多路音频——多路混在一起之后，老师分辨不出是谁在说话，
+   * 这条能力本身也就失去了价值。用 `Set` 会让"最多一个"变成一句口头约定，
+   * 而用单值让它在类型层面成立。
+   *
+   * 三道筛子，顺序即优先级：
+   * 1. 页面不可见 → 不订（老师切走了，没人听）；
+   * 2. 不是 Focus 对象 → 不订。§32 要的是"当前 Focus 学生的麦克风"，
+   *    而不是"每个可见卡片的麦克风"——后者正是要避免的叠音；
+   * 3. 业务上麦克风没开（或学生不在线）→ 不订（`shouldSubscribeMicrophone`）。
+   */
+  function desiredMicrophoneIdentity(): string | null {
+    if (pageHidden.value) return null
+    const focused = students.value.find(isFocusedStudent)
+    if (!focused || !shouldSubscribeMicrophone(focused)) return null
+    return focused.sessionId
+  }
+
+  /**
    * 协调入口：三路输入（可见性 / Focus / 页面隐藏）与轮询都调它。
    *
    * 串行化的理由见文件头第 6 点。重复调用是**廉价且安全**的：
@@ -548,6 +902,79 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
      * 只在真机上偶发的状态。这里只是把同一个计划里的另一半收敛掉。
      */
     await convergeCameraSubscriptions(active)
+
+    /**
+     * 麦克风也走**同一轮**协调（§32）。
+     *
+     * WHY 同一条理由：三路输入（可见性 / Focus / 页面隐藏）已经在上面合成过一遍计划，
+     * 音频另起一条链路就会出现"退出 Focus 了、耳机里还在放那个学生"这种
+     * 只会在真机上被发现的状态。而且它必须在**同一次**收敛里完成，
+     * 否则"最多一路音频"这条不变量会在两次协调之间被短暂破坏。
+     */
+    await convergeMicrophoneSubscription(active)
+  }
+
+  /**
+   * 麦克风订阅的收敛：**至多一条**。
+   *
+   * 先退掉所有不是当前应听对象的订阅，再补上那一个。因为计划是单值，
+   * 这个循环最多退掉一条、最多补上一条——"不会同时听到两个人"因此在代码结构上成立，
+   * 而不是靠调用方记得先退再订。
+   */
+  async function convergeMicrophoneSubscription(active: MonitorRoom): Promise<void> {
+    const desired = desiredMicrophoneIdentity()
+
+    for (const identity of Object.keys(microphoneSubscriptions.value)) {
+      if (identity === desired) continue
+      dropLocalMicrophoneSubscription(identity)
+      await active.unsubscribeMicrophone(identity)
+    }
+
+    if (desired !== null) await establishMicrophoneSubscription(active, desired)
+  }
+
+  /**
+   * 建立一条麦克风订阅并把结果写回状态（失败只影响"能不能听到"）。
+   *
+   * 与屏幕/摄像头一样的幂等 + pending 双保险：Focus 每 10 秒一轮的刷新、
+   * `MIC_CHANGED` 事件、轨道发布事件都会重算计划。
+   */
+  async function establishMicrophoneSubscription(
+    active: MonitorRoom,
+    identity: string,
+  ): Promise<void> {
+    if (microphoneSubscriptions.value[identity] !== undefined) return
+    if (pendingMicrophone.has(identity)) return
+    pendingMicrophone.add(identity)
+    microphoneMediaStates.value = { ...microphoneMediaStates.value, [identity]: 'pending' }
+    try {
+      const subscription = await active.subscribeMicrophone(identity)
+      if (subscription === null) {
+        /**
+         * 业务说他开着麦，媒体里却还没有这条轨道：可能是刚发布（webhook 比 SFU 快）。
+         * 保持 'none' 并等下一次协调——界面显示"正在连接该学生的麦克风…"，
+         * 而屏幕/摄像头完全不受影响。轨道发布事件会立刻再触发一轮。
+         */
+        microphoneMediaStates.value = { ...microphoneMediaStates.value, [identity]: 'none' }
+        return
+      }
+      microphoneSubscriptions.value = {
+        ...microphoneSubscriptions.value,
+        [identity]: markRaw(subscription),
+      }
+      microphoneMediaStates.value = { ...microphoneMediaStates.value, [identity]: 'subscribed' }
+    } catch {
+      microphoneMediaStates.value = { ...microphoneMediaStates.value, [identity]: 'failed' }
+    } finally {
+      pendingMicrophone.delete(identity)
+    }
+  }
+
+  /** 只清麦克风的本地记录（订阅对象与媒体状态）；不碰屏幕与摄像头。 */
+  function dropLocalMicrophoneSubscription(identity: string): void {
+    pendingMicrophone.delete(identity)
+    microphoneSubscriptions.value = omitKey(microphoneSubscriptions.value, identity)
+    microphoneMediaStates.value = { ...microphoneMediaStates.value, [identity]: 'none' }
   }
 
   /**
@@ -745,6 +1172,14 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
       if (focusedStudentId.value !== null && !next.some(isFocusedStudent)) {
         focusedStudentId.value = null
       }
+      /**
+       * 私密语音目标可能已经不在名单里了（学生被移出课堂）。不清掉的话，
+       * 页头会继续写着"正在与张三语音沟通"，而服务端的订阅目标早已不存在——
+       * 老师会对着一个空目标讲话。名单的权威是这次快照。
+       */
+      if (talkTarget.value !== null && !next.some(isTalkTargetStudent)) {
+        clearTalk()
+      }
       await reconcileSubscriptions()
     } catch (cause) {
       if (seq !== loadSeq) return
@@ -814,6 +1249,12 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
           camera: { active: false },
           microphone: { active: false },
         }))
+        /**
+         * 目标学生离开 ⇒ 私密语音不可能继续（§31）。**不**等 `PRIVATE_TALK_ENDED`：
+         * 那条事件会来，但"学生已经走了"这个事实此刻就成立，界面多显示一秒
+         * "正在与张三语音沟通"就是多一秒的谎报。
+         */
+        if (talkTarget.value !== null && talkTarget.value.studentId === studentId) clearTalk()
         // 下线即释放订阅：协调计划会发现这个人不再满足 shouldSubscribeScreen（§52）。
         if (changed) void reconcileSubscriptions()
         return
@@ -866,14 +1307,44 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
       }
       case 'MIC_CHANGED': {
         const { studentId, sessionId, active } = event.data
-        updateStudent(studentId, sessionId, 'MIC_CHANGED', (student) => ({
+        /**
+         * Phase 10（§25/§32）：只改 `microphone` 这一个字段。
+         *
+         * 事件证明不了别的——载荷里没有 `connection` / `joinedAt` / `sessionStatus`，
+         * 顺手"补一个看起来合理"的值就是造数据（§80）。麦克风也不改变会话状态
+         * （§21：屏幕才是 mandatory），所以这里连 `sessionStatus` 都不碰。
+         *
+         * 之后走**协调器**：Focus 中的学生一开麦，最多几百毫秒后老师就该听到声音
+         * （轨道发布事件也会触发同一轮协调）；而如果他关麦，协调器会把那一路音频退掉。
+         * 直接调 subscribeMicrophone 就会与 Focus / 页面隐藏两路输入打架。
+         */
+        const changed = updateStudent(studentId, sessionId, 'MIC_CHANGED', (student) => ({
           ...student,
           microphone: { active },
         }))
+        if (changed) void reconcileSubscriptions()
+        return
+      }
+      case 'PRIVATE_TALK_STARTED': {
+        /**
+         * §31：后端确认了目标（可能是另一个标签页发起的，也可能是对本次 POST 的
+         * 回执）。老师那版的载荷带身份三件套；收到学生版说明这条消息不该发给我。
+         */
+        if (!('studentId' in event.data)) return
+        const { studentId, sessionId, displayName } = event.data
+        talkTarget.value = { studentId, sessionId, displayName }
+        talkFailure.value = null
+        return
+      }
+      case 'PRIVATE_TALK_ENDED': {
+        const { sessionId } = event.data
+        // 按 sessionId 匹配当前目标：那是两端都有的那把键（§44）。
+        if (talkTarget.value !== null && talkTarget.value.sessionId === sessionId) {
+          talkTarget.value = null
+        }
         return
       }
       default:
-        // PRIVATE_TALK_* 属于 Phase 10（§31）：本 Phase 只定义类型，不处理。
         return
     }
   }
@@ -933,6 +1404,12 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
   function onClassroomClosed(): void {
     classroomClosed.value = true
     eventGeneration += 1
+    /**
+     * 课堂结束了 ⇒ 私密语音不可能继续（§31 的 TALKING 一定是短暂的）。
+     * 先清界面状态，再释放媒体：`teardownMedia` 是异步的，而界面上的
+     * "正在与张三语音沟通"必须在这一 tick 里消失。
+     */
+    clearTalk()
     void teardownMedia()
     scheduleSnapshotRefresh()
   }
@@ -953,6 +1430,11 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
     return student.studentId === focusedStudentId.value
   }
 
+  /** 名单里是否还有当前私密语音目标那个人（快照兜底用）。 */
+  function isTalkTargetStudent(student: MonitorStudent): boolean {
+    return student.studentId === talkTarget.value?.studentId
+  }
+
   /**
    * 进入监督墙：申请媒体凭据 → 连接 → 拉 monitor → 订阅 → 开始轮询。
    *
@@ -964,6 +1446,13 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
     classroomClosed.value = false
     await ensureMediaConnected(classroomId)
     await refresh()
+    /**
+     * 恢复"我正在和谁讲话"（§31）。**不 await**：这是一次恢复尝试，
+     * 后端慢或不可达时绝不能拖住后面的 `startPolling()`——那会让监督墙
+     * 连"谁在上课"都不再刷新，为了一句界面记忆付出过高的代价。
+     * 它在 `refresh()` 之后发起，这样校验名单时用的是刚拿到的数据。
+     */
+    void restoreTalkTarget(classroomId)
     startPolling()
   }
 
@@ -991,8 +1480,19 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
     mediaStates.value = {}
     cameraSubscriptions.value = {}
     cameraMediaStates.value = {}
+    microphoneSubscriptions.value = {}
+    microphoneMediaStates.value = {}
     pending.clear()
     pendingCamera.clear()
+    pendingMicrophone.clear()
+    /**
+     * 老师自己的麦克风必须跟着连接一起放手（§31）。
+     *
+     * WHY 把释放设备放在 `teardownMedia` 而不是各个调用点：它是"这条媒体连接结束了"
+     * 的唯一出口（退出、重试、课堂关闭都走它）。分开写就一定会漏掉一条路径，
+     * 而漏掉的后果是老师的麦克风指示灯在课堂结束后继续亮着。
+     */
+    dropTeacherMicrophone()
     if (current !== null) {
       try {
         await current.disconnect()
@@ -1025,6 +1525,9 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
     pageHidden.value = false
     classroomClosed.value = false
     visibleStudentIds.clear()
+    // 私密语音与老师麦克风的状态也要清：store 的生命周期比页面长（Pinia 单例），
+    // 留着会让"重新进入监督墙"的第一帧就显示"正在与张三语音沟通"。
+    clearTalk()
   }
 
   return {
@@ -1040,6 +1543,8 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
     subscriptionQualities,
     cameraSubscriptions,
     cameraMediaStates,
+    microphoneSubscriptions,
+    microphoneMediaStates,
     subscribedCount,
     rosterCount,
     enteredCount,
@@ -1048,6 +1553,14 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
     pageHidden,
     realtimeState,
     classroomClosed,
+    teacherMicState,
+    teacherMicFailure,
+    isTeacherMicOn,
+    isTeacherMicRequesting,
+    teacherMicActionLabel,
+    talkTarget,
+    talkBusy,
+    talkFailure,
     badgeOf,
     tileStateOf,
     mediaStateOf,
@@ -1055,11 +1568,21 @@ export const useMonitorStore = defineStore('teacher-monitor', () => {
     qualityOf,
     cameraSubscriptionOf,
     cameraMediaStateOf,
+    microphoneSubscriptionOf,
+    microphoneMediaStateOf,
+    isListeningToMicrophone,
+    isTalkTarget,
     setStudentVisible,
     setFocusedStudent,
     setPageHidden,
     setRealtimeState,
     applyRealtimeEvent,
+    enableTeacherMicrophone,
+    disableTeacherMicrophone,
+    toggleTeacherMicrophone,
+    startTalk,
+    stopTalk,
+    clearTalk,
     load,
     refresh,
     retryMedia,

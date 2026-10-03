@@ -165,6 +165,14 @@ type fakeMedia struct {
 	// revoked is what a pass reports as actually revoked. Tests that care about the log
 	// line script it; by default the fake reports nothing.
 	revoked []media.PeerSubscriptionRevocation
+
+	// The §31 half, same shape: what the private-talk state machine asked for, and what the
+	// fake reports back. The fake models the SUBSCRIPTION SET (identity → track sid →
+	// subscribed) rather than just recording calls, so a test can assert the property that
+	// matters — nobody but the target ends up subscribed to the teacher's microphone.
+	talkCalls     []talkEnforcementCall
+	talkErr       error
+	subscriptions map[string]map[string]bool
 }
 
 // enforcementCall is one EnforceNoPeerSubscriptions invocation, recorded so a test can
@@ -176,8 +184,21 @@ type enforcementCall struct {
 	allowed  []string
 }
 
+// talkEnforcementCall is one EnforcePrivateTalk invocation.
+type talkEnforcementCall struct {
+	room      string
+	students  []string
+	teachers  []string
+	target    string
+	micTracks []string
+}
+
 func newFakeMedia() *fakeMedia {
-	return &fakeMedia{observed: map[string]media.ParticipantTracks{}, token: "header.payload.signature"}
+	return &fakeMedia{
+		observed:      map[string]media.ParticipantTracks{},
+		token:         "header.payload.signature",
+		subscriptions: map[string]map[string]bool{},
+	}
 }
 
 func (m *fakeMedia) EnsureRoom(_ context.Context, roomName string) error {
@@ -220,6 +241,145 @@ func (m *fakeMedia) SignToken(req media.TokenRequest) (string, error) {
 		return "", m.signErr
 	}
 	return m.token, nil
+}
+
+// EnforcePrivateTalk mirrors the real reconciler's OUTCOME (§31): the target is subscribed
+// to every microphone publication of the teachers named, everybody else present is not. A
+// test can therefore ask "who can hear the teacher?" instead of "which RPC was sent".
+func (m *fakeMedia) EnforcePrivateTalk(
+	_ context.Context,
+	roomName string,
+	students []string,
+	observed map[string]media.ParticipantTracks,
+	teacherIdentities []string,
+	targetIdentity string,
+) (media.PrivateTalkEnforcement, error) {
+	var micTracks []string
+	for _, identity := range teacherIdentities {
+		if _, present := observed[identity]; !present {
+			continue
+		}
+		for _, track := range observed[identity].Tracks {
+			if track.Source == media.PublishMicrophone && track.Sid != "" {
+				micTracks = append(micTracks, track.Sid)
+			}
+		}
+	}
+	m.talkCalls = append(m.talkCalls, talkEnforcementCall{
+		room:      roomName,
+		students:  append([]string{}, students...),
+		teachers:  append([]string{}, teacherIdentities...),
+		target:    targetIdentity,
+		micTracks: micTracks,
+	})
+	if m.talkErr != nil {
+		return media.PrivateTalkEnforcement{TrackSids: micTracks}, m.talkErr
+	}
+
+	enforcement := media.PrivateTalkEnforcement{TrackSids: micTracks}
+	for _, student := range students {
+		if _, present := observed[student]; !present {
+			continue
+		}
+		subscribe := student == targetIdentity
+		for _, sid := range micTracks {
+			if m.subscriptions[student] == nil {
+				m.subscriptions[student] = map[string]bool{}
+			}
+			if m.subscriptions[student][sid] == subscribe {
+				continue
+			}
+			m.subscriptions[student][sid] = subscribe
+			change := media.PrivateTalkSubscription{StudentIdentity: student, TrackSid: sid}
+			if subscribe {
+				enforcement.Granted = append(enforcement.Granted, change)
+			} else {
+				enforcement.Revoked = append(enforcement.Revoked, change)
+			}
+		}
+	}
+	return enforcement, nil
+}
+
+// canHearTeacher reports whether one student is currently subscribed to one track.
+func (m *fakeMedia) canHearTeacher(identity, trackSid string) bool {
+	return m.subscriptions[identity][trackSid]
+}
+
+// ---------------------------------------------------------------------------
+// Fake private-talk collaborators (§31)
+// ---------------------------------------------------------------------------
+
+// talkMessage is one PRIVATE_TALK_STARTED / PRIVATE_TALK_REQUEST the state machine sent.
+type talkMessage struct {
+	ref                SessionRef
+	teacherDisplayName string
+}
+
+// fakeTalkEvents records the §31 messages and, crucially, does NOT record anything for
+// other students: the audience decision lives in internal/realtime, and a test here can
+// only assert WHICH session was addressed — which is exactly what makes "no classmate is
+// told" checkable one layer up.
+type fakeTalkEvents struct {
+	started   []talkMessage
+	requested []talkMessage
+	ended     []SessionRef
+	err       error
+}
+
+func (f *fakeTalkEvents) PrivateTalkStarted(_ context.Context, ref SessionRef, teacherDisplayName string) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.started = append(f.started, talkMessage{ref: ref, teacherDisplayName: teacherDisplayName})
+	return nil
+}
+
+func (f *fakeTalkEvents) PrivateTalkRequested(_ context.Context, ref SessionRef, teacherDisplayName string) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.requested = append(f.requested, talkMessage{ref: ref, teacherDisplayName: teacherDisplayName})
+	return nil
+}
+
+func (f *fakeTalkEvents) PrivateTalkEnded(_ context.Context, ref SessionRef) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.ended = append(f.ended, ref)
+	return nil
+}
+
+// talkRow is one TEACHER_TALK_* row the state machine appended.
+type talkRow struct {
+	sessionID uuid.UUID
+	event     EventType
+	payload   map[string]any
+}
+
+type fakeTalkAudit struct {
+	rows []talkRow
+	err  error
+}
+
+func (f *fakeTalkAudit) AppendEvent(_ context.Context, sessionID uuid.UUID, event EventType, payload map[string]any) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.rows = append(f.rows, talkRow{sessionID: sessionID, event: event, payload: payload})
+	return nil
+}
+
+// eventsOf lists the talk event types appended for one session, in order.
+func (f *fakeTalkAudit) eventsOf(sessionID uuid.UUID) []EventType {
+	var types []EventType
+	for _, row := range f.rows {
+		if row.sessionID == sessionID {
+			types = append(types, row.event)
+		}
+	}
+	return types
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +597,8 @@ type harness struct {
 	repo      *fakeRepo
 	directory *fakeDirectory
 	media     *fakeMedia
+	talk      *fakeTalkEvents
+	audit     *fakeTalkAudit
 	logs      *bytes.Buffer
 
 	teacherID   uuid.UUID
@@ -453,6 +615,8 @@ func newHarness(t *testing.T) *harness {
 	repo := newFakeRepo()
 	directory := newFakeDirectory()
 	mediaPlane := newFakeMedia()
+	talk := &fakeTalkEvents{}
+	audit := &fakeTalkAudit{}
 	logs := &bytes.Buffer{}
 	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	previous := slog.Default()
@@ -461,10 +625,15 @@ func newHarness(t *testing.T) *harness {
 
 	cfg := Config{LiveKitURL: "wss://media.example.test", TokenTTL: 2 * time.Hour}
 	h := &harness{
-		service:   NewService(repo, directory, mediaPlane, cfg),
+		// The private-talk collaborators are attached for every harness: the media-token and
+		// monitor tests never touch them, and the §31 tests get a service that is wired the
+		// way main wires it.
+		service:   NewService(repo, directory, mediaPlane, cfg).WithPrivateTalk(talk, audit),
 		repo:      repo,
 		directory: directory,
 		media:     mediaPlane,
+		talk:      talk,
+		audit:     audit,
 		logs:      logs,
 		teacherID: uuid.New(),
 		studentID: uuid.New(),
@@ -652,23 +821,22 @@ func TestJoinSuccessMintsScreenAndCameraToken(t *testing.T) {
 	if req.CanPublishData {
 		t.Error("canPublishData = true, want false (§47: business messages are not on the data channel)")
 	}
-	// The grant is asserted as an exact list, in order: §28's screen first (mandatory)
-	// and camera second (§75, optional), and NOTHING else. A missing microphone is the
-	// assertion that matters most here — it is the source Phase 10 adds together with its
-	// event path, and granting it early would let a client publish media no part of the
-	// control plane observes (§33/§76).
-	want := []media.PublishSource{media.PublishScreenShare, media.PublishCamera}
+	// The grant is asserted as an exact list, in ORDER: §28's screen first (mandatory),
+	// camera second (§75, optional) and microphone third (§76, optional) — and NOTHING
+	// else. Phase 10 is the phase in which the student's three sources are finally
+	// complete, so this assertion is the contract that a fourth source cannot appear
+	// without a deliberate change here.
+	//
+	// WHY the order and not only the set: the list is what the frontend's and the token's
+	// reviewers read, and ordering it the way §28 lists the sources makes "is anything
+	// missing?" a one-glance question.
+	want := []media.PublishSource{media.PublishScreenShare, media.PublishCamera, media.PublishMicrophone}
 	if len(req.PublishSources) != len(want) {
 		t.Fatalf("publish sources = %v, want exactly %v", req.PublishSources, want)
 	}
 	for i := range want {
 		if req.PublishSources[i] != want[i] {
 			t.Fatalf("publish sources = %v, want %v", req.PublishSources, want)
-		}
-	}
-	for _, source := range req.PublishSources {
-		if source == media.PublishMicrophone {
-			t.Fatal("the student token may publish a microphone: that is Phase 10 (§76)")
 		}
 	}
 }

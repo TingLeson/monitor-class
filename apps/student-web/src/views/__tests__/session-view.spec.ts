@@ -26,8 +26,9 @@ import SessionView from '../SessionView.vue'
  *
  * 这一页里有几条断言是**反面**的，而且它们比正面断言更重要：
  *
- * 1. 页面上**没有**任何 `<video>`（§56：不显示自己的屏幕预览，避免 screen-in-screen）；
- * 2. 摄像头 / 麦克风**不是可点的开关**（Phase 9/10 才接入，假开关会让学生以为坏了）；
+ * 1. 页面上**没有**任何屏幕预览的 `<video>`/`<audio>`（§56：不显示自己的屏幕预览，
+ *    避免 screen-in-screen）；唯一允许的 `<video>` 是 Phase 9 的摄像头自视小窗；
+ * 2. 摄像头与麦克风是**真开关**（Phase 9/10）：挂载时不请求设备，点击才请求；
  * 3. 重新共享**不重新 join**（会话还在，只是轨道没了）；
  * 4. 重新共享必须**重新过完整 Gate**——这里刻意**不** mock `requestEntireScreen`，
  *    用真实的 Gate + 假浏览器（mediaDevices 替身）跑，这样"选了窗口会被拒绝"
@@ -115,19 +116,23 @@ describe('课堂会话页', () => {
     expect(wrapper.find('[data-testid="screen-sharing-status"]').text()).toBe('🖥 正在共享整个屏幕')
   })
 
-  it('§24/§56：摄像头是真实开关；麦克风仍是 Phase 10 的不可点说明', async () => {
+  it('§24/§25/§56：摄像头与麦克风都是真实开关，而且**没有**在挂载时请求设备', async () => {
     installFakePublisherRoom()
-    const { wrapper } = await mountSession()
+    const { wrapper, devices } = await mountSession()
 
     const camera = wrapper.find('[data-testid="camera-row"]')
     expect(camera.find('[data-testid="toggle-camera"]').text()).toBe('📷 开启摄像头')
     expect(camera.find('[data-testid="camera-status"]').text()).toBe('未开启')
 
+    // Phase 10：麦克风从"不可点的说明"变成与摄像头同构的真实开关（§25）。
     const microphone = wrapper.find('[data-testid="microphone-row"]')
-    expect(microphone.text()).toContain('Phase 10')
-    // Phase 10 还没到：麦克风必须继续是"点不动的说明"，不是假开关（§54）。
-    expect(microphone.find('button').exists()).toBe(false)
+    expect(microphone.find('[data-testid="toggle-microphone"]').text()).toBe('🎤 开启麦克风')
+    expect(microphone.find('[data-testid="microphone-status"]').text()).toBe('未开启')
+    // 两个可选设备的入口都不许碰输入框（§56 的线框图只有开关，没有音量/波形）。
     expect(microphone.find('input').exists()).toBe(false)
+    // 挂载 ≠ 请求：两个设备一次都没被碰过。
+    expect(devices.cameraCalls).toHaveLength(0)
+    expect(devices.micCalls).toHaveLength(0)
   })
 
   /* -------------------------------------------------------------------- */

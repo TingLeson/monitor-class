@@ -97,7 +97,9 @@ func newRuntimeE2E(t *testing.T) *runtimeE2E {
 	logs := &strings.Builder{}
 	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	// The runtime layer, wired exactly as cmd/api wires it (§47/§74).
+	// The runtime layer, wired exactly as cmd/api wires it (§47/§74), including Phase 10's
+	// private-talk cycle: the session service reports its lifecycle into the processor, and
+	// the processor reports "the target is gone" back into the private-talk state machine.
 	hub := realtime.NewHub(realtime.HubConfig{Logger: logger})
 	runtimeService := realtime.NewService(hub, realtime.NewAudience(pool), logger)
 	processor := session.NewProcessor(sessionRepo, runtimeService)
@@ -113,7 +115,9 @@ func newRuntimeE2E(t *testing.T) *runtimeE2E {
 	sessionService := session.NewService(sessionRepo, classroomService, mediaPlane, session.Config{
 		LiveKitURL: cfg.LiveKitURL,
 		TokenTTL:   cfg.LiveKitTokenTTL,
-	}).WithLifecycleEvents(processor)
+	}).WithLifecycleEvents(processor).
+		WithPrivateTalk(runtimeService, sessionRepo)
+	processor.WithPrivateTalkEnder(sessionService)
 
 	verifier, err := media.NewWebhookVerifier(testWebhookKey, testWebhookSecret)
 	if err != nil {
@@ -121,14 +125,15 @@ func newRuntimeE2E(t *testing.T) *runtimeE2E {
 	}
 
 	router := httpapi.NewRouter(httpapi.Deps{
-		Logger:    logger,
-		Config:    cfg,
-		Auth:      authService,
-		Classroom: classroomService,
-		Session:   sessionService,
-		Webhook:   &httpapi.WebhookDeps{Verifier: verifier, Processor: processor},
-		Socket:    hub,
-		Limiter:   ratelimit.NewMemory(),
+		Logger:      logger,
+		Config:      cfg,
+		Auth:        authService,
+		Classroom:   classroomService,
+		Session:     sessionService,
+		PrivateTalk: sessionService,
+		Webhook:     &httpapi.WebhookDeps{Verifier: verifier, Processor: processor},
+		Socket:      hub,
+		Limiter:     ratelimit.NewMemory(),
 	})
 	t.Cleanup(func() { hub.Shutdown(context.Background()) })
 

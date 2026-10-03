@@ -158,6 +158,22 @@ export function shouldSubscribeScreen(student: MonitorStudent): boolean {
 }
 
 /**
+ * 这个学生的麦克风是否**值得**订阅（§32 的业务侧判据）。
+ *
+ * 与 {@link shouldSubscribeScreen} 同一个形状，但判的是另一个字段：麦克风是
+ * optional（§21/§25），屏幕在不在发布与麦克风开没开没有任何推导关系。
+ *
+ * 注意这里**不**包含"他是不是 Focus 对象"：那是订阅计划的第三道筛子
+ * （`desiredMicrophoneSubscriptions`）。§32 要求老师端同一时刻最多听**一路**音频，
+ * 而"最多一路"这条不变量只有把 Focus 也纳入计划之后才能成立——多路音频混在一起
+ * 之后，老师分辨不出是谁在说话，也就失去了这条能力本身的意义。
+ */
+export function shouldSubscribeMicrophone(student: MonitorStudent): boolean {
+  if (!isStudentEntered(student)) return false
+  return student.microphone.active
+}
+
+/**
  * 卡片主体该显示什么。
  *
  * 七种情形必须区分开，因为老师看到的"没有画面"有七种完全不同的原因：

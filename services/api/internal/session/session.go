@@ -166,9 +166,9 @@ type MonitorStudent struct {
 	Status *Status
 	// ScreenActive, CameraActive and MicrophoneActive are the observed tracks: the
 	// media plane reported a publication of that source and did not report it muted.
-	// From Phase 9 the camera can be true next to any session status (§24: a camera
-	// never changes the status), the microphone is still always false (§76), and a
-	// student without a session has all three false.
+	// Camera and microphone can be true next to any session status (§24/§25/§21: neither
+	// changes the status — only the screen does), and a student without a session has all
+	// three false.
 	ScreenActive     bool
 	CameraActive     bool
 	MicrophoneActive bool
@@ -301,6 +301,22 @@ type MediaPlane interface {
 		observed map[string]media.ParticipantTracks,
 		allowedTrackOwners []string,
 	) ([]media.PeerSubscriptionRevocation, error)
+	// EnforcePrivateTalk converges the room on §31's rule: the target student (when there
+	// is one) subscribes to the teacher's microphone tracks, and every other student does
+	// not. It takes the same observation as the call above — one room query per poll — and
+	// it is the ONLY way this control plane can take the teacher's audio away from a
+	// student, whose token grants `canSubscribe=true` room-wide (§28).
+	//
+	// An empty targetIdentity is not "skip": it means the room has no private talk, which
+	// is the state every student must be converged to.
+	EnforcePrivateTalk(
+		ctx context.Context,
+		roomName string,
+		students []string,
+		observed map[string]media.ParticipantTracks,
+		teacherIdentities []string,
+		targetIdentity string,
+	) (media.PrivateTalkEnforcement, error)
 }
 
 // CreateOrReuseParams is the input of Repository.CreateOrReuse.

@@ -33,9 +33,8 @@ import type { IsoDateTime, Uuid } from './common'
 /**
  * 服务端 → 客户端的业务事件类型全集（§47 的清单，逐字）。
  *
- * Phase 8 只会真的收到前六个；`CAMERA_CHANGED` / `MIC_CHANGED` 属于 Phase 9/10
- * （§24/§25），`PRIVATE_TALK_*` 属于 Phase 10（§31）。提前把类型定下来是为了让
- * 前端在收到它们时**至少不会崩**（走空档分支），而不是为了现在就去实现功能。
+ * Phase 8 起真实收到事件；`CAMERA_CHANGED`（Phase 9，§24）、`MIC_CHANGED` 与
+ * `PRIVATE_TALK_*`（Phase 10，§25/§31）都已经有具体载荷，守卫逐字段校验。
  */
 export const REALTIME_EVENT_TYPES = [
   'ROOM_OPENED',
@@ -131,15 +130,65 @@ export interface DeviceActiveChangedData {
   active: boolean
 }
 
+/* -------------------------------------------------------------------------- */
+/* 私密语音（Phase 10，§31/§32）                                               */
+/* -------------------------------------------------------------------------- */
+
 /**
- * `PRIVATE_TALK_*` → 指定学生（Phase 10，§31）。
+ * `PRIVATE_TALK_REQUEST` → **目标学生**（且只在学生麦克风未开启时下发）。
  *
- * 本 Phase **只定义类型**：冻结的表格只规定收件人是"指定学生"，没有规定字段
- * （§31 的模型是"老师麦克风只允许目标学生订阅"，业务上更接近媒体层动作）。
- * 因此这里刻意留成"后端字段待定"的空对象形态，守卫对这三个类型只校验信封；
- * 前端一旦真的收到它们也只会走空档分支，不会拿未定义的字段做判断。
+ * 它回答的是"老师想和你通话，请开麦"——因此载荷里只有老师的显示名。
+ * §26 的学生间隔离在这里也成立：目标学生拿不到其他学生的任何字段，
+ * 也拿不到课堂里"还有谁在听"。
  */
-export type PrivateTalkData = Record<string, unknown>
+export interface PrivateTalkRequestData {
+  teacherDisplayName: string
+}
+
+/**
+ * `PRIVATE_TALK_STARTED` → 目标学生：仍然是老师的显示名。
+ *
+ * WHY 不带上 `studentId`：那是学生**自己**的 id，对他来说没有任何用途
+ * （匹配会话用 `sessionId`），而下发它只会让"学生端会不会顺手用别人的 id"
+ * 变成一个需要回答的问题。没有字段就无从推断（§26 的同一套论证）。
+ */
+export interface StudentPrivateTalkStartedData {
+  teacherDisplayName: string
+}
+
+/**
+ * `PRIVATE_TALK_STARTED` → **老师**：目标学生的身份与姓名。
+ *
+ * 老师要在自己的界面上显示"正在和谁讲话"（§31：老师自己必须知道当前目标），
+ * 而"谁"只能用 studentId / sessionId / displayName 表达。同一台服务、
+ * 同一个事件类型，按收件人给不同形状的载荷——这与 `SCREEN_LOST` 的处理一致。
+ */
+export interface TeacherPrivateTalkStartedData {
+  studentId: Uuid
+  sessionId: Uuid
+  displayName: string
+}
+
+/**
+ * `PRIVATE_TALK_STARTED` 的两种收件人形状。
+ *
+ * 前端按"载荷里有没有 `teacherDisplayName`"分辨自己收到的是哪一版：
+ * 学生端只处理学生版，老师端只处理老师版。用联合而不是 `Record<string, unknown>`，
+ * 是为了让"老师端拿不到老师姓名"这种契约漂移在编译期就暴露。
+ */
+export type PrivateTalkStartedData = StudentPrivateTalkStartedData | TeacherPrivateTalkStartedData
+
+/**
+ * `PRIVATE_TALK_ENDED` → 目标学生 + 老师：结束的是哪一个会话（§31）。
+ *
+ * `sessionId` 是两端都有的那一把键（= LiveKit identity，§44），匹配会话必须用它；
+ * `studentId` 只在老师端有意义（他要在名册里找到那行）。这与 `SCREEN_LOST`
+ * 的两种形状同构：守卫只要求最小公共键，多余字段照收。
+ */
+export interface PrivateTalkEndedData {
+  studentId?: Uuid
+  sessionId: Uuid
+}
 
 /* -------------------------------------------------------------------------- */
 /* 事件联合类型                                                                */
@@ -155,9 +204,9 @@ export interface RealtimeEventDataMap {
   SCREEN_RESTORED: ScreenStateData
   CAMERA_CHANGED: DeviceActiveChangedData
   MIC_CHANGED: DeviceActiveChangedData
-  PRIVATE_TALK_REQUEST: PrivateTalkData
-  PRIVATE_TALK_STARTED: PrivateTalkData
-  PRIVATE_TALK_ENDED: PrivateTalkData
+  PRIVATE_TALK_REQUEST: PrivateTalkRequestData
+  PRIVATE_TALK_STARTED: PrivateTalkStartedData
+  PRIVATE_TALK_ENDED: PrivateTalkEndedData
 }
 
 /**
@@ -180,34 +229,42 @@ export type RealtimeEvent<T extends RealtimeEventType = RealtimeEventType> = {
 /* -------------------------------------------------------------------------- */
 
 /**
- * 每个事件类型必须存在的 data 字段及其运行时类型。
+ * 每个事件类型可接受的 data 形状（列表 = 允许的**任一**形状）。
  *
  * WHY 要逐字段校验而不是"有 type 和 data 就算数"：这是**网络来的**报文。
  * 只校验信封的话，一个 `{"type":"STUDENT_OFFLINE","data":{}}` 会把
  * `undefined` 送进 store，最后表现为监控墙上出现一张名字为空、状态为未定义的卡片——
  * 那正是 §80 说的"用假数据掩盖契约破裂"。宁可丢掉这条消息并计数。
  *
- * 注意 `SCREEN_LOST` / `SCREEN_RESTORED` 只要求 `sessionId`：学生端收到的
- * 就是不含 `studentId` 的版本（§26），把它列成必填会让学生端**必然**丢掉消息。
+ * WHY 是"形状列表"而不是单一形状：同一个事件类型对**不同收件人**的载荷不同
+ * （§47 的收件人表）。`SCREEN_LOST` 发给老师时带 `studentId`、发给学生本人时
+ * 只有 `sessionId`（§26），所以"只要求 sessionId"的那一版必须被接受，
+ * 否则学生端会**必然**丢掉每一条屏幕事件。Phase 10 的 `PRIVATE_TALK_STARTED`
+ * 是同一回事（学生版只有老师姓名，老师版是目标学生的身份）。
+ *
+ * 未列出的字段一律不看：契约只承诺这些键存在，向前兼容的多余字段不该让
+ * 一条本来可用的消息被丢掉。
  */
-const REQUIRED_FIELDS: Record<RealtimeEventType, Record<string, 'string' | 'boolean'>> = {
-  ROOM_OPENED: {
-    classroomId: 'string',
-    classroomName: 'string',
-    runId: 'string',
-    openedAt: 'string',
-  },
-  ROOM_CLOSED: { classroomId: 'string', runId: 'string', closedAt: 'string' },
-  STUDENT_ONLINE: { studentId: 'string', displayName: 'string', sessionId: 'string' },
-  STUDENT_OFFLINE: { studentId: 'string', sessionId: 'string', reason: 'string' },
-  SCREEN_LOST: { sessionId: 'string' },
-  SCREEN_RESTORED: { sessionId: 'string' },
-  CAMERA_CHANGED: { studentId: 'string', sessionId: 'string', active: 'boolean' },
-  MIC_CHANGED: { studentId: 'string', sessionId: 'string', active: 'boolean' },
-  // Phase 10 的载荷字段未冻结：只校验信封，不做字段断言（见 PrivateTalkData）。
-  PRIVATE_TALK_REQUEST: {},
-  PRIVATE_TALK_STARTED: {},
-  PRIVATE_TALK_ENDED: {},
+const REQUIRED_FIELDS: Record<RealtimeEventType, Record<string, 'string' | 'boolean'>[]> = {
+  ROOM_OPENED: [
+    { classroomId: 'string', classroomName: 'string', runId: 'string', openedAt: 'string' },
+  ],
+  ROOM_CLOSED: [{ classroomId: 'string', runId: 'string', closedAt: 'string' }],
+  STUDENT_ONLINE: [{ studentId: 'string', displayName: 'string', sessionId: 'string' }],
+  STUDENT_OFFLINE: [{ studentId: 'string', sessionId: 'string', reason: 'string' }],
+  SCREEN_LOST: [{ sessionId: 'string' }],
+  SCREEN_RESTORED: [{ sessionId: 'string' }],
+  CAMERA_CHANGED: [{ studentId: 'string', sessionId: 'string', active: 'boolean' }],
+  // §25：麦克风的开关只由**老师本人**（owner）收到，载荷与摄像头逐字同形。
+  MIC_CHANGED: [{ studentId: 'string', sessionId: 'string', active: 'boolean' }],
+  // 学生版：老师是谁（§26：没有别人的任何字段）。
+  PRIVATE_TALK_REQUEST: [{ teacherDisplayName: 'string' }],
+  PRIVATE_TALK_STARTED: [
+    { teacherDisplayName: 'string' },
+    { studentId: 'string', sessionId: 'string', displayName: 'string' },
+  ],
+  // 两端都有的最小公共键是 sessionId；studentId 只对老师端有意义（同 SCREEN_LOST）。
+  PRIVATE_TALK_ENDED: [{ sessionId: 'string' }],
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -238,9 +295,11 @@ export function isRealtimeEvent(value: unknown): value is RealtimeEvent {
   if (!isRecord(value.data)) return false
 
   const data = value.data
-  for (const [field, kind] of Object.entries(REQUIRED_FIELDS[value.type])) {
-    if (typeof data[field] !== kind) return false
-  }
+  const shapes = REQUIRED_FIELDS[value.type]
+  const matches = shapes.some((shape) =>
+    Object.entries(shape).every(([field, kind]) => typeof data[field] === kind),
+  )
+  if (!matches) return false
   // `reason` 是枚举而不是任意字符串：一个拼错的 reason 会让老师端把它当成
   // "未知离线"显示，而枚举校验能在这里就把它退回去。
   if (value.type === 'STUDENT_OFFLINE' && !isStudentOfflineReason(data.reason)) return false

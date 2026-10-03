@@ -42,6 +42,16 @@ vi.mock('../../lib/teacher-monitor-api.ts', () => ({
   requestMediaToken: requestMediaTokenMock,
 }))
 
+/**
+ * 私密语音接口（§31）。`load()` 会读一次"当前目标"来恢复界面记忆，
+ * 不替身的话每个用例都会真的去 fetch 一次（既慢又会打出连接失败的噪音）。
+ */
+vi.mock('../../lib/private-talk-api.ts', () => ({
+  startPrivateTalk: vi.fn(),
+  stopPrivateTalk: vi.fn(),
+  getPrivateTalk: vi.fn().mockResolvedValue(null),
+}))
+
 vi.mock('../../lib/teacher-classrooms-api.ts', () => ({
   listClassrooms: vi.fn().mockResolvedValue([]),
   getClassroom: getClassroomMock,

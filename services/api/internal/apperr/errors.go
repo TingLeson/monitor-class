@@ -124,8 +124,14 @@ func HTTPStatus(code Code) int {
 		// different account name; the conflict is with existing state.
 		return http.StatusConflict
 	case CodeClassroomClosed, CodeClassroomAlreadyOpen, CodeClassroomAlreadyClosed,
-		CodeSessionAlreadyActive:
-		return http.StatusConflict // 409 — the request was valid for another state
+		CodeSessionAlreadyActive, CodeTeacherMicRequired, CodePrivateTalkUnavailable:
+		// 409 — the request was valid for another state. The private-talk pair belongs
+		// here for the same reason CLASSROOM_CLOSED does: the body was well formed and the
+		// action is legal in general, it just conflicts with what the media plane reports
+		// right now (the teacher has no microphone track, or the student is not connected).
+		// Retrying the identical request can genuinely succeed once that changes, which is
+		// exactly what separates 409 from 400.
+		return http.StatusConflict
 	case CodeCannotDisableSelf, CodeLastAdminProtected:
 		// 409 and not 400: the body was well formed and the action is legal in
 		// general — it conflicts with the *system's* current state (which account

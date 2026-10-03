@@ -6,15 +6,17 @@
  *
  * 三条从这里流出去的硬约束：
  *
- * 1. `connect(url, token, { autoSubscribe: false })`（§26/§28）。学生端永远不订阅
- *    任何人的轨道；即便服务端已用 Subscription Permission 挡住其他学生，
- *    自动订阅也不该有"先拉下来再过滤"的机会。老师私密语音是 Phase 10 的事，
- *    届时也只允许**显式**订阅那一条。
+ * 1. `connect(url, token, { autoSubscribe: false })`（§26/§28）。学生端永远不主动
+ *    订阅任何人的轨道；即便服务端已用 Subscription Permission 挡住其他学生，
+ *    自动订阅也不该有"先拉下来再过滤"的机会。老师私密语音是**唯一**的例外，
+ *    而它的订阅权在服务端（§31 的 `UpdateSubscriptions`）：本文件只负责把被推下来的
+ *    那条麦克风轨道播出来（`TrackSubscribed` → `attach()`）。
  * 2. 本地轨道必须复用**已经拿到授权的那一条** `MediaStreamTrack`：屏幕那条来自
- *    Phase 5 的 Gate（§20），摄像头那条来自学生点击后的 `getUserMedia`（§24）。
- *    这里只接受现成的 track，绝不调用 `createLocalScreenTracks()` /
- *    `getDisplayMedia()` / `createLocalVideoTrack()` 之类的"重新采集"API——
- *    那会让学生看到第二次授权弹窗（屏幕）或一个他没点过的摄像头授权（摄像头）。
+ *    Phase 5 的 Gate（§20），摄像头那条来自学生点击后的 `getUserMedia`（§24），
+ *    麦克风那条同样来自学生点击（§25）。这里只接受现成的 track，绝不调用
+ *    `createLocalScreenTracks()` / `getDisplayMedia()` / `createLocalVideoTrack()` /
+ *    `createLocalAudioTrack()` 之类的"重新采集"API——那会让学生看到第二次授权弹窗
+ *    或一个他没点过的设备授权。
  * 3. 地址与 token 只在这里被交给 SDK，不缓存、不打印（§44）。本文件没有
  *    `console.*`，异常也原样上抛，由 store 折叠成中文提示。
  */
@@ -22,17 +24,22 @@
 import {
   ConnectionQuality,
   DisconnectReason,
+  LocalAudioTrack,
   LocalVideoTrack,
   Room,
   RoomEvent,
   Track,
   type Participant,
+  type RemoteAudioTrack,
+  type RemoteTrack,
+  type RemoteTrackPublication,
 } from 'livekit-client'
 import type {
   ConnectionQualityLevel,
   MediaCredentials,
   MediaDisconnectReason,
   ScreenPublisherRoom,
+  TeacherAudioState,
 } from './media-room.ts'
 
 /**
@@ -104,6 +111,96 @@ export function createLiveKitScreenPublisherRoom(
    * 同时开摄像头），共用一个变量会让"关闭摄像头"把屏幕一起撤下来。
    */
   let publishedCameraTrack: LocalVideoTrack | null = null
+  /**
+   * 当前已发布的本地麦克风轨道（§25）。
+   *
+   * 第三条独立变量，理由与摄像头完全相同：屏幕 / 摄像头 / 麦克风是三条互不相干的
+   * 轨道，"关麦"绝不能顺手把画面撤下来。
+   */
+  let publishedMicrophoneTrack: LocalAudioTrack | null = null
+
+  /* ---------------------------------------------------------------------- */
+  /* 老师私密语音的音频播放（§31 / §32）                                      */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * 老师麦克风的轨道与它当前挂着的 `<audio>`。
+   *
+   * WHY 由适配层自己在房间事件上挂载，而不是等 store 来 attach：
+   * 这条轨道的**订阅权在服务端**（§31 的 `UpdateSubscriptions`），它随时可能
+   * 被推下来；而 `autoSubscribe = false`（§26/§28）意味着 SDK **不会**自动播放
+   * 任何远端音频。少挂这一次，学生就会在"正在与老师语音沟通"的提示下什么都听不到。
+   */
+  let teacherAudioTrack: RemoteAudioTrack | null = null
+  let teacherAudioElement: HTMLMediaElement | null = null
+  let audioState: TeacherAudioState = 'idle'
+  const audioListeners = new Set<(state: TeacherAudioState) => void>()
+
+  /**
+   * 重算并广播音频状态。
+   *
+   * `canPlaybackAudio` 是 SDK 对"自动播放策略是否放行"的权威回答：轨道在、
+   * 但浏览器拦住了播放时，界面必须能说出"点一下才能听到"（见 TeacherAudioState）。
+   */
+  function refreshAudioState(): void {
+    const next: TeacherAudioState =
+      teacherAudioTrack === null ? 'idle' : room.canPlaybackAudio ? 'playing' : 'blocked'
+    if (next === audioState) return
+    audioState = next
+    for (const listener of [...audioListeners]) listener(next)
+  }
+
+  /** 摘掉老师音频（取消订阅 / 掉线 / 断开）：元素必须被移除，否则会留下一个静音黑洞。 */
+  function detachTeacherAudio(): void {
+    if (teacherAudioTrack !== null && teacherAudioElement !== null) {
+      teacherAudioTrack.detach(teacherAudioElement)
+    }
+    teacherAudioTrack = null
+    teacherAudioElement = null
+    refreshAudioState()
+  }
+
+  /** 服务端把老师麦克风推下来了：播放它（声音是这条轨道存在的唯一意义）。 */
+  function attachTeacherAudio(track: RemoteAudioTrack): void {
+    detachTeacherAudio()
+    teacherAudioTrack = track
+    // 不传元素：SDK 会创建一个 `<audio>` 元素并开始播放（真实 Chrome 需要它才出声）。
+    teacherAudioElement = track.attach()
+    /**
+     * `startAudio()` 是 SDK 提供的"在用户手势之后恢复播放"的入口。这里顺手调一次：
+     * 学生进入课堂时已经点过按钮（页面有 sticky activation），因此它通常直接成功；
+     * 失败了也不抛到界面——`canPlaybackAudio` 会把状态标成 blocked，
+     * 由学生点"开启声音"重试（那时一定在手势里）。
+     */
+    void room
+      .startAudio()
+      .catch(() => undefined)
+      .then(refreshAudioState)
+    refreshAudioState()
+  }
+
+  room
+    .on(RoomEvent.TrackSubscribed, (track: RemoteTrack, publication: RemoteTrackPublication) => {
+      /**
+       * 只认 `microphone` 源，而且只有老师会发布它（§27：老师 Token 唯一允许的
+       * 发布源就是 microphone）。学生之间的音频在服务端就被撤销了订阅（§26/§32），
+       * 即便漏过来，这里也不会把它当成"老师"播出来。
+       */
+      if (publication.source !== Track.Source.Microphone) return
+      if (track.kind !== Track.Kind.Audio) return
+      attachTeacherAudio(track as RemoteAudioTrack)
+    })
+    .on(RoomEvent.TrackUnsubscribed, (_track: RemoteTrack, publication: RemoteTrackPublication) => {
+      if (publication.source !== Track.Source.Microphone) return
+      detachTeacherAudio()
+    })
+    .on(RoomEvent.AudioPlaybackStatusChanged, () => {
+      refreshAudioState()
+    })
+    .on(RoomEvent.Disconnected, () => {
+      // 连接没了：这条音频不可能再出声，留着状态只会让界面继续说"正在语音沟通"。
+      detachTeacherAudio()
+    })
 
   return {
     async connect(): Promise<void> {
@@ -164,8 +261,55 @@ export function createLiveKitScreenPublisherRoom(
       await room.localParticipant.unpublishTrack(local, false)
     },
 
-    disconnect(): Promise<void> {
-      // stopTracks=false：同上，本地屏幕轨道由捕获层统一释放。
+    async publishMicrophoneTrack(track: MediaStreamTrack): Promise<void> {
+      /**
+       * 同样是 `userProvidedTrack = true`，理由与摄像头那条一模一样：
+       * 麦克风在**重连**场景下若让 SDK 自己重新采集，学生会在课堂中途再被弹一次
+       * 麦克风授权框——而 §25 的前提就是"只在他点击的那一刻请求一次"。
+       *
+       * `name: 'mic'` 与后端契约里那条轨道的名字逐字一致：判定归属靠 `source`，
+       * 但名字会进入 SFU 与 webhook 的记录，排障时能一眼区分三条轨道。
+       */
+      const local = new LocalAudioTrack(track, undefined, true)
+      await room.localParticipant.publishTrack(local, {
+        source: Track.Source.Microphone,
+        name: 'mic',
+      })
+      publishedMicrophoneTrack = local
+    },
+
+    async unpublishMicrophoneTrack(): Promise<void> {
+      const local = publishedMicrophoneTrack
+      publishedMicrophoneTrack = null
+      if (!local) return
+      /**
+       * 第二个参数 false：**不**在这里 stop。
+       *
+       * WHY：`stop()` 是唯一能让系统麦克风指示灯灭掉的动作，释放点必须只有一个
+       * （采集层），否则"unpublish 成功、stop 没跑到"会留下一个学生以为已经关掉、
+       * 实际仍在录音的麦克风。store 里 unpublish 与 stop 是紧挨着的两句。
+       */
+      await room.localParticipant.unpublishTrack(local, false)
+    },
+
+    onTeacherAudioChanged(listener: (state: TeacherAudioState) => void): () => void {
+      audioListeners.add(listener)
+      // 立刻报一次当前状态：订阅发生在"音频已经到位"之后时，调用方不该等到下一次变化。
+      listener(audioState)
+      return () => {
+        audioListeners.delete(listener)
+      }
+    },
+
+    async resumeTeacherAudio(): Promise<boolean> {
+      await room.startAudio().catch(() => undefined)
+      refreshAudioState()
+      return audioState === 'playing'
+    },
+
+    async disconnect(): Promise<void> {
+      // stopTracks=false：同上，本地屏幕/摄像头/麦克风轨道由各自的采集层统一释放。
+      detachTeacherAudio()
       return room.disconnect(false)
     },
 

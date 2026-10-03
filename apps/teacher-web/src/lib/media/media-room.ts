@@ -93,6 +93,27 @@ export interface CameraSubscription {
 }
 
 /**
+ * 一次已建立的**麦克风**订阅（§32 / §76）。
+ *
+ * 与学生端那条"老师音频"是镜像关系，但方向相反：
+ *
+ * ```text
+ * 老师 → 一个被选中的学生   （服务端 UpdateSubscriptions，客户端只播放）
+ * 学生 → 老师               （老师端显式订阅，只订 Focus 的那一个）
+ * ```
+ *
+ * WHY 与 {@link CameraSubscription} 分开而不是复用它：它们挂在**不同的元素类型**上
+ * （音频挂 `<audio>`、视频挂 `<video>`），把它们合成一个类型只会让调用方在
+ * attach 的时候需要一次类型断言。音频同样没有画质档位——§52 的"网格低 / Focus 高"
+ * 是视频的概念，给音频设 quality 是没有意义的。
+ */
+export interface MicrophoneSubscription {
+  identity: string
+  /** 把音频挂到 `<audio>` 上，返回 detach。 */
+  attach(element: HTMLAudioElement): () => void
+}
+
+/**
  * 老师端的媒体房间。
  *
  * `subscribeScreen()` 必须**幂等**：同一个 identity 反复调用只能产生一次订阅。
@@ -128,7 +149,33 @@ export interface MonitorRoom {
   subscribeCamera(identity: string): Promise<CameraSubscription | null>
   /** 取消摄像头订阅（不影响屏幕那一条）。 */
   unsubscribeCamera(identity: string): Promise<void>
-  /** 有人加入/离开，或发布了新的屏幕/摄像头轨道：业务状态仍以 monitor DTO 为准。 */
+  /**
+   * 发布老师自己的麦克风（§27/§31）。
+   *
+   * 老师 Token 的 `canPublishSources` 里只有 microphone（§27），所以这是老师端
+   * **唯一**能发布的东西。参数是现成的 `MediaStreamTrack`：适配层不得自己调
+   * `getUserMedia`，否则老师会在一个他没点过的时刻被弹授权框。
+   */
+  publishMicrophoneTrack(track: MediaStreamTrack): Promise<void>
+  /** 撤下老师麦克风；不 stop 本地轨道（释放设备的是采集层）。 */
+  unpublishMicrophoneTrack(): Promise<void>
+  /**
+   * 订阅某学生的麦克风轨道（§32）；他没有在发布麦克风时返回 null。
+   *
+   * 同样是**幂等**的独立订阅：它既不影响屏幕，也不影响摄像头。
+   * 调用方（store）保证同一时刻最多只订**一个**学生——§32 禁止网格里同时开多路音频，
+   * 因为多路混在一起之后老师根本分辨不出是谁在说话。
+   */
+  subscribeMicrophone(identity: string): Promise<MicrophoneSubscription | null>
+  /** 取消某学生的麦克风订阅（不影响他的屏幕/摄像头）。 */
+  unsubscribeMicrophone(identity: string): Promise<void>
+  /**
+   * 有轨道发布/取消，或有人加入/离开：业务状态仍以 monitor DTO 为准。
+   *
+   * 麦克风轨道的发布/取消也走这里（Phase 10 起）：`MIC_CHANGED` 是业务事件，
+   * 它到达时那条 publication 可能还没出现在老师端（webhook 比 SFU 快），
+   * 不在这里再通知一次，Focus 面板就要等到下一次快照（最多 60 秒）才听得到声音。
+   */
   onParticipantsChanged(listener: () => void): () => void
   onScreenSubscribed(listener: (identity: string) => void): () => void
   onScreenUnsubscribed(listener: (identity: string) => void): () => void

@@ -30,6 +30,8 @@ const lk = vi.hoisted(() => ({
   publishCalls: [] as { track: unknown; options: Record<string, unknown> }[],
   unpublishCalls: [] as { track: unknown; stop: boolean | undefined }[],
   localVideoTrackArgs: [] as unknown[][],
+  localAudioTrackArgs: [] as unknown[][],
+  startAudioCalls: 0,
   listeners: new Map<string, Set<(...args: never[]) => void>>(),
   instances: [] as RecordedRoom[],
 }))
@@ -39,6 +41,20 @@ vi.mock('livekit-client', () => {
     readonly kind = 'video'
     constructor(...args: unknown[]) {
       lk.localVideoTrackArgs.push(args)
+    }
+  }
+
+  /**
+   * 音频轨道的替身（§25）：与视频那条一样只记录构造参数。
+   *
+   * WHY 必须是两个类而不是一个：适配层用 `LocalAudioTrack` 包装麦克风，
+   * 用 `LocalVideoTrack` 包装屏幕/摄像头；一个类会让"麦克风被当成视频发布"
+   * 这种错误在测试里静默通过。
+   */
+  class LocalAudioTrack {
+    readonly kind = 'audio'
+    constructor(...args: unknown[]) {
+      lk.localAudioTrackArgs.push(args)
     }
   }
 
@@ -57,6 +73,8 @@ vi.mock('livekit-client', () => {
     }
 
     readonly remoteParticipants = new Map<string, unknown>()
+    /** 自动播放策略的替身：默认放行；测试可以把它改成 false 模拟被浏览器拦住。 */
+    canPlaybackAudio = true
 
     constructor(options: Record<string, unknown>) {
       lk.roomOptions.push(options)
@@ -70,6 +88,11 @@ vi.mock('livekit-client', () => {
 
     disconnect(stop?: boolean): Promise<void> {
       lk.disconnectCalls.push(stop)
+      return Promise.resolve()
+    }
+
+    startAudio(): Promise<void> {
+      lk.startAudioCalls += 1
       return Promise.resolve()
     }
 
@@ -93,11 +116,15 @@ vi.mock('livekit-client', () => {
   return {
     Room,
     LocalVideoTrack,
+    LocalAudioTrack,
     RoomEvent: {
       ConnectionQualityChanged: 'connectionQualityChanged',
       Disconnected: 'disconnected',
       Reconnecting: 'reconnecting',
       Reconnected: 'reconnected',
+      TrackSubscribed: 'trackSubscribed',
+      TrackUnsubscribed: 'trackUnsubscribed',
+      AudioPlaybackStatusChanged: 'audioPlaybackStatusChanged',
     },
     ConnectionQuality: {
       Excellent: 'excellent',
@@ -113,7 +140,10 @@ vi.mock('livekit-client', () => {
       UNKNOWN_REASON: 0,
       CLIENT_INITIATED: 4,
     },
-    Track: { Source: { ScreenShare: 'screen_share', Camera: 'camera', Microphone: 'microphone' } },
+    Track: {
+      Kind: { Audio: 'audio', Video: 'video' },
+      Source: { ScreenShare: 'screen_share', Camera: 'camera', Microphone: 'microphone' },
+    },
   }
 })
 
@@ -122,6 +152,23 @@ function emit(event: string, ...args: unknown[]): void {
   for (const handler of [...(lk.listeners.get(event) ?? [])]) {
     ;(handler as (...rest: unknown[]) => void)(...args)
   }
+}
+
+/**
+ * 模拟"服务端把老师的麦克风推下来了"（§31）。
+ *
+ * 真实链路是 `UpdateSubscriptions` → SFU 推流 → 客户端的 `TrackSubscribed`；
+ * 客户端没有任何订阅动作，所以测试也只能从这条事件接入。
+ * `attach()` 按 SDK 的约定返回一个媒体元素（这里给一个空对象），
+ * 取消订阅时适配层要靠它 detach。
+ */
+function attachMicrophone(
+  dispatch: typeof emit,
+  trackSid: string,
+): { kind: string; attach: ReturnType<typeof vi.fn>; detach: ReturnType<typeof vi.fn> } {
+  const track = { kind: 'audio', attach: vi.fn(() => ({})), detach: vi.fn() }
+  dispatch('trackSubscribed', track, { source: 'microphone', trackSid })
+  return track
 }
 
 const CREDENTIALS = {
@@ -137,6 +184,8 @@ describe('LiveKit 适配层（学生端）', () => {
     lk.publishCalls.length = 0
     lk.unpublishCalls.length = 0
     lk.localVideoTrackArgs.length = 0
+    lk.localAudioTrackArgs.length = 0
+    lk.startAudioCalls = 0
     lk.listeners.clear()
     lk.instances.length = 0
   })
@@ -178,7 +227,7 @@ describe('LiveKit 适配层（学生端）', () => {
     expect(lk.publishCalls[0]?.options).toEqual({ source: 'screen_share' })
   })
 
-  it('适配层不调用任何"重新采集屏幕"的 API（不存在第二条 Gate 绕过路径）', () => {
+  it('适配层不调用任何"重新采集"的 API（不存在第二条 Gate 绕过路径）', () => {
     const room = createLiveKitScreenPublisherRoom(CREDENTIALS)
 
     // 接口面上根本没有这些入口：一旦有人加回来，这个断言会连同类型检查一起失败。
@@ -190,9 +239,13 @@ describe('LiveKit 适配层（学生端）', () => {
       'onQualityChanged',
       'onReconnected',
       'onReconnecting',
+      'onTeacherAudioChanged',
       'publishCameraTrack',
+      'publishMicrophoneTrack',
       'publishScreenTrack',
+      'resumeTeacherAudio',
       'unpublishCameraTrack',
+      'unpublishMicrophoneTrack',
       'unpublishScreenTrack',
     ])
   })
@@ -314,5 +367,106 @@ describe('LiveKit 适配层（学生端）', () => {
 
     expect(reconnecting).toBe(1)
     expect(reconnected).toBe(1)
+  })
+
+  /* ------------------------------------------------------------------------ */
+  /* §25：麦克风发布（Phase 10）                                              */
+  /* ------------------------------------------------------------------------ */
+
+  it('§25：麦克风用 LocalAudioTrack 包装同一条轨道并发布到 Track.Source.Microphone', async () => {
+    const room = createLiveKitScreenPublisherRoom(CREDENTIALS)
+    const track = { kind: 'audio' } as unknown as MediaStreamTrack
+
+    await room.publishMicrophoneTrack(track)
+
+    // 第三个参数 true = userProvidedTrack：重连时 SDK 不得自己重新采集麦克风
+    // （那等于学生在课堂中途被弹第二次授权框，§25 的前提就是只请求一次）。
+    expect(lk.localAudioTrackArgs).toEqual([[track, undefined, true]])
+    // 视频那条一次都没被碰过：三条轨道各自独立。
+    expect(lk.localVideoTrackArgs).toEqual([])
+    expect(lk.publishCalls[0]?.options).toEqual({ source: 'microphone', name: 'mic' })
+  })
+
+  it('§25：unpublish 麦克风时**不**停轨道（设备释放点是采集层，指示灯才会灭）', async () => {
+    const room = createLiveKitScreenPublisherRoom(CREDENTIALS)
+    await room.publishMicrophoneTrack({ kind: 'audio' } as unknown as MediaStreamTrack)
+    await room.publishScreenTrack({ kind: 'video' } as unknown as MediaStreamTrack)
+
+    await room.unpublishMicrophoneTrack()
+
+    expect(lk.unpublishCalls).toHaveLength(1)
+    expect(lk.unpublishCalls[0]?.stop).toBe(false)
+    // 屏幕那条继续发布：关麦绝不该撤下画面。
+    await room.unpublishScreenTrack()
+    expect(lk.unpublishCalls).toHaveLength(2)
+    expect(lk.unpublishCalls[0]?.track).not.toBe(lk.unpublishCalls[1]?.track)
+  })
+
+  it('没有发布过麦克风时 unpublish 是空操作', async () => {
+    const room = createLiveKitScreenPublisherRoom(CREDENTIALS)
+
+    await room.unpublishMicrophoneTrack()
+
+    expect(lk.unpublishCalls).toHaveLength(0)
+  })
+
+  /* ------------------------------------------------------------------------ */
+  /* §31/§32：老师私密语音的音频（Phase 10）                                  */
+  /* ------------------------------------------------------------------------ */
+
+  it('§31：服务端推下老师麦克风时把它挂到 <audio> 上播放（autoSubscribe=false 不会自动播）', () => {
+    const room = createLiveKitScreenPublisherRoom(CREDENTIALS)
+    const states: string[] = []
+    room.onTeacherAudioChanged((state) => states.push(state))
+
+    expect(states).toEqual(['idle'])
+    attachMicrophone(emit, 'TR_mic')
+
+    expect(states.at(-1)).toBe('playing')
+    // startAudio 必须在拿到轨道时顺手调一次：这是 SDK 提供的"恢复播放"入口。
+    expect(lk.startAudioCalls).toBe(1)
+    expect(states).toEqual(['idle', 'playing'])
+  })
+
+  it('§31：自动播放被拦住时状态是 blocked（界面据此给"点击播放声音"）', async () => {
+    const room = createLiveKitScreenPublisherRoom(CREDENTIALS)
+    const instance = lk.instances[0] as unknown as { canPlaybackAudio: boolean }
+    instance.canPlaybackAudio = false
+
+    const states: string[] = []
+    room.onTeacherAudioChanged((state) => states.push(state))
+    attachMicrophone(emit, 'TR_mic')
+
+    expect(states.at(-1)).toBe('blocked')
+    // 用户手势里的那次调用之后才能出声。
+    instance.canPlaybackAudio = true
+    await expect(room.resumeTeacherAudio()).resolves.toBe(true)
+    expect(states.at(-1)).toBe('playing')
+  })
+
+  it('§31：取消订阅 / 断开连接都会摘掉老师音频（不留一个静音黑洞）', () => {
+    const room = createLiveKitScreenPublisherRoom(CREDENTIALS)
+    const states: string[] = []
+    room.onTeacherAudioChanged((state) => states.push(state))
+    const track = attachMicrophone(emit, 'TR_mic')
+    expect(states.at(-1)).toBe('playing')
+
+    emit('trackUnsubscribed', track, { source: 'microphone', trackSid: 'TR_mic' })
+
+    expect(states.at(-1)).toBe('idle')
+    expect(track.detach).toHaveBeenCalled()
+  })
+
+  it('§26：其他来源的轨道不会被当成老师语音播放出来', () => {
+    const room = createLiveKitScreenPublisherRoom(CREDENTIALS)
+    const states: string[] = []
+    room.onTeacherAudioChanged((state) => states.push(state))
+
+    // 屏幕与摄像头轨道（老师端根本没有这些发布源）；音频但非 microphone 源同理。
+    emit('trackSubscribed', { kind: 'video' }, { source: 'screen_share', trackSid: 'TR_s' })
+    emit('trackSubscribed', { kind: 'video' }, { source: 'camera', trackSid: 'TR_c' })
+
+    expect(states).toEqual(['idle'])
+    expect(lk.startAudioCalls).toBe(0)
   })
 })

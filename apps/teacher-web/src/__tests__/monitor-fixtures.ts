@@ -7,6 +7,7 @@ import {
   type MediaCredentials,
   type MediaDisconnectReason,
   type MediaRemoteParticipant,
+  type MicrophoneSubscription,
   type MonitorRoom,
   type ScreenQuality,
   type ScreenSubscription,
@@ -57,6 +58,23 @@ export interface FakeMonitorRoom {
   readonly unsubscribeCameraCalls: string[]
   /** 摄像头被 attach 过的 `<video>`（断言画中画的画面真的挂上去了）。 */
   readonly cameraAttachedElements: HTMLVideoElement[]
+  /**
+   * 麦克风的订阅调用（§32，同样**不去重**）。
+   *
+   * 与摄像头那几个数组分开：本 Phase 最要盯的性质是"同一时刻最多一路音频"，
+   * 共用一个数组会让"Focus 切换时旧的那路没退掉"这种 bug 测不出来。
+   */
+  readonly subscribeMicrophoneCalls: string[]
+  readonly unsubscribeMicrophoneCalls: string[]
+  /** 麦克风被 attach 过的 `<audio>`（断言"正在听"这句话背后真的有声音）。 */
+  readonly microphoneAttachedElements: HTMLAudioElement[]
+  /** 老师自己发布过的麦克风轨道（§27/§31）。 */
+  readonly publishedMicrophoneTracks: MediaStreamTrack[]
+  readonly unpublishMicrophoneCalls: number
+  /** false 表示"业务说他开着麦，但媒体里还没有这条轨道"（返回 null）。 */
+  microphoneAvailable: boolean
+  /** 让 `subscribeMicrophone` 抛错（§32 的订阅失败只影响能不能听到）。 */
+  subscribeMicrophoneError: Error | null
   /** 被 attach 过的 `<video>`（断言"画面真的挂上去了"）。 */
   readonly attachedElements: HTMLVideoElement[]
   /** 媒体层的参与者事实（业务状态不在这里，见 §51）。 */
@@ -92,6 +110,7 @@ export interface MonitorRoomHarness {
     connectError: Error | null
     subscribeError: Error | null
     subscribeCameraError: Error | null
+    subscribeMicrophoneError: Error | null
     /**
      * 订阅闸门：非 null 时 `subscribeScreen` 会一直挂到它 resolve。
      *
@@ -114,6 +133,7 @@ export function installFakeMonitorRoom(
     connectError: options.connectError ?? null,
     subscribeError: null as Error | null,
     subscribeCameraError: null as Error | null,
+    subscribeMicrophoneError: null as Error | null,
     subscribeGate: null as Promise<void> | null,
   }
   /**
@@ -149,6 +169,7 @@ function makeFakeMonitorRoom(flags: {
   connectError: Error | null
   subscribeError: Error | null
   subscribeCameraError: Error | null
+  subscribeMicrophoneError: Error | null
   subscribeGate: Promise<void> | null
 }): FakeMonitorRoom {
   const participantsChanged: (() => void)[] = []
@@ -164,6 +185,11 @@ function makeFakeMonitorRoom(flags: {
   const subscribeCameraCalls: string[] = []
   const unsubscribeCameraCalls: string[] = []
   const cameraAttachedElements: HTMLVideoElement[] = []
+  const subscribeMicrophoneCalls: string[] = []
+  const unsubscribeMicrophoneCalls: string[] = []
+  const microphoneAttachedElements: HTMLAudioElement[] = []
+  const publishedMicrophoneTracks: MediaStreamTrack[] = []
+  let unpublishMicrophoneCalls = 0
   let connectCalls = 0
   let disconnectCalls = 0
 
@@ -244,6 +270,39 @@ function makeFakeMonitorRoom(flags: {
       unsubscribeCameraCalls.push(identity)
       return Promise.resolve()
     },
+    publishMicrophoneTrack(track: MediaStreamTrack): Promise<void> {
+      publishedMicrophoneTracks.push(track)
+      return Promise.resolve()
+    },
+    unpublishMicrophoneTrack(): Promise<void> {
+      unpublishMicrophoneCalls += 1
+      return Promise.resolve()
+    },
+    subscribeMicrophone(identity: string): Promise<MicrophoneSubscription | null> {
+      // 与另外两条一样不去重：store 的幂等防线正是要在这里被验证。
+      subscribeMicrophoneCalls.push(identity)
+      if (flags.subscribeMicrophoneError) return Promise.reject(flags.subscribeMicrophoneError)
+      if (!self.participants.some((participant) => participant.identity === identity)) {
+        return Promise.resolve(null)
+      }
+      // 麦克风可能还没发布（业务状态领先于媒体状态）：返回 null，界面显示"正在连接…"。
+      if (!self.microphoneAvailable) return Promise.resolve(null)
+      const subscription: MicrophoneSubscription = {
+        identity,
+        attach(element: HTMLAudioElement): () => void {
+          microphoneAttachedElements.push(element)
+          return () => {
+            const index = microphoneAttachedElements.indexOf(element)
+            if (index >= 0) microphoneAttachedElements.splice(index, 1)
+          }
+        },
+      }
+      return Promise.resolve(subscription)
+    },
+    unsubscribeMicrophone(identity: string): Promise<void> {
+      unsubscribeMicrophoneCalls.push(identity)
+      return Promise.resolve()
+    },
     onParticipantsChanged(listener) {
       participantsChanged.push(listener)
       return () => removeFrom(participantsChanged, listener)
@@ -278,9 +337,17 @@ function makeFakeMonitorRoom(flags: {
     subscribeCameraCalls,
     unsubscribeCameraCalls,
     cameraAttachedElements,
+    subscribeMicrophoneCalls,
+    unsubscribeMicrophoneCalls,
+    microphoneAttachedElements,
+    publishedMicrophoneTracks,
+    get unpublishMicrophoneCalls() {
+      return unpublishMicrophoneCalls
+    },
     participants: [],
     screenAvailable: true,
     cameraAvailable: true,
+    microphoneAvailable: true,
     get subscribeError() {
       return flags.subscribeError
     },
@@ -292,6 +359,12 @@ function makeFakeMonitorRoom(flags: {
     },
     set subscribeCameraError(next: Error | null) {
       flags.subscribeCameraError = next
+    },
+    get subscribeMicrophoneError() {
+      return flags.subscribeMicrophoneError
+    },
+    set subscribeMicrophoneError(next: Error | null) {
+      flags.subscribeMicrophoneError = next
     },
     emitParticipantsChanged() {
       for (const listener of [...participantsChanged]) listener()

@@ -142,6 +142,60 @@ export function makeScreenRestoredEvent(sessionId = 'session-1'): RealtimeEvent<
   return { type: 'SCREEN_RESTORED', at: AT, data: { sessionId } }
 }
 
+/**
+ * `PRIVATE_TALK_REQUEST`（§25）：老师请求与学生通话，**只在学生麦克风未开启时**下发。
+ *
+ * 载荷里只有老师的显示名——这是 §26 的直接体现：学生端拿不到、也不该拿到
+ * "课堂里还有谁"这类信息。
+ */
+export function makePrivateTalkRequestEvent(
+  overrides: Partial<{ teacherDisplayName: string }> = {},
+): RealtimeEvent<'PRIVATE_TALK_REQUEST'> {
+  return {
+    type: 'PRIVATE_TALK_REQUEST',
+    at: AT,
+    data: { teacherDisplayName: '王老师', ...overrides },
+  }
+}
+
+/** `PRIVATE_TALK_STARTED`：**学生本人**收到的形状（§47 的收件人表）。 */
+export function makeStudentPrivateTalkStartedEvent(
+  overrides: Partial<{ teacherDisplayName: string }> = {},
+): RealtimeEvent<'PRIVATE_TALK_STARTED'> {
+  return {
+    type: 'PRIVATE_TALK_STARTED',
+    at: AT,
+    data: { teacherDisplayName: '王老师', ...overrides },
+  }
+}
+
+/** `PRIVATE_TALK_ENDED`：学生与老师都会收到（§31 的 TALKING → IDLE）。 */
+export function makePrivateTalkEndedEvent(
+  overrides: Partial<{ studentId: string; sessionId: string }> = {},
+): RealtimeEvent<'PRIVATE_TALK_ENDED'> {
+  return {
+    type: 'PRIVATE_TALK_ENDED',
+    at: AT,
+    data: { studentId: 'student-1', sessionId: 'session-1', ...overrides },
+  }
+}
+
+/**
+ * **老师版**的 `PRIVATE_TALK_STARTED` 载荷，用来验证"发错人也吓不到学生端"。
+ *
+ * 学生端只会显示老师是谁，因此这条载荷里没有 `teacherDisplayName` 时，
+ * 学生端的处理是"忽略"——绝不会把目标学生的姓名显示成老师的名字（§26）。
+ */
+export function makeTeacherShapedPrivateTalkStartedEvent(
+  overrides: Partial<{ studentId: string; sessionId: string; displayName: string }> = {},
+): RealtimeEvent<'PRIVATE_TALK_STARTED'> {
+  return {
+    type: 'PRIVATE_TALK_STARTED',
+    at: AT,
+    data: { studentId: 'student-1', sessionId: 'session-1', displayName: '张三', ...overrides },
+  }
+}
+
 afterEach(() => {
   // 连接引用活在 store 模块的模块作用域里（HMR 需要），必须显式清掉，
   // 否则下一个用例 start() 会因为"已经有一条连接"直接返回。
