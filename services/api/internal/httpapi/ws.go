@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -11,6 +12,7 @@ import (
 	"github.com/classwatch/classwatch/services/api/internal/apperr"
 	"github.com/classwatch/classwatch/services/api/internal/auth"
 	"github.com/classwatch/classwatch/services/api/internal/infrastructure/logging"
+	"github.com/classwatch/classwatch/services/api/internal/metrics"
 	"github.com/classwatch/classwatch/services/api/internal/realtime"
 	"github.com/classwatch/classwatch/services/api/internal/user"
 )
@@ -33,10 +35,85 @@ type socketHandlers struct {
 	// auth is the same middleware the REST routes use. It is called directly rather than
 	// installed with router.Use so the failure can be presented as a close code.
 	auth *authMiddleware
+	// resolver is the process-wide client address policy. The concurrency cap below
+	// keys on it, so the socket a NAT-ed classroom opens are counted against the
+	// address the trusted proxy reported and not against the proxy itself.
+	resolver *ClientIPResolver
+	// sockets caps CONCURRENT sockets per address (§63/§77).
+	sockets *socketCap
+	// metrics is optional instrumentation (§77).
+	metrics *metrics.Metrics
 }
 
-func newSocketHandlers(socket SocketService, auth *authMiddleware) *socketHandlers {
-	return &socketHandlers{socket: socket, auth: auth}
+func newSocketHandlers(socket SocketService, auth *authMiddleware, resolver *ClientIPResolver, sockets *socketCap, m *metrics.Metrics) *socketHandlers {
+	return &socketHandlers{socket: socket, auth: auth, resolver: resolver, sockets: sockets, metrics: m}
+}
+
+// socketCap counts live sockets per client address.
+//
+// WHY a concurrency cap on top of the handshake rate limit: a rate limit bounds how
+// fast sockets are opened, not how many stay open. A reconnect loop that never
+// closes, or a script that opens sockets and stops reading, accumulates a
+// goroutine, a write queue and a file descriptor each. The cap makes "one address
+// holds at most N sockets" a property of the process rather than a hope.
+//
+// The counter is decremented when the handler returns, which is exactly when the
+// socket ends: SocketService.Serve blocks for the lifetime of the connection.
+type socketCap struct {
+	limit int
+	mu    sync.Mutex
+	live  map[string]int
+}
+
+func newSocketCap(limit int) *socketCap {
+	if limit <= 0 {
+		return nil
+	}
+	return &socketCap{limit: limit, live: make(map[string]int)}
+}
+
+// acquire reserves one slot for addr. The returned release function is idempotent
+// and safe to defer immediately.
+func (c *socketCap) acquire(addr string) (release func(), ok bool) {
+	if c == nil {
+		return func() {}, true
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.live[addr] >= c.limit {
+		return nil, false
+	}
+	c.live[addr]++
+	// The release is idempotent (sync.Once) because the caller defers it and the
+	// handler has more than one return path: a double release would free a slot that
+	// belongs to another connection from the same address, and the cap would then be
+	// silently higher than configured for exactly the client that abuses it.
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if c.live[addr] <= 1 {
+				// Delete the bucket rather than leaving a zero: a process that has
+				// been up for a term must not keep one map entry per address that
+				// ever connected.
+				delete(c.live, addr)
+				return
+			}
+			c.live[addr]--
+		})
+	}, true
+}
+
+// liveCount reports how many sockets one address currently holds. It exists for the
+// tests, which must not assert on timing.
+func (c *socketCap) liveCount(addr string) int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.live[addr]
 }
 
 // serve authenticates the handshake and then either serves the socket or refuses it.
@@ -83,6 +160,21 @@ func (h *socketHandlers) serve(role realtime.Role, entry AuthEntry) gin.HandlerF
 			return
 		}
 
+		// The cap is applied AFTER authentication and before the socket is
+		// registered. Charging an unauthenticated handshake against the cap would
+		// let anyone exhaust an address's budget with cheap 401s and lock the real
+		// student behind the same NAT out of their classroom.
+		addr := ""
+		if h.resolver != nil {
+			addr = h.resolver.ClientIP(c.Request)
+		}
+		release, ok := h.sockets.acquire(addr)
+		if !ok {
+			h.rejectTooManySockets(c, entry, role, addr)
+			return
+		}
+		defer release()
+
 		if serveErr := h.socket.Serve(c.Writer, c.Request, role, principal.UserID); serveErr != nil {
 			h.serveFailure(c, role, principal, serveErr)
 		}
@@ -122,6 +214,25 @@ func (h *socketHandlers) reject(c *gin.Context, entry AuthEntry, role realtime.R
 		// already written the HTTP error, so there is nothing left to answer with.
 		c.Abort()
 	}
+}
+
+// rejectTooManySockets answers a handshake that would exceed the per-address cap.
+//
+// The answer is the standard 429 envelope (a browser that is refused an upgrade
+// cannot read it, but the frontend's reconnect loop treats a refused handshake as
+// "back off" either way, and the log line names the reason). 429 rather than 503:
+// nothing is broken, this address simply holds too many sockets.
+func (h *socketHandlers) rejectTooManySockets(c *gin.Context, entry AuthEntry, role realtime.Role, addr string) {
+	h.metrics.IncRateLimitRejected(metrics.RateLimitScopeWSHandshake, metrics.DimensionIP)
+	LoggerFrom(c).Warn("websocket rejected: too many concurrent connections from this address",
+		"action", "ws_connection_cap",
+		"entry", entry.PathPrefix,
+		"role", string(role),
+		"ip", addr,
+		"limit", h.sockets.limit,
+	)
+	c.Writer.Header().Set(headerRetryAfter, "5")
+	RespondError(c, apperr.New(apperr.CodeRateLimited))
 }
 
 // serveFailure maps a hub failure onto a response, mirroring the pre-close-code
@@ -200,7 +311,7 @@ func errorCause(err error) string {
 // upgrader (realtime.Hub): a hostile page cannot forge the Origin header, so a
 // connection from an origin outside the allowlist is refused even though the browser
 // would happily attach the victim's cookie.
-func registerSocketRoutes(router *gin.Engine, deps Deps, entries []AuthEntry) {
+func registerSocketRoutes(router *gin.Engine, deps Deps, entries []AuthEntry, resolver *ClientIPResolver) {
 	if deps.Socket == nil || deps.Auth == nil {
 		// No hub (a deployment without the realtime layer) or no auth service (no
 		// database): the routes are not registered, so they answer 404 instead of
@@ -209,7 +320,20 @@ func registerSocketRoutes(router *gin.Engine, deps Deps, entries []AuthEntry) {
 	}
 
 	mw := newAuthMiddleware(deps.Auth, entries, deps.Config)
-	handlers := newSocketHandlers(deps.Socket, mw)
+	// Same reasoning as the body cap in NewRouter: a nil Config is supported (there
+	// are no entries to serve then, because the entry points come from the config),
+	// and the cap must default rather than panic.
+	maxSocketsPerIP := 0
+	if deps.Config != nil {
+		maxSocketsPerIP = deps.Config.WSMaxConnectionsPerIP
+	}
+	handlers := newSocketHandlers(deps.Socket, mw, resolver, newSocketCap(maxSocketsPerIP), deps.Metrics)
+
+	// The handshake limiter is per address and cheap (it is the coarse front door of
+	// a long-lived resource); the concurrency cap inside the handler is what bounds
+	// the resource itself. Both are needed: see socketCap.
+	handshakeLimit := RateLimitWSHandshake(deps.Limiter, deps.Metrics, resolver,
+		deps.Config.RateLimitWSHandshake, deps.Config.RateLimitEndpointWindow)
 
 	// One route per entry point, each bound to its own cookie and role — the same
 	// structure as registerAuthRoutes, and for the same reason: a student cookie cannot
@@ -221,9 +345,9 @@ func registerSocketRoutes(router *gin.Engine, deps Deps, entries []AuthEntry) {
 	for _, entry := range entries {
 		switch entry.Role {
 		case user.RoleStudent:
-			router.GET("/ws/student", handlers.serve(realtime.RoleStudent, entry))
+			router.GET("/ws/student", handshakeLimit, handlers.serve(realtime.RoleStudent, entry))
 		case user.RoleTeacher:
-			router.GET("/ws/teacher", handlers.serve(realtime.RoleTeacher, entry))
+			router.GET("/ws/teacher", handshakeLimit, handlers.serve(realtime.RoleTeacher, entry))
 		default:
 			// No admin socket exists in V1: the administrator's surface manages accounts
 			// and has nothing to watch live.

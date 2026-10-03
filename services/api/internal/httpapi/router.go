@@ -12,13 +12,12 @@ package httpapi
 
 import (
 	"log/slog"
-	"net/http"
-	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/classwatch/classwatch/services/api/internal/apperr"
 	"github.com/classwatch/classwatch/services/api/internal/config"
+	"github.com/classwatch/classwatch/services/api/internal/metrics"
 	"github.com/classwatch/classwatch/services/api/internal/ratelimit"
 	"github.com/classwatch/classwatch/services/api/internal/user"
 )
@@ -76,6 +75,15 @@ type Deps struct {
 	// §2.2/§63 make it mandatory in every real deployment, and main always wires
 	// a Redis-backed limiter with an in-memory fallback.
 	Limiter ratelimit.Limiter
+	// Metrics is the §77 metric set. A nil value installs no instrumentation and
+	// does not register /metrics: a deployment that did not ask for metrics should
+	// not have an endpoint that pretends to serve them, and every existing test
+	// keeps working unchanged.
+	Metrics *metrics.Metrics
+	// Drain is the shutdown gate (§62). A nil value means the router never reports
+	// "going away", which is correct for a test that runs a router without an
+	// http.Server lifecycle.
+	Drain *DrainGate
 }
 
 // WebhookDeps bundles the two collaborators of the LiveKit webhook endpoint.
@@ -96,6 +104,13 @@ func NewRouter(deps Deps) *gin.Engine {
 	logger := deps.Logger
 	if logger == nil {
 		logger = slog.Default()
+	}
+	// A Config built by hand (a test, a tool) must not silently lose the §63
+	// hardening: a zero body limit or a zero window would read as "off".
+	// ApplyDefaults only fills fields that are still zero, so a loaded Config is
+	// unchanged.
+	if deps.Config != nil {
+		deps.Config.ApplyDefaults()
 	}
 
 	// Release mode in production silences gin's route-debug output and its
@@ -140,14 +155,35 @@ func NewRouter(deps Deps) *gin.Engine {
 		_ = router.SetTrustedProxies(nil)
 	}
 
-	// Order matters: the request id must exist before anything can log it, the
-	// access log must wrap the recovery handler so a panic is still logged, and
-	// CORS must reject a hostile origin before a handler does any work.
-	router.Use(
-		RequestIDMiddleware(logger),
-		AccessLogMiddleware(logger, resolver),
-		RecoveryMiddleware(logger),
-	)
+	// Order matters, and every step of it is load-bearing (§59/§62/§63):
+	//
+	//  1. RequestID first: nothing can be logged or correlated before it exists.
+	//  2. AccessLog next: it must wrap everything, so a request that dies in the
+	//     middle of the chain is still one log line.
+	//  3. DrainGate: a request that arrives while the process is shutting down is
+	//     refused before it can touch a handler or a database pool that is about
+	//     to close.
+	//  4. Metrics OUTSIDE Recovery: a panic must be observed as the 500 that
+	//     Recovery produces, not as the 200 the writer still claims while the
+	//     panic unwinds (see MetricsMiddleware).
+	//  5. SecurityHeaders before CORS and the handlers: the headers must also be
+	//     present on a refused cross-origin request and on a 404.
+	//  6. BodyLimit before any handler can read a body.
+	router.Use(RequestIDMiddleware(logger))
+	router.Use(AccessLogMiddleware(logger, resolver))
+	router.Use(deps.Drain.Middleware())
+	router.Use(MetricsMiddleware(deps.Metrics))
+	router.Use(RecoveryMiddleware(logger))
+	router.Use(SecurityHeadersMiddleware(resolver))
+	// Read through a local because a nil Config is a supported input (the router is
+	// usable without one: only the probes and /metrics exist then), and a middleware
+	// must never be the thing that panics on a supported input. A zero limit means
+	// "no body cap", which is what BodyLimitMiddleware already does.
+	var maxBodyBytes int64
+	if deps.Config != nil {
+		maxBodyBytes = deps.Config.HTTPMaxBodyBytes
+	}
+	router.Use(BodyLimitMiddleware(maxBodyBytes))
 
 	env := ""
 	var origins []string
@@ -165,13 +201,20 @@ func NewRouter(deps Deps) *gin.Engine {
 	router.GET("/healthz", healthzHandler)
 	router.GET("/readyz", readyzHandler(deps.Ready))
 
+	// /metrics sits next to the probes: it is an infrastructure endpoint consumed
+	// by a scraper, not part of the versioned browser contract, and it needs no
+	// session (see metrics.Handler for why, and for the production advice).
+	if deps.Metrics != nil {
+		router.GET("/metrics", gin.WrapH(deps.Metrics.Handler()))
+	}
+
 	v1 := router.Group("/api/v1")
 	{
 		// The coarse limit covers every API route, including the login endpoints
 		// (which add their own, stricter limits below).
 		if deps.Config != nil {
-			v1.Use(RateLimitAPI(deps.Limiter, resolver,
-				deps.Config.RateLimitAPIPerMinute, time.Minute))
+			v1.Use(RateLimitAPI(deps.Limiter, deps.Metrics, resolver,
+				deps.Config.RateLimitAPIPerMinute, deps.Config.RateLimitAPIWindow))
 		}
 		v1.GET("/meta", metaHandler(env))
 	}
@@ -192,7 +235,7 @@ func NewRouter(deps Deps) *gin.Engine {
 	//     calls. They authenticate with the same session cookie as everything else, and
 	//     they must not consume (or be cut off by) an API request budget mid-lesson.
 	registerWebhookRoute(router, deps, resolver)
-	registerSocketRoutes(router, deps, entries)
+	registerSocketRoutes(router, deps, entries, resolver)
 
 	// Unknown routes and methods must go through the same error envelope as a
 	// handler failure. gin's defaults are bare text ("404 page not found"), which
@@ -203,8 +246,8 @@ func NewRouter(deps Deps) *gin.Engine {
 	// route would be answered as 404. Turning it on gives the correct 405 and an
 	// Allow header, and makes NoMethod reachable.
 	router.HandleMethodNotAllowed = true
-	router.NoRoute(noRouteHandler(http.StatusNotFound))
-	router.NoMethod(noRouteHandler(http.StatusMethodNotAllowed))
+	router.NoRoute(notFoundHandler())
+	router.NoMethod(methodNotAllowedHandler())
 
 	return router
 }
@@ -249,8 +292,10 @@ func registerAuthRoutes(v1 *gin.RouterGroup, deps Deps, resolver *ClientIPResolv
 		// allowlist (CORS middleware) and by two rate limits, and they are the
 		// endpoints an attacker is expected to hammer.
 		group.POST("/auth/login",
-			RateLimitLogin(deps.Limiter, resolver, deps.Config.RateLimitLoginPerMinute, time.Minute),
-			RateLimitLoginPerAccount(deps.Limiter, resolver, deps.Config.RateLimitLoginPerAccountPer10Min, 10*time.Minute),
+			RateLimitLogin(deps.Limiter, deps.Metrics, resolver,
+				deps.Config.RateLimitLoginPerMinute, deps.Config.RateLimitLoginWindow),
+			RateLimitLoginPerAccount(deps.Limiter, deps.Metrics, resolver,
+				deps.Config.RateLimitLoginPerAccountPer10Min, deps.Config.RateLimitLoginAccountWindow),
 			login,
 		)
 
@@ -453,23 +498,28 @@ func entryForRole(entries []AuthEntry, role user.Role) (AuthEntry, bool) {
 	return AuthEntry{}, false
 }
 
-// noRouteHandler renders 404/405 in the standard envelope.
-// The code is INVALID_REQUEST in both cases: from the client's point of view the
-// request targets something this API does not serve, and one code keeps the
-// frontend's error handler small. The HTTP status still separates "wrong path"
-// from "wrong method" for tooling and for HTTP caches.
+// notFoundHandler renders an unmatched path as the standard envelope.
 //
-// No route, parameter or method detail is echoed back — a 404 that lists valid
+// The code is NOT_FOUND and the status is 404: gin's default is a bare text
+// "404 page not found", which would force every client to special-case the one
+// response shape that does not parse as JSON (§58).
+//
+// No route, parameter or method detail is echoed back — a 404 that lists the valid
 // paths is a free map of the attack surface.
-func noRouteHandler(code int) gin.HandlerFunc {
+func notFoundHandler() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		err := apperr.New(apperr.CodeInvalidRequest)
-		err.Status = code
-		if code == http.StatusMethodNotAllowed {
-			err.Message = "Method not allowed for this endpoint."
-		} else {
-			err.Message = "Endpoint not found."
-		}
-		RespondError(c, err)
+		RespondError(c, apperr.New(apperr.CodeNotFound))
+	}
+}
+
+// methodNotAllowedHandler renders a known path with an unknown method.
+//
+// It is only reachable because HandleMethodNotAllowed is on: gin answers 404 for a
+// method mismatch by default, which hides a real client/server disagreement (the
+// frontend calls a PUT the API does not implement) behind "this endpoint does not
+// exist". Gin adds the Allow header itself.
+func methodNotAllowedHandler() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		RespondError(c, apperr.New(apperr.CodeMethodNotAllowed))
 	}
 }

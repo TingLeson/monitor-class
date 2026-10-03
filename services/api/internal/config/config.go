@@ -55,6 +55,81 @@ type Config struct {
 	APIAddr string
 	// LogLevel is a log/slog level name: debug|info|warn|error.
 	LogLevel slog.Level
+	// LogFormat is "text", "json" or "" (empty = follow APP_ENV: JSON in
+	// production, text elsewhere).
+	//
+	// WHY it is configuration and not only a consequence of APP_ENV: a staging
+	// deployment wants the production log SHAPE (so the shipper and the dashboards
+	// are exercised) without production's hardening, and an operator debugging a
+	// single container wants JSON off. Format is a property of where the logs go,
+	// which the process cannot infer.
+	LogFormat string
+
+	// HTTP server limits (§63). Every one of them has a default that is safe for
+	// the public internet, and every one is overridable because a deployment
+	// behind a slow internal proxy may need a different balance — but a zero value
+	// is never allowed, because "no timeout" is how a slowloris takes the process
+	// down.
+	//
+	// HTTPMaxBodyBytes bounds every request body (§63). The largest legitimate
+	// body in this API is a classroom roster import, which is a few kilobytes;
+	// 1 MiB leaves room for a much larger roster and still makes
+	// memory-exhaustion-by-body impossible.
+	HTTPMaxBodyBytes int64
+	// HTTPReadHeaderTimeout bounds reading the request line and headers. It is the
+	// one that defeats slowloris, because it covers the window before any handler
+	// runs and before any body is read.
+	HTTPReadHeaderTimeout time.Duration
+	// HTTPReadTimeout bounds reading the whole request, headers and body. The
+	// largest bodies here are kilobytes, so this is generous for the LAN and still
+	// far below a client's patience.
+	HTTPReadTimeout time.Duration
+	// HTTPWriteTimeout bounds writing one response.
+	//
+	// # Why this does not cut a WebSocket connection
+	//
+	// A business socket (§47) is a HIJACKED connection: net/http clears the
+	// connection deadline when a handler hijacks it, and the hub then sets its own
+	// deadline around every frame it writes. A 30s write timeout therefore bounds
+	// the HTTP request that performed the handshake and nothing else. This is not
+	// an assumption: realtime.TestWriteTimeoutDoesNotCutWebSockets holds a socket
+	// open past the timeout and exchanges a message on it.
+	HTTPWriteTimeout time.Duration
+	// HTTPIdleTimeout bounds how long a keep-alive connection may sit idle between
+	// requests. Without it, a browser that walks away leaves a socket (and a file
+	// descriptor) per abandoned tab.
+	HTTPIdleTimeout time.Duration
+	// HTTPShutdownTimeout bounds the whole graceful-shutdown sequence (§62):
+	// stop accepting, drain in-flight requests, close the sockets, close the
+	// pools. It must stay below the orchestrator's SIGKILL grace period.
+	HTTPShutdownTimeout time.Duration
+	// HTTPDrainDelay is how long the process keeps SERVING after the drain gate
+	// opens and before it stops listening.
+	//
+	// WHY this exists, and why it is not optional in a load-balanced deployment:
+	// http.Server.Shutdown stops the listeners immediately and — more importantly —
+	// silently DROPS a request that arrives on a connection it has already decided
+	// to retire. A request dropped that way is indistinguishable, in the browser,
+	// from a network failure. Serving 503 SERVICE_UNAVAILABLE for a short window
+	// instead is what turns a rolling deploy into "one retry" rather than "one
+	// broken screen", and it is also the window in which a load balancer's
+	// readiness probe (which now fails) removes this instance from rotation.
+	//
+	// Two seconds is the default: long enough for a 1-2s probe interval, short
+	// enough that it does not noticeably extend a deploy. Zero is allowed and means
+	// "stop listening immediately" — correct only when nothing routes to this
+	// process (a single-instance deployment, or a test).
+	HTTPDrainDelay time.Duration
+
+	// MetricsSessionRefreshInterval is how often the session census and the other
+	// sampled gauges are read from the database.
+	//
+	// WHY sampled and not updated on every transition: `classwatch_session_status`
+	// answers an operational question ("how many sessions are in each state right
+	// now?"), not a per-request one. Counting it on every state change would add a
+	// database round trip to the hot path of the whole session state machine, and
+	// an extra UPDATE of a counter row.
+	MetricsSessionRefreshInterval time.Duration
 
 	// CORSAllowedOrigins is the strict browser-origin allowlist. Wildcards are
 	// intentionally not representable: credentialed requests plus "*" is both
@@ -139,6 +214,36 @@ type Config struct {
 	// scripted scrape) from consuming the whole connection pool.
 	RateLimitAPIPerMinute int
 
+	// Per-endpoint limits added in Phase 11 (§63/§77). Each one exists because the
+	// route is either expensive (a media-plane call), authorization-sensitive
+	// (minting a credential) or long-lived (a socket): the coarse API limit alone
+	// would let one client spend a whole classroom's budget on them.
+	//
+	// They share RateLimitEndpointWindow as their window, so the policy of "how
+	// long is a burst" is one setting rather than four.
+	RateLimitPrivateTalk    int
+	RateLimitMediaToken     int
+	RateLimitJoin           int
+	RateLimitWSHandshake    int
+	RateLimitEndpointWindow time.Duration
+
+	// WSMaxConnectionsPerIP caps CONCURRENT business sockets per client address.
+	//
+	// WHY a concurrency cap in addition to a handshake rate limit: one browser
+	// open on one classroom needs one socket, and a legitimate classroom is not
+	// behind one NAT address — but a school is. A rate limit alone still allows an
+	// attacker (or a broken reconnect loop) to accumulate thousands of
+	// simultaneously open sockets, each with a goroutine and a writer queue. The
+	// cap bounds the resource; the rate limit bounds the churn.
+	WSMaxConnectionsPerIP int
+
+	// Windows of the pre-existing limiters. They are configuration because
+	// "requests per minute" is a policy an operator may need to change without a
+	// release, and because a test needs to drive expiry without sleeping a minute.
+	RateLimitLoginWindow        time.Duration
+	RateLimitLoginAccountWindow time.Duration
+	RateLimitAPIWindow          time.Duration
+
 	// PasswordMinLength is the minimum length for TEACHER/ADMIN passwords. Length
 	// is the only password rule enforced, deliberately: composition rules push
 	// people towards "Password1!" patterns, while Argon2id makes a long
@@ -206,6 +311,12 @@ func Load() (*Config, error) {
 	if err := parseLogLevel(cfg); err != nil {
 		return nil, err
 	}
+	if err := parseLogFormat(cfg); err != nil {
+		return nil, err
+	}
+	if err := parseHTTPServer(cfg); err != nil {
+		return nil, err
+	}
 	if err := parseCORSOrigins(cfg); err != nil {
 		return nil, err
 	}
@@ -222,6 +333,12 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if err := parseRateLimits(cfg); err != nil {
+		return nil, err
+	}
+	if err := parseEndpointRateLimits(cfg); err != nil {
+		return nil, err
+	}
+	if err := parseMetrics(cfg); err != nil {
 		return nil, err
 	}
 	if err := parseTrustedProxies(cfg); err != nil {
@@ -244,6 +361,10 @@ func Load() (*Config, error) {
 	if cfg.LiveKitAPIURL == "" {
 		cfg.LiveKitAPIURL = cfg.LiveKitURL
 	}
+	// Every field above is already populated; this call is what keeps the "zero
+	// value means a default, never means off" property true even if a future
+	// parser forgets a field (see ApplyDefaults).
+	cfg.ApplyDefaults()
 	return cfg, nil
 }
 
@@ -264,6 +385,203 @@ func parseLogLevel(cfg *Config) error {
 		return fmt.Errorf("LOG_LEVEL must be one of debug, info, warn, error (got %q)", raw)
 	}
 	cfg.LogLevel = level
+	return nil
+}
+
+// parseLogFormat reads LOG_FORMAT. The empty value is the default and means
+// "decide from APP_ENV" (see LogFormat).
+func parseLogFormat(cfg *Config) error {
+	raw := strings.ToLower(envString("LOG_FORMAT", ""))
+	switch raw {
+	case "", LogFormatText, LogFormatJSON:
+		cfg.LogFormat = raw
+		return nil
+	default:
+		return fmt.Errorf("LOG_FORMAT must be one of %q, %q or empty (got %q)", LogFormatText, LogFormatJSON, raw)
+	}
+}
+
+// Recognised LOG_FORMAT values.
+const (
+	LogFormatText = "text"
+	LogFormatJSON = "json"
+)
+
+// UseJSONLogs reports whether the process must emit one JSON object per line.
+func (c *Config) UseJSONLogs() bool {
+	switch c.LogFormat {
+	case LogFormatJSON:
+		return true
+	case LogFormatText:
+		return false
+	default:
+		return c.IsProduction()
+	}
+}
+
+// Defaults of the Phase 11 transport and limit settings.
+//
+// They live here, once, because two callers need them: parseHTTPServer (which
+// applies them while reading the environment) and ApplyDefaults (which applies
+// them to a Config that was built by hand — a test, a tool, or a future embedder).
+// Two copies of "1 MiB" would eventually disagree, and the copy that loses is the
+// one nobody reads.
+const (
+	defaultHTTPMaxBodyBytes       = 1 << 20 // 1 MiB
+	defaultHTTPReadHeaderTimeout  = 5 * time.Second
+	defaultHTTPReadTimeout        = 15 * time.Second
+	defaultHTTPWriteTimeout       = 30 * time.Second
+	defaultHTTPIdleTimeout        = 60 * time.Second
+	defaultHTTPShutdownTimeout    = 10 * time.Second
+	defaultHTTPDrainDelay         = 2 * time.Second
+	defaultMetricsRefreshInterval = 15 * time.Second
+	defaultEndpointWindow         = time.Minute
+	defaultLoginWindow            = time.Minute
+	defaultLoginAccountWindow     = 10 * time.Minute
+	defaultAPIWindow              = time.Minute
+	defaultRateLimitPrivateTalk   = 30
+	defaultRateLimitMediaToken    = 20
+	defaultRateLimitJoin          = 60
+	defaultRateLimitWSHandshake   = 60
+	defaultWSMaxConnectionsPerIP  = 16
+)
+
+// ApplyDefaults fills every Phase 11 transport/limit field that is still zero.
+//
+// WHY this exists on top of Load: Load already produces a fully populated Config,
+// but Config is also constructed directly — by tests, and by any future tool that
+// embeds the API. A zero window silently DISABLES a rate limiter and a zero
+// timeout silently disables a slowloris guard, and "the guard was off because
+// nobody set the field" is not a failure anyone notices until it is an incident.
+// Filling the gaps here makes the zero value of those fields impossible to
+// misread as "off".
+//
+// It is idempotent, so calling it twice is harmless.
+func (c *Config) ApplyDefaults() {
+	if c == nil {
+		return
+	}
+	if c.HTTPMaxBodyBytes <= 0 {
+		c.HTTPMaxBodyBytes = defaultHTTPMaxBodyBytes
+	}
+	if c.HTTPReadHeaderTimeout <= 0 {
+		c.HTTPReadHeaderTimeout = defaultHTTPReadHeaderTimeout
+	}
+	if c.HTTPReadTimeout <= 0 {
+		c.HTTPReadTimeout = defaultHTTPReadTimeout
+	}
+	if c.HTTPWriteTimeout <= 0 {
+		c.HTTPWriteTimeout = defaultHTTPWriteTimeout
+	}
+	if c.HTTPIdleTimeout <= 0 {
+		c.HTTPIdleTimeout = defaultHTTPIdleTimeout
+	}
+	if c.HTTPShutdownTimeout <= 0 {
+		c.HTTPShutdownTimeout = defaultHTTPShutdownTimeout
+	}
+	// A zero drain delay is meaningful (nothing routes here yet), so it is left
+	// alone: only a negative value is nonsense.
+	if c.HTTPDrainDelay < 0 {
+		c.HTTPDrainDelay = 0
+	}
+	if c.MetricsSessionRefreshInterval <= 0 {
+		c.MetricsSessionRefreshInterval = defaultMetricsRefreshInterval
+	}
+	if c.RateLimitEndpointWindow <= 0 {
+		c.RateLimitEndpointWindow = defaultEndpointWindow
+	}
+	if c.RateLimitLoginWindow <= 0 {
+		c.RateLimitLoginWindow = defaultLoginWindow
+	}
+	if c.RateLimitLoginAccountWindow <= 0 {
+		c.RateLimitLoginAccountWindow = defaultLoginAccountWindow
+	}
+	if c.RateLimitAPIWindow <= 0 {
+		c.RateLimitAPIWindow = defaultAPIWindow
+	}
+	if c.RateLimitPrivateTalk <= 0 {
+		c.RateLimitPrivateTalk = defaultRateLimitPrivateTalk
+	}
+	if c.RateLimitMediaToken <= 0 {
+		c.RateLimitMediaToken = defaultRateLimitMediaToken
+	}
+	if c.RateLimitJoin <= 0 {
+		c.RateLimitJoin = defaultRateLimitJoin
+	}
+	if c.RateLimitWSHandshake <= 0 {
+		c.RateLimitWSHandshake = defaultRateLimitWSHandshake
+	}
+	if c.WSMaxConnectionsPerIP <= 0 {
+		c.WSMaxConnectionsPerIP = defaultWSMaxConnectionsPerIP
+	}
+}
+
+// parseHTTPServer reads the §63 transport hardening knobs.
+//
+// The defaults are chosen for a public deployment behind a reverse proxy:
+//
+//   - body 1 MiB: every legitimate body in this API is a few kilobytes, and a
+//     bound is what makes "send 4 GiB and watch the heap grow" impossible.
+//   - ReadHeaderTimeout 5s: the slowloris window. A real client sends its headers
+//     in one round trip; five seconds is generous even on a bad mobile link.
+//   - ReadTimeout 15s: headers plus body. Three times the header budget, because
+//     a roster import over a slow uplink is the slowest legitimate request.
+//   - WriteTimeout 30s: enough for the slowest handler (a media-plane call with a
+//     retry, or a monitoring poll that waits on LiveKit) and short enough that a
+//     stuck client cannot hold a response forever. It does NOT cut WebSockets:
+//     see the field comment.
+//   - IdleTimeout 60s: a keep-alive connection is cheaper than a TLS handshake,
+//     but an abandoned tab must eventually release its socket.
+//   - Shutdown 10s: comfortably below the 30s SIGKILL grace period that container
+//     runtimes use by default.
+func parseHTTPServer(cfg *Config) error {
+	body, err := envInt("HTTP_MAX_BODY_BYTES", defaultHTTPMaxBodyBytes)
+	if err != nil {
+		return err
+	}
+	// The upper bound is a sanity check, not a policy: a body limit above 64 MiB
+	// means a single request can allocate more than a small instance has, which
+	// defeats the point of having the limit.
+	const maxBodyBytes = 64 << 20
+	if body <= 0 || body > maxBodyBytes {
+		return fmt.Errorf("HTTP_MAX_BODY_BYTES must be between 1 and %d (got %d)", maxBodyBytes, body)
+	}
+	cfg.HTTPMaxBodyBytes = int64(body)
+
+	if cfg.HTTPReadHeaderTimeout, err = envDuration("HTTP_READ_HEADER_TIMEOUT", defaultHTTPReadHeaderTimeout); err != nil {
+		return err
+	}
+	if cfg.HTTPReadTimeout, err = envDuration("HTTP_READ_TIMEOUT", defaultHTTPReadTimeout); err != nil {
+		return err
+	}
+	if cfg.HTTPWriteTimeout, err = envDuration("HTTP_WRITE_TIMEOUT", defaultHTTPWriteTimeout); err != nil {
+		return err
+	}
+	if cfg.HTTPIdleTimeout, err = envDuration("HTTP_IDLE_TIMEOUT", defaultHTTPIdleTimeout); err != nil {
+		return err
+	}
+	if cfg.HTTPShutdownTimeout, err = envDuration("HTTP_SHUTDOWN_TIMEOUT", defaultHTTPShutdownTimeout); err != nil {
+		return err
+	}
+	if cfg.HTTPDrainDelay, err = envNonNegativeDuration("HTTP_DRAIN_DELAY", defaultHTTPDrainDelay); err != nil {
+		return err
+	}
+	// ReadHeaderTimeout must not exceed ReadTimeout: the whole-request deadline
+	// starts at the same instant, so a larger header budget would be silently
+	// truncated by the outer one — a configuration that lies about itself.
+	if cfg.HTTPReadHeaderTimeout > cfg.HTTPReadTimeout {
+		return fmt.Errorf("HTTP_READ_HEADER_TIMEOUT (%s) must not exceed HTTP_READ_TIMEOUT (%s)",
+			cfg.HTTPReadHeaderTimeout, cfg.HTTPReadTimeout)
+	}
+	return nil
+}
+
+func parseMetrics(cfg *Config) error {
+	interval, err := envDuration("METRICS_SESSION_REFRESH_INTERVAL", defaultMetricsRefreshInterval)
+	if err != nil {
+		return err
+	}
+	cfg.MetricsSessionRefreshInterval = interval
 	return nil
 }
 
@@ -395,6 +713,86 @@ func parseRateLimits(cfg *Config) error {
 	cfg.RateLimitLoginPerMinute = login
 	cfg.RateLimitLoginPerAccountPer10Min = loginPerAccount
 	cfg.RateLimitAPIPerMinute = api
+	return nil
+}
+
+// parseEndpointRateLimits reads the Phase 11 per-endpoint limits and every window
+// (§63/§77).
+//
+// Defaults are derived from what one teacher and one student legitimately do:
+//
+//   - private talk: a teacher starts/stops a talk by hand, so 30/minute is already
+//     an order of magnitude more than a human can produce; the limit exists to stop
+//     a script, and the state machine would serialize it anyway.
+//   - media token: one per join, plus a retry after a LiveKit hiccup. 20/minute per
+//     address lets a whole classroom behind one NAT retry and still stops a loop
+//     that mints credentials.
+//   - join: 60/minute. A student joins once; a reconnecting browser retries a few
+//     times. A NAT-ed classroom of 30 students sharing one egress address all join
+//     within the same minute, so this one is deliberately roomy — the per-session
+//     rules (§43/§50), not this limit, are what prevent abuse.
+//   - ws handshake: 60/minute, for the same NAT reason (one classroom opening its
+//     consoles at once is ~31 handshakes), while still bounding the realistic
+//     failure mode: a reconnect loop, where each handshake costs a database session
+//     lookup.
+func parseEndpointRateLimits(cfg *Config) error {
+	privateTalk, err := envInt("RATE_LIMIT_PRIVATE_TALK", defaultRateLimitPrivateTalk)
+	if err != nil {
+		return err
+	}
+	mediaToken, err := envInt("RATE_LIMIT_MEDIA_TOKEN", defaultRateLimitMediaToken)
+	if err != nil {
+		return err
+	}
+	join, err := envInt("RATE_LIMIT_JOIN", defaultRateLimitJoin)
+	if err != nil {
+		return err
+	}
+	ws, err := envInt("RATE_LIMIT_WS_HANDSHAKE", defaultRateLimitWSHandshake)
+	if err != nil {
+		return err
+	}
+	maxSockets, err := envInt("WS_MAX_CONNECTIONS_PER_IP", defaultWSMaxConnectionsPerIP)
+	if err != nil {
+		return err
+	}
+	// A slice, not a map: the error message must name the same variable on every
+	// run, or an operator chasing a boot failure sees a different complaint each
+	// time they retry.
+	for _, limit := range []struct {
+		name  string
+		value int
+	}{
+		{"RATE_LIMIT_PRIVATE_TALK", privateTalk},
+		{"RATE_LIMIT_MEDIA_TOKEN", mediaToken},
+		{"RATE_LIMIT_JOIN", join},
+		{"RATE_LIMIT_WS_HANDSHAKE", ws},
+		// 16 sockets from one address is far above one browser (which opens one
+		// socket per console tab) and far below what it takes to exhaust a process.
+		{"WS_MAX_CONNECTIONS_PER_IP", maxSockets},
+	} {
+		if limit.value <= 0 {
+			return fmt.Errorf("%s must be > 0 (got %d); disabling a limit must be a code change, not a configuration value", limit.name, limit.value)
+		}
+	}
+	cfg.RateLimitPrivateTalk = privateTalk
+	cfg.RateLimitMediaToken = mediaToken
+	cfg.RateLimitJoin = join
+	cfg.RateLimitWSHandshake = ws
+	cfg.WSMaxConnectionsPerIP = maxSockets
+
+	if cfg.RateLimitEndpointWindow, err = envDuration("RATE_LIMIT_ENDPOINT_WINDOW", defaultEndpointWindow); err != nil {
+		return err
+	}
+	if cfg.RateLimitLoginWindow, err = envDuration("RATE_LIMIT_LOGIN_WINDOW", defaultLoginWindow); err != nil {
+		return err
+	}
+	if cfg.RateLimitLoginAccountWindow, err = envDuration("RATE_LIMIT_LOGIN_ACCOUNT_WINDOW", defaultLoginAccountWindow); err != nil {
+		return err
+	}
+	if cfg.RateLimitAPIWindow, err = envDuration("RATE_LIMIT_API_WINDOW", defaultAPIWindow); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -634,6 +1032,23 @@ func envInt(key string, fallback int) (int, error) {
 	v, err := strconv.Atoi(strings.TrimSpace(raw))
 	if err != nil {
 		return 0, fmt.Errorf("%s must be an integer (got %q)", key, raw)
+	}
+	return v, nil
+}
+
+// envNonNegativeDuration is envDuration for a delay where ZERO is a legitimate
+// value ("do not wait"), as opposed to a bound where zero would disable a guard.
+func envNonNegativeDuration(key string, fallback time.Duration) (time.Duration, error) {
+	raw, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return fallback, nil
+	}
+	v, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a Go duration such as 2s (got %q)", key, raw)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("%s must not be negative (got %q)", key, raw)
 	}
 	return v, nil
 }

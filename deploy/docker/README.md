@@ -13,13 +13,29 @@
 
 因此：
 
-| 镜像             | Dockerfile 位置           | 构建命令                                                      |
-| ---------------- | ------------------------- | ------------------------------------------------------------- |
-| API（Go）        | `services/api/Dockerfile` | `make image` 或 `docker build -t classwatch-api services/api` |
-| 三个前端静态站点 | 本目录（Phase 11）        | 前端开发期用宿主的 `pnpm dev`，生产再容器化（任务书 §61）     |
+| 镜像             | Dockerfile 位置                | 构建命令                                                               |
+| ---------------- | ------------------------------ | ---------------------------------------------------------------------- |
+| API（Go）        | `services/api/Dockerfile`      | `make image` 或 `docker build -t classwatch-api services/api`          |
+| 三个前端静态站点 | `deploy/docker/web.Dockerfile` | `docker build -f deploy/docker/web.Dockerfile -t classwatch-web:<v> .` |
 
-## Phase 11 会在这里补什么
+## Phase 11 补上了什么
 
-- 三个 SPA 的多阶段构建（`pnpm build` → Nginx/静态托管），
-- 与 `deploy/nginx/` 的反代配置配合的生产 compose / 编排文件，
-- 镜像tag策略与非 root 运行、只读根文件系统等加固项。
+| 文件             | 作用                                                                                                                                       |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `web.Dockerfile` | 三个 SPA 的多阶段构建（`pnpm install --frozen-lockfile` → `pnpm build`），产物按 `student/teacher/admin` 分目录；运行时镜像里**没有 Node** |
+| `publish-web.sh` | 一次性容器把镜像里的产物发布到 `webdist` 卷（Caddy 只读挂载）                                                                              |
+
+### 为什么是"镜像 + 一次性发布容器"，而不是 bind mount 宿主的 `dist/`
+
+1. **bind mount 一个不存在的宿主目录时，Docker 会静默创建一个空目录**，
+   站点点开是白屏而**不是**报错——"部署成功但站点是空的"是最难查的失败形态。
+   `publish-web.sh` 会检查三个 `index.html`，缺一个就让容器以非 0 退出，
+   `caddy` 的 `depends_on: service_completed_successfully` 因此拒绝启动。
+2. **构建环境与 CI 完全一致**：Node/pnpm 版本与 `pnpm-lock.yaml` 都锁在镜像里，
+   不会出现"服务器上的 Node 比 CI 新一个小版本，产物不同"。
+3. **回滚方式与 API 一致**：换回上一个镜像标签（见 `deploy/README.md` 步骤 10）。
+
+### 仍然不做的事（明确记录，避免"以为做了"）
+
+- 不做镜像签名 / `cosign` 校验：当前只依赖"不可变标签 + 私有 registry"。
+- 发布容器不用只读根文件系统：它只跑一次 `cp` 就退出，收益极低。

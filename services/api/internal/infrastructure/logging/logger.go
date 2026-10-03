@@ -46,8 +46,12 @@ const (
 //
 // Production emits JSON so log shippers can index fields without regexes;
 // development and test emit text because a human is reading them in a terminal.
-// Format follows APP_ENV rather than LOG_LEVEL so raising verbosity locally
-// never accidentally changes the machine-readable shape in production.
+// The shape is decided by LOG_FORMAT when it is set, and otherwise by APP_ENV, so
+// raising verbosity locally never accidentally changes the machine-readable shape
+// in production, while an operator who wants JSON in staging can say so.
+//
+// Every handler is wrapped in a RedactingHandler: the "must never be logged" list
+// of §59 is enforced by the logger, not only by the discipline of its callers.
 func New(cfg *config.Config, out io.Writer) *slog.Logger {
 	if out == nil {
 		out = os.Stdout
@@ -55,12 +59,12 @@ func New(cfg *config.Config, out io.Writer) *slog.Logger {
 	opts := &slog.HandlerOptions{Level: cfg.LogLevel}
 
 	var handler slog.Handler
-	if cfg.IsProduction() {
+	if cfg.UseJSONLogs() {
 		handler = slog.NewJSONHandler(out, opts)
 	} else {
 		handler = slog.NewTextHandler(out, opts)
 	}
-	return slog.New(handler)
+	return slog.New(NewRedactingHandler(handler))
 }
 
 // Redact builds an attribute for a value that must never appear in a log line:

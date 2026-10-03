@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
+
+	"github.com/classwatch/classwatch/services/api/internal/metrics"
 )
 
 // This file is the MEDIA-PLANE half of §31: the rule that the teacher's microphone
@@ -106,7 +109,14 @@ func (c *Client) EnforcePrivateTalk(
 	observed map[string]ParticipantTracks,
 	teacherIdentities []string,
 	targetIdentity string,
-) (PrivateTalkEnforcement, error) {
+) (enforcement PrivateTalkEnforcement, err error) {
+	// A private talk is TWO subscription changes (grant the target, revoke everybody
+	// else) issued in one reconciliation pass, so it gets its own operation label:
+	// folding it into update_subscriptions would hide §31's traffic inside §26's.
+	start := time.Now()
+	defer func() {
+		c.observeCall(metrics.MediaOperationUpdatePrivateTalk, start, err)
+	}()
 	if c == nil || c.rooms == nil {
 		return PrivateTalkEnforcement{}, fmt.Errorf("livekit: not connected")
 	}
@@ -175,7 +185,7 @@ func (c *Client) EnforcePrivateTalk(
 		return pending[i] < pending[j]
 	})
 
-	enforcement := PrivateTalkEnforcement{TrackSids: micSids}
+	enforcement = PrivateTalkEnforcement{TrackSids: micSids}
 	succeeded := make(map[talkSubscription]struct{}, len(pending)*len(micSids))
 	var failures []error
 	for _, student := range pending {

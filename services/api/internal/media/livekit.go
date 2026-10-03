@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/livekit/protocol/livekit"
@@ -23,6 +24,8 @@ import (
 	"github.com/twitchtv/twirp"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/classwatch/classwatch/services/api/internal/metrics"
 )
 
 // roomService is the slice of the LiveKit RoomService API this package uses.
@@ -58,6 +61,10 @@ type Client struct {
 	// (§44/§59) — see NewClient.
 	apiKey    string
 	apiSecret string
+
+	// metrics is the §77 instrumentation. Optional; every recording is a no-op
+	// when it is nil (see WithMetrics).
+	metrics *metrics.Metrics
 
 	// revoked remembers which peer-track subscriptions were already revoked, per room.
 	// WHY the media client holds state at all: §26 enforcement is a RECONCILIATION
@@ -112,7 +119,9 @@ func NewClient(apiURL, apiKey, apiSecret string) (*Client, error) {
 // It is used by the readiness probe, so it must be cheap and must not mutate
 // anything. The timeout belongs to the caller: readiness needs 2s, a boot check
 // may want more.
-func (c *Client) HealthCheck(ctx context.Context) error {
+func (c *Client) HealthCheck(ctx context.Context) (err error) {
+	start := time.Now()
+	defer func() { c.observeCall(metrics.MediaOperationHealthCheck, start, err) }()
 	if c == nil || c.rooms == nil {
 		return fmt.Errorf("livekit: not connected")
 	}
@@ -132,7 +141,19 @@ func (c *Client) HealthCheck(ctx context.Context) error {
 // (§8/§26/§44). Room names and identities reach every participant's client and
 // the LiveKit dashboard; a name there would tell a student exactly who else is
 // being monitored. All media-layer identities are opaque UUIDs.
-func (c *Client) CreateRoom(ctx context.Context, roomName string) error {
+func (c *Client) CreateRoom(ctx context.Context, roomName string) (err error) {
+	start := time.Now()
+	defer func() { c.observeCall(metrics.MediaOperationCreateRoom, start, err) }()
+	return c.createRoom(ctx, roomName)
+}
+
+// createRoom is CreateRoom without the instrumentation.
+//
+// WHY the split: EnsureRoom calls it, and counting both methods would attribute one
+// logical "make sure the room exists" to two operations — the `create_room` counter
+// would then be a mix of direct calls and joins, and neither number would answer a
+// question. Each public method measures exactly one operation.
+func (c *Client) createRoom(ctx context.Context, roomName string) error {
 	if err := validateOpaqueRoomName(roomName); err != nil {
 		return err
 	}
@@ -159,7 +180,9 @@ func (c *Client) CreateRoom(ctx context.Context, roomName string) error {
 // transaction. Terminating the LiveKit room afterwards is cleanup that makes the
 // media plane catch up with the database; if it fails, the database is still
 // correct and the media plane is merely behind. Never the other way round.
-func (c *Client) TerminateRoom(ctx context.Context, roomName string) error {
+func (c *Client) TerminateRoom(ctx context.Context, roomName string) (err error) {
+	start := time.Now()
+	defer func() { c.observeCall(metrics.MediaOperationTerminateRoom, start, err) }()
 	if err := validateOpaqueRoomName(roomName); err != nil {
 		return err
 	}
@@ -186,8 +209,10 @@ func (c *Client) TerminateRoom(ctx context.Context, roomName string) error {
 // Treating it as an error would make "the room already exists" — the normal case for
 // everyone except the first participant — look like an outage, and the join endpoint
 // would answer MEDIA_TOKEN_FAILED to a student whose room is perfectly fine.
-func (c *Client) EnsureRoom(ctx context.Context, roomName string) error {
-	err := c.CreateRoom(ctx, roomName)
+func (c *Client) EnsureRoom(ctx context.Context, roomName string) (err error) {
+	start := time.Now()
+	defer func() { c.observeCall(metrics.MediaOperationEnsureRoom, start, err) }()
+	err = c.createRoom(ctx, roomName)
 	if err == nil || isAlreadyExists(err) {
 		return nil
 	}

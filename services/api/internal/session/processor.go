@@ -10,6 +10,7 @@ import (
 
 	"github.com/classwatch/classwatch/services/api/internal/classroom"
 	"github.com/classwatch/classwatch/services/api/internal/infrastructure/logging"
+	"github.com/classwatch/classwatch/services/api/internal/metrics"
 )
 
 // Processor is the runtime event path of §74: it turns media-plane observations and
@@ -39,6 +40,18 @@ type Processor struct {
 	// thing missing is the revocation of a talk whose target went away — which the monitor's
 	// reconciliation pass reaches on its next poll anyway (see Service.enforcePrivateTalk).
 	talk PrivateTalkEnder
+	// metrics is the §77 instrumentation. Optional; a nil value makes every recording a
+	// no-op.
+	metrics *metrics.Metrics
+}
+
+// WithMetrics attaches the metric set (§77).
+func (p *Processor) WithMetrics(m *metrics.Metrics) *Processor {
+	if p == nil {
+		return p
+	}
+	p.metrics = m
+	return p
 }
 
 // NewProcessor wires the processor. events may be nil in a deployment without a
@@ -74,10 +87,36 @@ func (p *Processor) WithPrivateTalkEnder(talk PrivateTalkEnder) *Processor {
 // LiveKit retries: every transition is idempotent, so a retry is safe, and silently
 // dropping an observation would leave a row the teacher's wall trusts in a state the
 // media plane already left.
-func (p *Processor) ProcessWebhook(ctx context.Context, ev *livekit.WebhookEvent) error {
+func (p *Processor) ProcessWebhook(ctx context.Context, ev *livekit.WebhookEvent) (err error) {
 	if p == nil || p.store == nil || ev == nil {
 		return nil
 	}
+
+	// # How one delivery becomes exactly one metric sample
+	//
+	// The outcome is decided in several places — a branch that drops an event type, a
+	// lookup that finds no session, a conditional update that matches nothing, a
+	// database failure — so it is carried in the context and refined along the way
+	// instead of being guessed here from the return value. `applied` is the starting
+	// assumption (the event reached a handler that acts on it) and every "nothing
+	// happened" path downgrades it to `ignored` through the two funnels that already
+	// exist for logging: logDebugSkip and lookup. The deferred recorder then upgrades
+	// it to `rejected` if the call ultimately failed.
+	//
+	// WHY the counter lives here and not in the HTTP handler: the handler cannot tell
+	// "applied" from "correctly ignored" — both are a nil error by contract — and
+	// inferring it from the event name would label a teacher's own participant_joined
+	// as applied when nothing was written.
+	outcome := &webhookOutcome{result: metrics.WebhookResultApplied}
+	ctx = withWebhookOutcome(ctx, outcome)
+	defer func() {
+		result := outcome.result
+		if err != nil {
+			result = metrics.WebhookResultRejected
+		}
+		p.metrics.IncWebhookEvent(webhookEventLabel(ev.GetEvent()), result)
+	}()
+
 	room := ev.GetRoom().GetName()
 	identity := ev.GetParticipant().GetIdentity()
 
@@ -86,6 +125,7 @@ func (p *Processor) ProcessWebhook(ctx context.Context, ev *livekit.WebhookEvent
 		// §33: a LiveKit room existing means some media infrastructure allocated a
 		// name. It does NOT mean a lesson is open — that is a classroom_runs row, and
 		// the teacher's open call wrote it. Logged and dropped.
+		markWebhookIgnored(ctx)
 		logging.FromContext(ctx).Debug("livekit room started",
 			"action", "livekit_room_started",
 			"room", room,
@@ -114,6 +154,7 @@ func (p *Processor) ProcessWebhook(ctx context.Context, ev *livekit.WebhookEvent
 		// (§53: V1 does not record). Debug, not Warn: an event we do not consume is not
 		// an incident, and a Warn here would fire on every LiveKit upgrade that adds a
 		// type.
+		markWebhookIgnored(ctx)
 		logging.FromContext(ctx).Debug("livekit webhook ignored",
 			"action", "livekit_webhook_ignored",
 			"room", room,
@@ -279,6 +320,7 @@ func (p *Processor) trackPublished(ctx context.Context, ev *livekit.WebhookEvent
 	default:
 		// A source this project does not grant (a data track, a future LiveKit enum).
 		// Quiet on purpose: an unobserved source is not an incident.
+		markWebhookIgnored(ctx)
 		logging.FromContext(ctx).Debug("track source without a session rule; session state unchanged",
 			"action", "track_published_ignored",
 			"room", room,
@@ -787,6 +829,7 @@ func (p *Processor) broadcastRoomClosed(ctx context.Context, ref ClassroomRef, r
 // unvetted client-supplied text into the logs.
 func (p *Processor) lookup(ctx context.Context, room, identity string, ev *livekit.WebhookEvent) (*StudentSession, error) {
 	if identity == "" {
+		markWebhookIgnored(ctx)
 		logging.FromContext(ctx).Info("livekit webhook without a participant identity",
 			"action", "livekit_webhook_ignored",
 			"room", room,
@@ -800,6 +843,7 @@ func (p *Processor) lookup(ctx context.Context, room, identity string, ev *livek
 		return nil, err
 	}
 	if stored == nil {
+		markWebhookIgnored(ctx)
 		logging.FromContext(ctx).Info("livekit webhook identity is not a student session of this room",
 			"action", "livekit_webhook_unmatched_identity",
 			"room", room,
@@ -926,6 +970,50 @@ func (p *Processor) endPrivateTalk(ctx context.Context, action string, end func(
 // talkEndTimeout bounds the media-plane work of ending a private talk after the fact.
 const talkEndTimeout = 5 * time.Second
 
+// webhookOutcome carries the classification of one delivery from the branch that
+// decided it to the deferred recorder (see ProcessWebhook).
+type webhookOutcome struct {
+	result string
+}
+
+type webhookOutcomeContextKey struct{}
+
+// withWebhookOutcome attaches an outcome to the context.
+func withWebhookOutcome(ctx context.Context, outcome *webhookOutcome) context.Context {
+	return context.WithValue(ctx, webhookOutcomeContextKey{}, outcome)
+}
+
+// markWebhookIgnored downgrades the outcome of the delivery being processed.
+//
+// A no-op when there is no outcome in the context (a direct call in a test), which is
+// what keeps the helper usable from any code path.
+func markWebhookIgnored(ctx context.Context) {
+	if outcome, ok := ctx.Value(webhookOutcomeContextKey{}).(*webhookOutcome); ok && outcome != nil {
+		outcome.result = metrics.WebhookResultIgnored
+	}
+}
+
+// webhookEventLabel bounds the `event` label of the webhook counter.
+//
+// The event name comes from a VERIFIED body here, so it is LiveKit's vocabulary and a
+// closed set in practice — but the counter would still grow if a future LiveKit release
+// added event types without a matching deploy of this service. Names are therefore kept
+// only when they are recognisably LiveKit's (a short, lowercase, dot-free token); anything
+// else collapses to a constant. A verified body is not a licence for unbounded labels.
+func webhookEventLabel(event string) string {
+	if event == "" || len(event) > 64 {
+		return metrics.WebhookEventUnverified
+	}
+	for _, r := range event {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_':
+		default:
+			return metrics.WebhookEventUnverified
+		}
+	}
+	return event
+}
+
 // runRef resolves the run and classroom a close is about.
 //
 // A run that cannot be found is not an error: it means the close path was called with
@@ -948,6 +1036,10 @@ func (p *Processor) runRef(ctx context.Context, runID uuid.UUID) (ClassroomRef, 
 // LiveKit retries, and the retry of an applied event changes nothing. Logging it at
 // Warn would teach operators to ignore the level.
 func logDebugSkip(ctx context.Context, ev *livekit.WebhookEvent, stored *StudentSession, reason string) {
+	// This is the single funnel for "the event was correct and changed nothing", which is
+	// why the metric outcome is refined here: every duplicate delivery, every terminal
+	// session and every already-recorded observation passes through it.
+	markWebhookIgnored(ctx)
 	logging.FromContext(ctx).Debug("livekit webhook made no change",
 		"action", "livekit_webhook_no_change",
 		"livekit_event", ev.GetEvent(),

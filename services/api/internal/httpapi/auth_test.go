@@ -996,8 +996,8 @@ func TestUnknownAuthRouteStillUsesTheEnvelope(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
-	if code := decodeErrorCode(t, rec); code != "INVALID_REQUEST" {
-		t.Errorf("code = %q, want INVALID_REQUEST", code)
+	if code := decodeErrorCode(t, rec); code != "NOT_FOUND" {
+		t.Errorf("code = %q, want NOT_FOUND", code)
 	}
 }
 

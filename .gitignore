@@ -17,6 +17,9 @@ tmp/
 .env.local
 .env.*.local
 !.env.example
+# 生产环境文件（含真实域名/密码/LiveKit 凭据）：只提交 deploy/.env.production.example。
+# 少了这一行，部署时手一抖 `git add -A` 就会把生产密钥提交上去。
+deploy/.env.production
 
 # ---------- Go ----------
 services/api/bin/

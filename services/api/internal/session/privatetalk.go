@@ -253,6 +253,7 @@ func (r *privateTalkRegistry) snapshot() []privateTalkTarget {
 // Running the pass first means a failed POST leaves the previous state untouched (the
 // monitor reconciles back to it within one poll) and answers 502.
 func (s *Service) StartPrivateTalk(ctx context.Context, in StartPrivateTalkInput) (*PrivateTalkView, error) {
+	defer s.publishPrivateTalkGauge()
 	current, err := s.ownedOpenClassroom(ctx, in.ClassroomID, in.TeacherID)
 	if err != nil {
 		return nil, err
@@ -400,6 +401,7 @@ func (s *Service) StartPrivateTalk(ctx context.Context, in StartPrivateTalkInput
 // classroom close all end in the same place. Nothing is written and nothing is broadcast,
 // so a repeated request cannot produce a second TEACHER_TALK_ENDED.
 func (s *Service) StopPrivateTalk(ctx context.Context, in StopPrivateTalkInput) error {
+	defer s.publishPrivateTalkGauge()
 	// Ownership and existence are enforced even when there is nothing to stop: this
 	// endpoint must not become an oracle for "does this classroom exist and is it mine?".
 	// A CLOSED classroom is NOT an error here — the close already ended the talk (see
@@ -466,6 +468,7 @@ func (s *Service) PrivateTalk(ctx context.Context, classroomID, teacherID uuid.U
 // EndPrivateTalkForSession implements PrivateTalkEnder for the paths that know a session
 // (a webhook, the leave endpoint): the target is gone, so the talk is over.
 func (s *Service) EndPrivateTalkForSession(ctx context.Context, sessionID uuid.UUID, reason string) error {
+	defer s.publishPrivateTalkGauge()
 	target, ok := s.talkState.clearSession(sessionID)
 	if !ok {
 		return nil
@@ -476,6 +479,7 @@ func (s *Service) EndPrivateTalkForSession(ctx context.Context, sessionID uuid.U
 // EndPrivateTalkForRun implements PrivateTalkEnder for the lesson-level path: the run is
 // over, so nothing of it is being talked to any more.
 func (s *Service) EndPrivateTalkForRun(ctx context.Context, runID uuid.UUID, reason string) error {
+	defer s.publishPrivateTalkGauge()
 	if s == nil || s.repo == nil || runID == uuid.Nil {
 		return nil
 	}

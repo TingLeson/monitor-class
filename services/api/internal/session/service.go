@@ -11,6 +11,7 @@ import (
 	"github.com/classwatch/classwatch/services/api/internal/classroom"
 	"github.com/classwatch/classwatch/services/api/internal/infrastructure/logging"
 	"github.com/classwatch/classwatch/services/api/internal/media"
+	"github.com/classwatch/classwatch/services/api/internal/metrics"
 )
 
 // Service implements the session use cases of §43/§45/§49/§51: joining a lesson,
@@ -43,6 +44,46 @@ type Service struct {
 	// a service built by NewService, so no method has to guard against it; see
 	// privatetalk.go for why it is not a database table in Phase 10 (§52/§77).
 	talkState *privateTalkRegistry
+	// metrics is the §77 instrumentation. Optional: a nil value makes every recording a
+	// no-op, which is what the existing unit tests rely on.
+	metrics *metrics.Metrics
+}
+
+// WithMetrics attaches the metric set (§77).
+func (s *Service) WithMetrics(m *metrics.Metrics) *Service {
+	if s == nil {
+		return s
+	}
+	s.metrics = m
+	return s
+}
+
+// ActivePrivateTalkCount reports how many private talks this PROCESS currently holds.
+//
+// It is the value behind classwatch_private_talk_active, and it is read from the one
+// place that knows: the state machine's registry. A gauge maintained by incrementing
+// and decrementing counters at each transition would eventually disagree with the
+// registry (one missed path, one early return), and a gauge that disagrees with the
+// state it describes is worse than no gauge — so the count is DERIVED, never tracked.
+func (s *Service) ActivePrivateTalkCount() int {
+	if s == nil {
+		return 0
+	}
+	return len(s.talkState.snapshot())
+}
+
+// publishPrivateTalkGauge republishes the derived count.
+//
+// WHY every mutating entry point defers this instead of the state machine recording it:
+// talkState has four mutators (start, stop, session-end, run-end) and each of them can
+// return early on a validation failure. A deferred publish runs on every path — success,
+// refusal and panic — so the gauge cannot be left describing a talk that ended, which is
+// the one failure mode that would make an operator chase a phantom.
+func (s *Service) publishPrivateTalkGauge() {
+	if s == nil || s.metrics == nil {
+		return
+	}
+	s.metrics.SetPrivateTalkActive(int64(s.ActivePrivateTalkCount()))
 }
 
 // NewService wires the service. media may be nil in a degraded deployment (the API

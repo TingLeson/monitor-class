@@ -291,8 +291,10 @@ func TestUnknownRouteReturnsUnifiedError(t *testing.T) {
 	if !ok {
 		t.Fatalf("error envelope missing: %s", rec.Body.String())
 	}
-	if errObj["code"] != "INVALID_REQUEST" {
-		t.Errorf("error.code = %v, want INVALID_REQUEST", errObj["code"])
+	// Phase 11 splits the transport-level codes: an unmatched path is NOT_FOUND
+	// (404), a known path with an unknown method is METHOD_NOT_ALLOWED (405).
+	if errObj["code"] != "NOT_FOUND" {
+		t.Errorf("error.code = %v, want NOT_FOUND", errObj["code"])
 	}
 	if msg, _ := errObj["message"].(string); msg == "" {
 		t.Error("error.message is empty; clients would have nothing to show")
@@ -312,8 +314,12 @@ func TestMethodNotAllowedReturnsUnifiedError(t *testing.T) {
 	if allow := rec.Header().Get("Allow"); !strings.Contains(allow, http.MethodGet) {
 		t.Errorf("Allow header = %q, want it to list GET", allow)
 	}
-	if _, ok := decodeBody(t, rec)["error"].(map[string]any); !ok {
-		t.Errorf("405 body is not the unified envelope: %s", rec.Body.String())
+	errObj, ok := decodeBody(t, rec)["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("405 body is not the unified envelope: %s", rec.Body.String())
+	}
+	if errObj["code"] != "METHOD_NOT_ALLOWED" {
+		t.Errorf("405 error.code = %v, want METHOD_NOT_ALLOWED", errObj["code"])
 	}
 }
 

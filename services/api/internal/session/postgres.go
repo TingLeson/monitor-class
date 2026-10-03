@@ -326,6 +326,45 @@ func scanSession(row pgx.Row) (*StudentSession, error) {
 	return &session, nil
 }
 
+// CountByStatus returns how many student_sessions rows exist per status.
+//
+// It exists for the periodic gauge of §77 and for nothing else: it is a census of
+// the whole table, not scoped to a classroom or a run, so it must never be called
+// on a request path. The status vocabulary is returned as-is (including states with
+// zero rows absent from the map) and the caller is expected to publish ALL SIX
+// statuses, which is what keeps a state that disappears readable as 0 instead of
+// stuck at its last value.
+//
+// The query is a single sequential scan of a small table with an index on `status`;
+// at the scale this product targets (a campus) it is microseconds, and it runs 4
+// times a minute.
+func (p *Postgres) CountByStatus(ctx context.Context) (map[Status]int64, error) {
+	if p == nil || p.pool == nil {
+		return nil, errors.New("session: repository is not connected")
+	}
+	rows, err := p.pool.Query(ctx, `SELECT status, count(*) FROM student_sessions GROUP BY status`)
+	if err != nil {
+		return nil, fmt.Errorf("session: count by status: %w", err)
+	}
+	defer rows.Close()
+
+	counts := make(map[Status]int64, 6)
+	for rows.Next() {
+		var (
+			status string
+			count  int64
+		)
+		if err := rows.Scan(&status, &count); err != nil {
+			return nil, fmt.Errorf("session: scan status census: %w", err)
+		}
+		counts[Status(status)] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("session: read status census: %w", err)
+	}
+	return counts, nil
+}
+
 // translateWriteError turns constraint violations into business errors or into
 // readable internal errors, mirroring internal/classroom's translation.
 //

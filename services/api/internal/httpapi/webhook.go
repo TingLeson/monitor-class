@@ -8,6 +8,7 @@ import (
 	"github.com/livekit/protocol/livekit"
 
 	"github.com/classwatch/classwatch/services/api/internal/apperr"
+	"github.com/classwatch/classwatch/services/api/internal/metrics"
 )
 
 // LiveKitVerifier verifies the signature of a LiveKit webhook and parses it (§45).
@@ -59,10 +60,18 @@ type MediaEventProcessor interface {
 //     LiveKit retries. Every transition is a conditional update, so a retry is harmless,
 //     and silently dropping the observation would leave a session row the teacher's wall
 //     trusts in a state the media plane already left.
-func webhookHandler(verifier LiveKitVerifier, processor MediaEventProcessor, resolver *ClientIPResolver) gin.HandlerFunc {
+func webhookHandler(verifier LiveKitVerifier, processor MediaEventProcessor, resolver *ClientIPResolver, m *metrics.Metrics) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		event, err := verifier.Receive(c.Request)
 		if err != nil {
+			// The signature failed, so THE BODY IS UNTRUSTED and is not parsed for an
+			// event name: using a caller-supplied string as a label value would let
+			// one request per name grow this metric without bound. The rejection is
+			// therefore counted under a constant event label.
+			//
+			// The other three outcomes (applied/ignored/rejected) are counted by the
+			// processor, which is the only layer that can tell them apart.
+			m.IncWebhookEvent(metrics.WebhookEventUnverified, metrics.WebhookResultInvalidSignature)
 			// Warn, with the remote address and NOTHING else: the request body is
 			// unauthenticated input, and the Authorization header is a credential
 			// (§59). The remote address is what an operator needs to tell a
@@ -129,5 +138,5 @@ func registerWebhookRoute(router *gin.Engine, deps Deps, resolver *ClientIPResol
 		return
 	}
 	router.POST("/internal/livekit/webhook",
-		webhookHandler(deps.Webhook.Verifier, deps.Webhook.Processor, resolver))
+		webhookHandler(deps.Webhook.Verifier, deps.Webhook.Processor, resolver, deps.Metrics))
 }

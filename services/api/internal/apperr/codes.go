@@ -113,6 +113,34 @@ const (
 	// Generic transport-level failures.
 	CodeInvalidRequest Code = "INVALID_REQUEST"
 	CodeInternal       Code = "INTERNAL"
+
+	// CodeNotFound and CodeMethodNotAllowed are the transport-level answers to
+	// "there is nothing here".
+	//
+	// WHY they are separate from CodeInvalidRequest even though the HTTP status
+	// already distinguishes them: the frontend branches on the CODE, never on the
+	// status (§58). A single generic code would push it into reading the status
+	// again — the exact coupling the error contract exists to remove — and the two
+	// cases ask for different UX (a 404 is "this screen does not exist", a 405 is
+	// "the client and the server disagree about this endpoint").
+	//
+	// They are also additive: INVALID_REQUEST keeps its meaning for a malformed or
+	// refused request to a route that does exist.
+	CodeNotFound         Code = "NOT_FOUND"
+	CodeMethodNotAllowed Code = "METHOD_NOT_ALLOWED"
+
+	// CodePayloadTooLarge is returned when a request body exceeds
+	// HTTP_MAX_BODY_BYTES (§63). It is its own code because the client's action is
+	// specific — send less data — and because it must be distinguishable from a
+	// malformed body in the logs: one is an over-eager client, the other is a
+	// client/server contract mismatch.
+	CodePayloadTooLarge Code = "PAYLOAD_TOO_LARGE"
+
+	// CodeServiceUnavailable is returned while the process is draining for
+	// shutdown (§62). A request that arrives on a connection the load balancer has
+	// not yet retired must get an explicit, retryable answer instead of being
+	// silently dropped or served by a process that is about to exit.
+	CodeServiceUnavailable Code = "SERVICE_UNAVAILABLE"
 )
 
 // defaultMessages maps every code to a short, non-technical sentence.
@@ -169,6 +197,20 @@ var defaultMessages = map[Code]string{
 
 	CodeInvalidRequest: "The request is invalid.",
 	CodeInternal:       "An internal error occurred.",
+
+	// Deliberately terse: a 404 that describes what IS there is a free map of the
+	// attack surface, and a 405 that lists the allowed methods is a free map of the
+	// endpoints. The Allow header carries what HTTP requires; the message does not.
+	CodeNotFound:         "This endpoint does not exist.",
+	CodeMethodNotAllowed: "This method is not allowed for this endpoint.",
+
+	// Actionable without being technical: the client can retry with a smaller
+	// payload (or the operator can raise HTTP_MAX_BODY_BYTES).
+	CodePayloadTooLarge: "The request body is too large.",
+
+	// Short and retryable: during a rolling deploy this is a transient answer, and
+	// the frontend's reconnect/backoff path is the correct reaction.
+	CodeServiceUnavailable: "The service is restarting. Please try again in a moment.",
 }
 
 // DefaultMessage returns the user-facing message for a code.

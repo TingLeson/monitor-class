@@ -158,6 +158,40 @@ test: test-api test-web ## 运行全部测试
 test-api: ## 运行 Go 单元测试
 	cd $(API_DIR) && go test ./...
 
+# prod-* 必须在**干净环境**里跑 compose。
+#
+# WHY：本文件顶部有 `-include .env` + 裸 `export`，会把开发 .env 的每一项灌进 recipe 的环境；
+# 而 docker compose 的变量插值是**进程环境优先于 --env-file**。两者一叠加，生产栈就会
+# 被开发值悄悄覆盖——CORS_ALLOWED_ORIGINS 变成 localhost、TRUSTED_PROXIES 继承本机配置、
+# REDIS_PASSWORD 变成空字符串直接启动失败（这就是当初 `make prod-config` 报
+# "REDIS_PASSWORD is missing a value" 的原因）。用 env -i 起干净环境，只透传外壳需要的变量。
+PROD_ENV := env -i PATH="$$PATH" HOME="$$HOME" TMPDIR="$${TMPDIR:-/tmp}" DOCKER_HOST="$$DOCKER_HOST" DOCKER_CONFIG="$$DOCKER_CONFIG"
+PROD_COMPOSE := $(PROD_ENV) docker compose --env-file deploy/.env.production -f deploy/docker-compose.prod.yml
+
+prod-config: ## 校验生产编排与 Caddyfile 的变量（不启动容器）
+	$(PROD_COMPOSE) config >/dev/null && echo "生产配置解析通过（compose）"
+
+prod-up: ## 拉起/更新生产栈（含构建）
+	$(PROD_COMPOSE) up -d --build
+
+prod-ps: ## 生产容器状态
+	$(PROD_COMPOSE) ps
+
+prod-logs: ## 生产日志：make prod-logs S=api
+	$(PROD_COMPOSE) logs -f --tail=200 $(S)
+
+prod-check: ## 生产网络/证书/探针巡检（需要 API_HOST）
+	deploy/scripts/net-check.sh $${API_HOST:?先设置 API_HOST，例如 API_HOST=api.example.com}
+
+prod-backup: ## 备份生产数据库（保留策略见 deploy/.env.production）
+	deploy/scripts/backup-db.sh
+
+prod-migrate-status: ## 生产迁移状态
+	$(PROD_COMPOSE) run --rm migrate status
+
+bench-api: ## 跑 API 基准（中间件/指标开销护栏）
+	cd services/api && go test -run XXX -bench . -benchmem ./internal/httpapi/
+
 test-integration: env ## 运行需要真实 PostgreSQL 的集成测试
 	@$(COMPOSE) exec -T postgres psql -U $(POSTGRES_USER) -d postgres -tAc \
 		"SELECT 1 FROM pg_database WHERE datname = 'classwatch_test'" | grep -q 1 \

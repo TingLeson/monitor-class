@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/livekit/protocol/livekit"
+
+	"github.com/classwatch/classwatch/services/api/internal/metrics"
 )
 
 // PeerSubscriptionRevocation is one subscription the Control Plane revoked: student
@@ -198,7 +201,11 @@ func (c *Client) EnforceNoPeerSubscriptions(
 	students []string,
 	observed map[string]ParticipantTracks,
 	allowedTrackOwners []string,
-) ([]PeerSubscriptionRevocation, error) {
+) (revocations []PeerSubscriptionRevocation, err error) {
+	start := time.Now()
+	defer func() {
+		c.observeCall(metrics.MediaOperationUpdateSubscriptions, start, err)
+	}()
 	if c == nil || c.rooms == nil {
 		return nil, fmt.Errorf("livekit: not connected")
 	}
@@ -275,7 +282,7 @@ func (c *Client) EnforceNoPeerSubscriptions(
 		}
 	}
 
-	revocations := make([]PeerSubscriptionRevocation, 0, len(plan))
+	revocations = make([]PeerSubscriptionRevocation, 0, len(plan))
 	succeeded := make(map[string]map[revokedSubscription]struct{}, len(plan))
 	var failures []error
 	for _, student := range present {

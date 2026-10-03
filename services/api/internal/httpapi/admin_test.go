@@ -956,8 +956,12 @@ func TestAdminWrongMethodIs405(t *testing.T) {
 			if rec.Code != http.StatusMethodNotAllowed {
 				t.Fatalf("status = %d, want 405 (%s)", rec.Code, rec.Body.String())
 			}
-			if code := decodeErrorCode(t, rec); code != "INVALID_REQUEST" {
-				t.Errorf("code = %q, want INVALID_REQUEST", code)
+			// Phase 11 gave the transport-level failures codes of their own
+			// (NOT_FOUND / METHOD_NOT_ALLOWED) instead of the generic
+			// INVALID_REQUEST: the frontend branches on the code, so "wrong method"
+			// must not look like "malformed body".
+			if code := decodeErrorCode(t, rec); code != "METHOD_NOT_ALLOWED" {
+				t.Errorf("code = %q, want METHOD_NOT_ALLOWED", code)
 			}
 			if allow := rec.Header().Get("Allow"); !strings.Contains(allow, tc.allow) {
 				t.Errorf("Allow = %q, want it to contain %q", allow, tc.allow)
@@ -976,8 +980,8 @@ func TestAdminUnknownPathIs404(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
-	if code := decodeErrorCode(t, rec); code != "INVALID_REQUEST" {
-		t.Errorf("code = %q, want INVALID_REQUEST", code)
+	if code := decodeErrorCode(t, rec); code != "NOT_FOUND" {
+		t.Errorf("code = %q, want NOT_FOUND", code)
 	}
 }
 

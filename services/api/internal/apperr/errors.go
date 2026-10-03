@@ -109,7 +109,7 @@ func HTTPStatus(code Code) int {
 		// tells the frontend to back off instead of retrying in a loop.
 		return http.StatusTooManyRequests
 	case CodeClassroomNotFound, CodeSessionNotFound, CodeUserNotFound, CodeStudentNotFound,
-		CodeStudentNotAssigned:
+		CodeStudentNotAssigned, CodeNotFound:
 		// 404 rather than 403 for "exists but is not yours" only where the
 		// resource id is already unguessable (UUID) and the caller has a
 		// legitimate reason to distinguish "typo" from "denied".
@@ -118,6 +118,9 @@ func HTTPStatus(code Code) int {
 		// account exists but is not on this roster) are both 404: in each case the
 		// caller named a student who is not there, and the fix is to correct the
 		// name or add them — not to log in differently.
+		//
+		// CodeNotFound is the transport-level member of this group: the URL named
+		// something this API does not serve.
 		return http.StatusNotFound
 	case CodeAccountAlreadyExists:
 		// 409 — the request was well formed and would have succeeded against a
@@ -154,6 +157,20 @@ func HTTPStatus(code Code) int {
 		// 502 because the failure is in the media plane, not in the request: the
 		// client's input was fine and retrying can genuinely succeed.
 		return http.StatusBadGateway
+	case CodeMethodNotAllowed:
+		// 405 with gin's own Allow header. The code and the status agree, which is
+		// the whole point of having both: a client that branches on the code sees
+		// the same classification a human reading the status does.
+		return http.StatusMethodNotAllowed
+	case CodePayloadTooLarge:
+		// 413 — the body was rejected before it was interpreted, so no business code
+		// applies.
+		return http.StatusRequestEntityTooLarge
+	case CodeServiceUnavailable:
+		// 503 is what makes a load balancer and a retrying client do the right
+		// thing during a rolling deploy: this process is alive, but not for you
+		// right now.
+		return http.StatusServiceUnavailable
 	default:
 		return http.StatusInternalServerError
 	}

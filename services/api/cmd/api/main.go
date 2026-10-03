@@ -34,16 +34,20 @@ import (
 	"github.com/classwatch/classwatch/services/api/internal/infrastructure/postgres"
 	"github.com/classwatch/classwatch/services/api/internal/infrastructure/redis"
 	"github.com/classwatch/classwatch/services/api/internal/media"
+	"github.com/classwatch/classwatch/services/api/internal/metrics"
 	"github.com/classwatch/classwatch/services/api/internal/ratelimit"
 	"github.com/classwatch/classwatch/services/api/internal/realtime"
 	"github.com/classwatch/classwatch/services/api/internal/session"
 	"github.com/classwatch/classwatch/services/api/internal/user"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// shutdownTimeout bounds graceful shutdown. Ten seconds is enough for in-flight
-// requests to finish and short enough that an orchestrator's SIGKILL window
-// (usually 30s) is never reached.
-const shutdownTimeout = 10 * time.Second
+// shutdownTimeout bounds one STEP of graceful shutdown (the HTTP drain and the
+// socket close each get it, and each gets a fresh deadline). The total budget is
+// therefore bounded by roughly 3x this, which is still comfortably inside the 30s
+// SIGKILL grace period container runtimes use by default.
+//
+// The value itself is HTTP_SHUTDOWN_TIMEOUT (see config.ApplyDefaults for why 10s).
 
 func main() {
 	if err := run(); err != nil {
@@ -65,6 +69,12 @@ func run() error {
 	logger := logging.New(cfg, os.Stdout)
 	logging.SetupDefault(logger)
 	logging.LogStartup(logger, cfg, httpapi.Version, httpapi.Commit)
+
+	// The metric set exists before anything that reports into it. It is created
+	// unconditionally: /metrics is part of the production surface of §77, and the
+	// cost of an unused registry is a few hundred bytes per family.
+	metricSet := metrics.New()
+	metricSet.SetBuildInfo(httpapi.Version, httpapi.Commit)
 	// A debug-only line that answers "did the secret load?" without ever printing
 	// it: logging the secret once while debugging is the most common way it ends
 	// up in a file that later gets attached to a ticket.
@@ -80,11 +90,24 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// The drain gate is the difference between "the listener is closed" and "this
+	// process tells the truth about going away": connections that are already open
+	// (keep-alive, HTTP/2) can still deliver requests after Shutdown starts, and
+	// those must get 503 SERVICE_UNAVAILABLE instead of being served by a process
+	// that is about to exit (see httpapi.DrainGate).
+	drain := httpapi.NewDrainGate()
+
 	deps, err := connectDependencies(ctx, cfg, logger)
 	if err != nil {
 		return err
 	}
 	defer deps.close()
+
+	// The media client reports every RoomService call (§77). It is attached here,
+	// before any service captures the client, so no call can happen uninstrumented.
+	if deps.livekit != nil {
+		deps.livekit.WithMetrics(metricSet)
+	}
 
 	if cfg.DBAutoMigrate {
 		if deps.postgres == nil {
@@ -114,14 +137,14 @@ func run() error {
 	// events is the same realtime service handed out a second time, as the private-talk
 	// message path of §31: the session service produces the facts and the realtime layer
 	// decides who may hear them, exactly as it does for the screen and camera messages.
-	runtime, hub, events := deps.runtimeLayer(logger, cfg)
+	runtime, hub, events := deps.runtimeLayer(logger, cfg, metricSet)
 	if hub != nil {
 		// Close the sockets with a proper "going away" frame before the HTTP server
 		// stops: WebSocket connections are hijacked, so http.Server.Shutdown does not
 		// wait for them, and a client that is told why it was disconnected reconnects
 		// with a backoff instead of treating a deploy as a network failure.
 		defer func() {
-			hubCtx, hubCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+			hubCtx, hubCancel := context.WithTimeout(context.Background(), cfg.HTTPShutdownTimeout)
 			defer hubCancel()
 			hub.Shutdown(hubCtx)
 		}()
@@ -133,6 +156,9 @@ func run() error {
 	// purpose — the session service reports its lifecycle into the processor, and the
 	// processor reports "the target is gone" back into the state machine.
 	sessions := deps.sessionService(logger, cfg, users, runtime, events)
+	if sessions != nil {
+		sessions.WithMetrics(metricSet)
+	}
 	if runtime != nil && sessions != nil {
 		runtime.WithPrivateTalkEnder(sessions)
 	}
@@ -147,6 +173,8 @@ func run() error {
 		Webhook:   deps.webhookDeps(cfg, runtime),
 		Socket:    hub,
 		Limiter:   deps.rateLimiter(logger),
+		Metrics:   metricSet,
+		Drain:     drain,
 	}
 	// The two session-shaped fields are interface fields, and a nil *session.Service stored
 	// in one would NOT compare equal to nil: the route groups would register and then call a
@@ -159,22 +187,44 @@ func run() error {
 
 	router := httpapi.NewRouter(depsForRouter)
 
+	// Every derived gauge is published from this loop: the session census, the pool
+	// pressure and the private-talk count (see cmd/api/metrics.go for why they are
+	// sampled and not counted).
+	samplerCtx, stopSampler := context.WithCancel(context.Background())
+	defer stopSampler()
+	var poolForSampler *pgxpool.Pool
+	if deps.postgres != nil {
+		poolForSampler = deps.postgres.Pool()
+	}
+	go newMetricsSampler(logger, cfg, metricSet, poolForSampler, sessions).run(samplerCtx)
+
+	// Every timeout comes from the configuration (§63), where the reasoning behind
+	// each default is written down next to the field. The names are used instead of
+	// literals so that reading this block tells an operator exactly which knob to
+	// turn. WriteTimeout does NOT cut a WebSocket: see config.HTTPWriteTimeout and
+	// realtime's timeout test.
 	server := &http.Server{
-		Addr:    cfg.APIAddr,
-		Handler: router,
-		// Bounds a slow or malicious client. ReadHeaderTimeout is the one that
-		// matters for slowloris: it covers the window before any handler runs.
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		Addr:              cfg.APIAddr,
+		Handler:           router,
+		ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout,
+		ReadTimeout:       cfg.HTTPReadTimeout,
+		WriteTimeout:      cfg.HTTPWriteTimeout,
+		IdleTimeout:       cfg.HTTPIdleTimeout,
 		MaxHeaderBytes:    1 << 20,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
 	}
 
 	serverErr := make(chan error, 1)
 	go func() {
-		logger.Info("http server listening", "addr", cfg.APIAddr, "env", cfg.AppEnv)
+		logger.Info("http server listening",
+			"addr", cfg.APIAddr,
+			"env", cfg.AppEnv,
+			"read_header_timeout", cfg.HTTPReadHeaderTimeout.String(),
+			"read_timeout", cfg.HTTPReadTimeout.String(),
+			"write_timeout", cfg.HTTPWriteTimeout.String(),
+			"idle_timeout", cfg.HTTPIdleTimeout.String(),
+			"max_body_bytes", cfg.HTTPMaxBodyBytes,
+		)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 			return
@@ -182,6 +232,7 @@ func run() error {
 		serverErr <- nil
 	}()
 
+	shutdownStarted := time.Time{}
 	select {
 	case err := <-serverErr:
 		if err != nil {
@@ -189,19 +240,70 @@ func run() error {
 		}
 		return nil
 	case <-ctx.Done():
-		logger.Info("shutdown signal received; draining connections", "timeout", shutdownTimeout)
-	}
+		shutdownStarted = time.Now()
+		logger.Info("shutdown signal received; draining connections",
+			"timeout", cfg.HTTPShutdownTimeout.String(),
+			"sequence", "drain gate -> drain delay -> http shutdown -> websocket close -> pool close",
+		)
 
-	// A fresh context: ctx is already cancelled, and Shutdown needs a live
-	// deadline to wait for in-flight requests.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		// Report but do not retry: after the deadline the process must exit, and
-		// the connections are gone either way.
-		return fmt.Errorf("graceful shutdown: %w", err)
+		// The order below is the whole of §62's graceful shutdown, and each step
+		// exists because the previous one cannot cover it:
+		//
+		//  1. Open the drain gate. From this instant every request that arrives on a
+		//     connection the load balancer has not retired yet is answered 503 with
+		//     Retry-After, instead of being served by a process that is about to
+		//     exit or dropped in a way the client cannot interpret.
+		drain.BeginDraining()
+
+		//  2. Keep SERVING for HTTP_DRAIN_DELAY while the gate answers 503.
+		//
+		//     WHY this step exists at all (it was found by observing a real SIGTERM,
+		//     not by reading the docs): http.Server.Shutdown stops the listeners
+		//     immediately AND silently drops a request that arrives on a connection it
+		//     has already decided to retire. A browser cannot tell that apart from a
+		//     network failure. The delay is the window in which
+		//       (a) an already-established connection gets a real 503 with Retry-After
+		//           instead of a reset, and
+		//       (b) a load balancer's readiness probe (which now fails) takes this
+		//           instance out of rotation before the listener closes.
+		//     With a zero delay this step is skipped, which is correct only when
+		//     nothing routes to this process.
+		if cfg.HTTPDrainDelay > 0 {
+			logger.Info("drain gate open; serving 503 before closing the listener",
+				"drain_delay", cfg.HTTPDrainDelay.String())
+			// ctx is already cancelled (it is what got us here), so the wait has its
+			// own timer.
+			timer := time.NewTimer(cfg.HTTPDrainDelay)
+			<-timer.C
+		}
+
+		//  3. Stop accepting new connections and wait for in-flight requests. A
+		//     fresh context: ctx is already cancelled, and Shutdown needs a live
+		//     deadline to wait for.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.HTTPShutdownTimeout)
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			// Report but do not retry: after the deadline the process must exit, and
+			// the connections are gone either way. The websocket and pool steps below
+			// still run, because leaving sockets open on a process that is exiting is
+			// what makes a deploy look like a network failure to every browser.
+			logger.Error("graceful shutdown of the http server did not finish in time",
+				"action", "shutdown_timeout", "error", err, "timeout", cfg.HTTPShutdownTimeout.String())
+		}
+		cancel()
+
+		//  4. Stop the metric sampler before the pool closes, so a sample cannot race
+		//     the pool teardown and log a spurious error during a clean exit.
+		stopSampler()
+
+		//  5. Close the WebSocket connections with a "going away" frame (the deferred
+		//     hub shutdown above does this against its own deadline), then let the
+		//     deferred pool closes run. Both are deferred so that an early return from
+		//     connectDependencies, or a panic, still tears them down — a shutdown path
+		//     that only works on the happy path is not a shutdown path.
+		logger.Info("http drain complete; closing websockets and dependencies",
+			"elapsed_ms", time.Since(shutdownStarted).Milliseconds())
 	}
-	logger.Info("shutdown complete")
+	logger.Info("shutdown complete", "elapsed_ms", time.Since(shutdownStarted).Milliseconds())
 	return nil
 }
 
@@ -397,7 +499,7 @@ func (d *dependencies) sessionService(
 // The realtime.Service is returned next to the processor because Phase 10 needs it as a
 // second port: the private-talk state machine lives in internal/session (not in the
 // processor), and it produces messages through the same audience rules.
-func (d *dependencies) runtimeLayer(logger *slog.Logger, cfg *config.Config) (*session.Processor, *realtime.Hub, *realtime.Service) {
+func (d *dependencies) runtimeLayer(logger *slog.Logger, cfg *config.Config, m *metrics.Metrics) (*session.Processor, *realtime.Hub, *realtime.Service) {
 	if d.postgres == nil {
 		logger.Warn("postgres is not connected; runtime events and websockets are disabled",
 			"hint", "STARTUP_REQUIRE_DEPENDENCIES=false must only be used for local work")
@@ -405,13 +507,17 @@ func (d *dependencies) runtimeLayer(logger *slog.Logger, cfg *config.Config) (*s
 	}
 	hub := realtime.NewHub(realtime.HubConfig{
 		Logger: logger,
+		// The hub owns connection lifetime and the write queue, so it is the only
+		// place that can count live sockets, messages and slow-consumer drops
+		// accurately (§77).
+		Metrics: m,
 		// The same origin allowlist the HTTP API uses: the frontends are configured once,
 		// and a WebSocket handshake must be refused for exactly the origins that are
 		// refused a cross-origin fetch (§63).
 		AllowedOrigins: cfg.CORSOrigins(),
 	})
 	runtime := realtime.NewService(hub, realtime.NewAudience(d.postgres.Pool()), logger)
-	return session.NewProcessor(session.NewPostgres(d.postgres.Pool()), runtime), hub, runtime
+	return session.NewProcessor(session.NewPostgres(d.postgres.Pool()), runtime).WithMetrics(m), hub, runtime
 }
 
 // webhookDeps builds the LiveKit webhook endpoint's two halves (§45).

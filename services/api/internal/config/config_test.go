@@ -28,6 +28,14 @@ func clearEnv(t *testing.T) {
 		"SESSION_IDLE_TOUCH_INTERVAL", "PASSWORD_MIN_LENGTH",
 		"RATE_LIMIT_LOGIN_PER_MINUTE", "RATE_LIMIT_LOGIN_PER_ACCOUNT_PER_10MIN",
 		"RATE_LIMIT_API_PER_MINUTE", "TRUSTED_PROXIES",
+		// Phase 11 (§63/§77).
+		"LOG_FORMAT", "HTTP_MAX_BODY_BYTES", "HTTP_READ_HEADER_TIMEOUT",
+		"HTTP_READ_TIMEOUT", "HTTP_WRITE_TIMEOUT", "HTTP_IDLE_TIMEOUT",
+		"HTTP_SHUTDOWN_TIMEOUT", "HTTP_DRAIN_DELAY", "METRICS_SESSION_REFRESH_INTERVAL",
+		"RATE_LIMIT_PRIVATE_TALK", "RATE_LIMIT_MEDIA_TOKEN", "RATE_LIMIT_JOIN",
+		"RATE_LIMIT_WS_HANDSHAKE", "WS_MAX_CONNECTIONS_PER_IP",
+		"RATE_LIMIT_ENDPOINT_WINDOW", "RATE_LIMIT_LOGIN_WINDOW",
+		"RATE_LIMIT_LOGIN_ACCOUNT_WINDOW", "RATE_LIMIT_API_WINDOW",
 	}
 	for _, key := range keys {
 		t.Setenv(key, "")
@@ -667,4 +675,193 @@ func TestLoadTrustedProxies(t *testing.T) {
 			t.Errorf("error = %q, want it to name TRUSTED_PROXIES", err)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Phase 11 transport hardening (§63/§77)
+// ---------------------------------------------------------------------------
+
+func TestLoadPhase11TransportDefaults(t *testing.T) {
+	clearEnv(t)
+	setMinimalValidEnv(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+
+	if cfg.HTTPMaxBodyBytes != 1<<20 {
+		t.Errorf("HTTPMaxBodyBytes = %d, want %d", cfg.HTTPMaxBodyBytes, 1<<20)
+	}
+	for _, tc := range []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{"HTTPReadHeaderTimeout", cfg.HTTPReadHeaderTimeout, 5 * time.Second},
+		{"HTTPReadTimeout", cfg.HTTPReadTimeout, 15 * time.Second},
+		{"HTTPWriteTimeout", cfg.HTTPWriteTimeout, 30 * time.Second},
+		{"HTTPIdleTimeout", cfg.HTTPIdleTimeout, 60 * time.Second},
+		{"HTTPShutdownTimeout", cfg.HTTPShutdownTimeout, 10 * time.Second},
+		{"HTTPDrainDelay", cfg.HTTPDrainDelay, 2 * time.Second},
+		{"MetricsSessionRefreshInterval", cfg.MetricsSessionRefreshInterval, 15 * time.Second},
+		{"RateLimitEndpointWindow", cfg.RateLimitEndpointWindow, time.Minute},
+		{"RateLimitLoginWindow", cfg.RateLimitLoginWindow, time.Minute},
+		{"RateLimitLoginAccountWindow", cfg.RateLimitLoginAccountWindow, 10 * time.Minute},
+		{"RateLimitAPIWindow", cfg.RateLimitAPIWindow, time.Minute},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %v, want %v", tc.name, tc.got, tc.want)
+		}
+	}
+	if cfg.RateLimitPrivateTalk <= 0 || cfg.RateLimitMediaToken <= 0 ||
+		cfg.RateLimitJoin <= 0 || cfg.RateLimitWSHandshake <= 0 || cfg.WSMaxConnectionsPerIP <= 0 {
+		t.Errorf("Phase 11 limits must default to a positive value: %+v", cfg)
+	}
+	// An empty LOG_FORMAT means "decide from APP_ENV", which is what keeps the
+	// production log shape a property of the environment rather than a second knob
+	// that can disagree with it.
+	if cfg.LogFormat != "" {
+		t.Errorf("LogFormat = %q, want empty", cfg.LogFormat)
+	}
+	if cfg.UseJSONLogs() {
+		t.Error("a development config must produce text logs by default")
+	}
+}
+
+func TestLoadPhase11TransportOverrides(t *testing.T) {
+	clearEnv(t)
+	setMinimalValidEnv(t)
+	t.Setenv("LOG_FORMAT", "json")
+	t.Setenv("HTTP_MAX_BODY_BYTES", "2048")
+	t.Setenv("HTTP_READ_HEADER_TIMEOUT", "2s")
+	t.Setenv("HTTP_READ_TIMEOUT", "7s")
+	t.Setenv("HTTP_WRITE_TIMEOUT", "9s")
+	t.Setenv("HTTP_IDLE_TIMEOUT", "11s")
+	t.Setenv("HTTP_SHUTDOWN_TIMEOUT", "13s")
+	t.Setenv("HTTP_DRAIN_DELAY", "3s")
+	t.Setenv("METRICS_SESSION_REFRESH_INTERVAL", "30s")
+	t.Setenv("RATE_LIMIT_PRIVATE_TALK", "7")
+	t.Setenv("RATE_LIMIT_MEDIA_TOKEN", "8")
+	t.Setenv("RATE_LIMIT_JOIN", "9")
+	t.Setenv("RATE_LIMIT_WS_HANDSHAKE", "10")
+	t.Setenv("WS_MAX_CONNECTIONS_PER_IP", "4")
+	t.Setenv("RATE_LIMIT_ENDPOINT_WINDOW", "2m")
+	t.Setenv("RATE_LIMIT_API_WINDOW", "3m")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.LogFormat != LogFormatJSON || !cfg.UseJSONLogs() {
+		t.Errorf("LogFormat = %q, UseJSONLogs = %v", cfg.LogFormat, cfg.UseJSONLogs())
+	}
+	if cfg.HTTPMaxBodyBytes != 2048 {
+		t.Errorf("HTTPMaxBodyBytes = %d, want 2048", cfg.HTTPMaxBodyBytes)
+	}
+	if cfg.HTTPReadHeaderTimeout != 2*time.Second || cfg.HTTPReadTimeout != 7*time.Second ||
+		cfg.HTTPWriteTimeout != 9*time.Second || cfg.HTTPIdleTimeout != 11*time.Second ||
+		cfg.HTTPShutdownTimeout != 13*time.Second || cfg.HTTPDrainDelay != 3*time.Second {
+		t.Errorf("timeouts not applied: %+v", cfg)
+	}
+	if cfg.MetricsSessionRefreshInterval != 30*time.Second {
+		t.Errorf("MetricsSessionRefreshInterval = %v", cfg.MetricsSessionRefreshInterval)
+	}
+	if cfg.RateLimitPrivateTalk != 7 || cfg.RateLimitMediaToken != 8 ||
+		cfg.RateLimitJoin != 9 || cfg.RateLimitWSHandshake != 10 || cfg.WSMaxConnectionsPerIP != 4 {
+		t.Errorf("Phase 11 limits not applied: %+v", cfg)
+	}
+	if cfg.RateLimitEndpointWindow != 2*time.Minute || cfg.RateLimitAPIWindow != 3*time.Minute {
+		t.Errorf("windows not applied: %+v", cfg)
+	}
+}
+
+func TestLoadRejectsUnsafePhase11Values(t *testing.T) {
+	cases := []struct {
+		name    string
+		key     string
+		value   string
+		wantSub string
+	}{
+		{"zero body cap", "HTTP_MAX_BODY_BYTES", "0", "HTTP_MAX_BODY_BYTES"},
+		{"absurd body cap", "HTTP_MAX_BODY_BYTES", "1073741824", "HTTP_MAX_BODY_BYTES"},
+		{"header budget above whole-request budget", "HTTP_READ_HEADER_TIMEOUT", "20s", "HTTP_READ_HEADER_TIMEOUT"},
+		{"zero timeout", "HTTP_WRITE_TIMEOUT", "0s", "HTTP_WRITE_TIMEOUT"},
+		{"unknown log format", "LOG_FORMAT", "logfmt", "LOG_FORMAT"},
+		{"zero private talk limit", "RATE_LIMIT_PRIVATE_TALK", "0", "RATE_LIMIT_PRIVATE_TALK"},
+		{"negative media token limit", "RATE_LIMIT_MEDIA_TOKEN", "-1", "RATE_LIMIT_MEDIA_TOKEN"},
+		{"zero join limit", "RATE_LIMIT_JOIN", "0", "RATE_LIMIT_JOIN"},
+		{"zero ws handshake limit", "RATE_LIMIT_WS_HANDSHAKE", "0", "RATE_LIMIT_WS_HANDSHAKE"},
+		{"zero socket cap", "WS_MAX_CONNECTIONS_PER_IP", "0", "WS_MAX_CONNECTIONS_PER_IP"},
+		{"zero refresh interval", "METRICS_SESSION_REFRESH_INTERVAL", "0s", "METRICS_SESSION_REFRESH_INTERVAL"},
+		{"negative drain delay", "HTTP_DRAIN_DELAY", "-1s", "HTTP_DRAIN_DELAY"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			setMinimalValidEnv(t)
+			t.Setenv(tc.key, tc.value)
+
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load() accepted %s=%s; a disabled guard must not be configurable", tc.key, tc.value)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error = %q, want it to mention %q", err, tc.wantSub)
+			}
+		})
+	}
+}
+
+// TestApplyDefaultsFillsZeroValues is the safety net for a Config that was built by
+// hand (a test, a tool): a zero window would silently DISABLE a limiter and a zero
+// body cap would silently disable the body bound, so both must become their default.
+func TestApplyDefaultsFillsZeroValues(t *testing.T) {
+	cfg := &Config{AppEnv: EnvTest}
+	cfg.ApplyDefaults()
+
+	if cfg.HTTPMaxBodyBytes != 1<<20 {
+		t.Errorf("HTTPMaxBodyBytes = %d, want the default", cfg.HTTPMaxBodyBytes)
+	}
+	if cfg.RateLimitAPIWindow <= 0 || cfg.RateLimitLoginWindow <= 0 || cfg.RateLimitEndpointWindow <= 0 {
+		t.Errorf("windows were left at zero: %+v", cfg)
+	}
+	if cfg.HTTPReadHeaderTimeout <= 0 || cfg.HTTPReadTimeout <= 0 || cfg.HTTPWriteTimeout <= 0 ||
+		cfg.HTTPIdleTimeout <= 0 || cfg.HTTPShutdownTimeout <= 0 {
+		t.Errorf("timeouts were left at zero: %+v", cfg)
+	}
+	if cfg.WSMaxConnectionsPerIP <= 0 || cfg.RateLimitJoin <= 0 {
+		t.Errorf("limits were left at zero: %+v", cfg)
+	}
+
+	// A zero drain delay is legitimate ("nothing routes here"), so ApplyDefaults must
+	// leave it alone rather than surprise an operator with a two-second wait.
+	cfg = &Config{AppEnv: EnvTest, HTTPDrainDelay: 0}
+	cfg.ApplyDefaults()
+	if cfg.HTTPDrainDelay != 0 {
+		t.Errorf("ApplyDefaults invented a drain delay: %v", cfg.HTTPDrainDelay)
+	}
+
+	// Idempotent, and it must not overwrite an explicit value.
+	cfg.HTTPMaxBodyBytes = 4096
+	cfg.ApplyDefaults()
+	if cfg.HTTPMaxBodyBytes != 4096 {
+		t.Errorf("ApplyDefaults overwrote an explicit value: %d", cfg.HTTPMaxBodyBytes)
+	}
+
+	// A nil config must not panic: the router calls this defensively.
+	var nilConfig *Config
+	nilConfig.ApplyDefaults()
+}
+
+func TestUseJSONLogsFollowsAppEnvByDefault(t *testing.T) {
+	if (&Config{AppEnv: EnvProduction}).UseJSONLogs() != true {
+		t.Error("production must default to JSON logs")
+	}
+	if (&Config{AppEnv: EnvDevelopment}).UseJSONLogs() != false {
+		t.Error("development must default to text logs")
+	}
+	if (&Config{AppEnv: EnvProduction, LogFormat: LogFormatText}).UseJSONLogs() != false {
+		t.Error("an explicit LOG_FORMAT must win over APP_ENV")
+	}
 }

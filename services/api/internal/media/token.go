@@ -7,6 +7,8 @@ import (
 
 	"github.com/livekit/protocol/auth"
 	"github.com/livekit/protocol/livekit"
+
+	"github.com/classwatch/classwatch/services/api/internal/metrics"
 )
 
 // PublishSource is one kind of media a token is allowed to publish.
@@ -83,7 +85,13 @@ type TokenRequest struct {
 //
 // The returned token is a credential: it must be sent to exactly the participant it
 // was minted for and must never be logged (§59).
-func (c *Client) SignToken(req TokenRequest) (string, error) {
+func (c *Client) SignToken(req TokenRequest) (token string, err error) {
+	// Signing is local (no network call), but it is the operation whose budget the
+	// join/media-token limits exist to protect: a spike here with a flat
+	// media_calls_total is what tells an operator "somebody is minting credentials in
+	// a loop", and it must be visible next to the calls it enables.
+	start := time.Now()
+	defer func() { c.observeCall(metrics.MediaOperationSignToken, start, err) }()
 	if c == nil || c.apiKey == "" || c.apiSecret == "" {
 		return "", fmt.Errorf("livekit: not connected")
 	}
@@ -104,7 +112,7 @@ func (c *Client) SignToken(req TokenRequest) (string, error) {
 	canPublish := req.CanPublish
 	canSubscribe := req.CanSubscribe
 	canPublishData := req.CanPublishData
-	token := auth.NewAccessToken(c.apiKey, c.apiSecret).
+	signed := auth.NewAccessToken(c.apiKey, c.apiSecret).
 		SetIdentity(req.Identity).
 		SetValidFor(req.TTL).
 		SetVideoGrant(&auth.VideoGrant{
@@ -118,7 +126,7 @@ func (c *Client) SignToken(req TokenRequest) (string, error) {
 			CanPublishData:    &canPublishData,
 			CanPublishSources: sources,
 		})
-	jwt, err := token.ToJWT()
+	jwt, err := signed.ToJWT()
 	if err != nil {
 		// The SDK's error text never contains the secret, but the token does not exist
 		// yet either way: nothing to redact here, and the caller must not log the value.

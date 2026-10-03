@@ -20,7 +20,7 @@
 | 8 | `phase/08-runtime-state` | WebSocket、LiveKit Webhook、StudentSession、SessionEvent | ✅ 已完成 |
 | 9 | `phase/09-camera` | 可选摄像头 + 老师端画中画 | ✅ 已完成 |
 | 10 | `phase/10-private-audio` | 学生可选麦克风 + 老师私密语音状态机 | ✅ 已完成 |
-| 11 | `phase/11-production` | HTTPS、TURN、反代、限流、CSRF、CORS、指标、重连 | ⏳ |
+| 11 | `phase/11-production` | HTTPS、TURN、反代、限流、CSRF、CORS、指标、重连 | ✅ 已完成 |
 | 12 | `phase/12-performance` | 1 老师 + 20/30 学生压测（禁止用假 video 标签冒充） | ⏳ |
 
 **每个 Phase 完成后停止，等待人工确认再进入下一个 Phase。**

@@ -1,0 +1,456 @@
+# ============================================================================
+# ClassWatch 生产反向代理（Caddy v2）—— 任务书 §62 / §77（Phase 11）
+#
+# 拓扑：
+#
+#   Internet ──► Caddy（:80/:443，**唯一**对公网暴露的容器）
+#                 ├── student.<domain> ─┐
+#                 ├── teacher.<domain> ─┼─► 三个前端静态产物（file_server + SPA fallback）
+#                 ├── admin.<domain>   ─┘   （同源反代 /api、/ws）
+#                 ├── api.<domain>     ───► api:8080（/api、/ws、探针、LiveKit webhook）
+#                 └── rtc.<domain>     ───► 自建 LiveKit 才需要；LiveKit Cloud 时**不需要**（见文末）
+#
+# 所有域名都通过环境变量注入（{$STUDENT_HOST} 等）。仓库里不出现任何真实域名、
+# IP、邮箱或密钥 —— 它们只存在于服务器上的 deploy/.env.production（已要求 gitignore）。
+#
+# 为什么用 Caddy 而不是 nginx（§62 两者都允许）：
+#   1) 自动 ACME 与 HTTP→HTTPS 跳转是默认行为，没有"证书路径写错/续期忘配"的空间；
+#      单机课堂部署里这一项就把运维面砍掉一半。
+#   2) 反代**默认**识别 WebSocket Upgrade 并完成协议切换。本项目 /ws/* 是实时通道，
+#      而 nginx 漏写 proxy_set_header Upgrade/Connection 会静默降级（见 /ws/* 注释）。
+#   3) Caddyfile 读起来更像拓扑描述，与 docs/ 里"表格 + 说明"的风格一致。
+#   nginx 方案的取舍与迁移要点保留在 deploy/nginx/README.md。
+#
+# 校验方式（不启动服务也能校验语法与占位符展开）：
+#   docker run --rm -e STUDENT_HOST=... -e ACME_EMAIL=... \
+#     -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2-alpine \
+#     caddy validate --config /etc/caddy/Caddyfile
+# ============================================================================
+{
+	# ── ACME 账户邮箱 ─────────────────────────────────────────────────────────
+	# 只用于证书到期提醒与 ACME 账户找回，不参与任何业务逻辑。
+	# 故意**不给默认值**：Caddy 在拿不到值时启动即报错（fail fast），
+	# 这比"静默用假邮箱注册账户、证书快到期时没人收到通知"要好得多 ——
+	# 证书过期的后果是四个入口**同时**不可用。
+	email {$ACME_EMAIL}
+
+	# 故意不开启 admin API（默认关闭）：本机 2019 端口的 admin API 可以在线改配置，
+	# 单机部署没有需要它的运维动作，开着只是多一个监听面。
+	#
+	# HTTP→HTTPS 跳转不需要任何配置：只要站点地址写了域名，Caddy 会自动在 80 端口
+	# 应答 ACME HTTP-01 challenge，其余请求 308 跳转到 https。
+}
+
+# ---------------------------------------------------------------------------
+# 可复用片段（snippet）
+# ---------------------------------------------------------------------------
+
+# 请求体上限：防大体积请求打满内存/带宽。
+# 本系统最大的请求是登录表单与 LiveKit webhook 回调（KB 级）；媒体流走 WebRTC，
+# **不经过** Caddy。所以 1MB 的默认值是宽裕的。
+(request_body_limit) {
+	request_body {
+		max_size {$HTTP_MAX_BODY_BYTES:1MB}
+	}
+}
+
+# 全站安全响应头（CSP 单独成段，便于逐条注释理由）。
+(security_headers) {
+	header {
+		# ── HSTS ──────────────────────────────────────────────────────────
+		# 让浏览器在一年内只允许通过 HTTPS 访问这台主机**及其所有子域**。
+		# WHY includeSubDomains 不能省：student/teacher/admin/api 是同一个
+		# registrable domain 的兄弟子域，少了它，攻击者在校园网里对
+		# http://api.<domain> 发一次明文请求就能拿到/篡改内容（会话 Cookie 有
+		# Secure 保护，但 CSRF Cookie 与响应内容没有）。
+		# 注意：HSTS 一旦下发**无法撤回**，只能等 max-age 过期。首次上线前请确认
+		# 四个子域证书都能签发成功，再打开。preload 需要主动向浏览器厂商提交，
+		# 本系统不做（一旦进了 preload 列表，退出的周期以月计）。
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+		# ── 禁止 MIME 嗅探 ────────────────────────────────────────────────
+		# 否则一个"看起来像图片、其实是 HTML/JS"的响应会被浏览器当脚本执行。
+		X-Content-Type-Options "nosniff"
+
+		# ── Referrer 策略 ────────────────────────────────────────────────
+		# 跨站跳转只发 origin，不发完整 URL。URL 里会带 classroom/session 的
+		# UUID，把它们泄露给第三方（外链、CDN）是最廉价的隐私事故。
+		Referrer-Policy "strict-origin-when-cross-origin"
+
+		# ── 权限位（Permissions-Policy）────────────────────────────────────
+		# 下面三个 (self) 是本项目课堂功能的**前提**，删掉任何一个都会让课堂在
+		# 浏览器层直接失败（getUserMedia / getDisplayMedia 抛 NotAllowedError，
+		# 而且报错信息不会提到"是响应头禁止的"，极难定位）：
+		#   camera=(self)           摄像头（§52 可选摄像头，学生开关 + 老师画中画）
+		#   microphone=(self)       麦克风（§41 私密语音：老师只对选中的那一个学生讲话）
+		#   display-capture=(self)  屏幕共享（本系统核心业务：整屏共享硬闸门）
+		# 其余能力显式关闭：本系统不需要定位/支付/USB/串口/MIDI，
+		# 开放它们只是在"万一被 XSS"时扩大攻击面。
+		Permissions-Policy "camera=(self), microphone=(self), display-capture=(self), geolocation=(), payment=(), usb=(), serial=(), midi=()"
+
+		# 不回显 Caddy 版本号：少一个"按版本挑漏洞"的入口。
+		-Server
+	}
+}
+
+# 内容安全策略（CSP）。
+#
+# ⚠️ 这段配置写错不会报错，只会**静默**让课堂不可用（请求被浏览器拦掉，服务端
+#    日志里什么都看不到）。因此下面按来源逐条解释"为什么需要它"。
+(csp) {
+	header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://{$API_HOST} wss://{$API_HOST} https://*.livekit.cloud wss://*.livekit.cloud blob:; media-src 'self' blob:; worker-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests"
+
+	# 逐条理由（与上面那一行的顺序一致）：
+	#
+	# 1) default-src 'self'
+	#    默认拒绝一切外部来源；后面的每一条都是**显式**开口子。先拒绝再加白名单，
+	#    顺序反了就会变成"列了 10 个来源，漏掉的那个刚好是攻击入口"。
+	#
+	# 2) script-src 'self'
+	#    只允许同源打包产物。**故意没有** 'unsafe-inline' / 'unsafe-eval'：
+	#    这是整条 CSP 里唯一真正挡 XSS 的指令，任何妥协都会让它退化成装饰品。
+	#    Vite 生产构建输出的是带 hash 的外部 <script type=module>，不需要内联，
+	#    所以这里不需要妥协。（如果将来引入需要 eval 的库，正确做法是换库，
+	#    而不是加 'unsafe-eval'。）
+	#
+	# 3) style-src 'self' 'unsafe-inline'
+	#    Vue 的 :style 绑定、部分组件的过渡动画会写内联样式，禁用内联样式会让
+	#    界面在某些状态下错位。这是**有意识**的折中：CSS 注入不能直接执行 JS，
+	#    危害等级明显低于脚本注入，而脚本注入已经被第 2 条堵死。
+	#    收紧路径：确认无内联 <style> 后改成 'self'（Tailwind v4 已编译进外部 CSS）。
+	#
+	# 4) img-src 'self' data: blob:
+	#    data: 给内联图标/占位图；blob: 给 canvas 抓帧或本地预览生成的图片 URL。
+	#
+	# 5) font-src 'self' data:
+	#    打包字体文件；data: 兼容内联 base64 字体。
+	#
+	# 6) connect-src —— **课堂能不能用，几乎全看这一条**
+	#    'self'
+	#       三个前端都用相对路径 /api、/ws（见 packages/api-client/src/realtime-socket.ts
+	#       与 apps/*/vite.config.ts 的注释），生产由本文件把它们同源反代到 API。
+	#       同源这一条覆盖的就是主路径。
+	#    https://{$API_HOST}  wss://{$API_HOST}
+	#       一旦某个前端改成**直连** api.<domain>（跨源），必须在这里放行，否则
+	#       请求被浏览器拦掉且只在 DevTools 控制台报错 —— 页面表现是"点了没反应"。
+	#       两个协议都要写：REST 是 https，实时通道是 wss。
+	#    https://*.livekit.cloud  wss://*.livekit.cloud
+	#       LiveKit Cloud 的信令是 wss://<project>.livekit.cloud，服务端 RoomService
+	#       /Twirp 是 https；区域/边缘域也在这个通配下。用通配子域而不是写死单个项目域，
+	#       是因为 LiveKit 可能把连接调度到其它区域域。
+	#       ⚠️ **换成自建 LiveKit 时，这两条必须改成自建的信令域名**
+	#          （例如 wss://rtc.<domain>），否则浏览器连不上媒体面，
+	#          表现是一直停在"连接中"，而服务端一切正常。
+	#    blob:
+	#       livekit-client 会从 Blob 构造 Worker 并与之通信（E2EE / Insertable
+	#       Streams 路径），屏幕共享的本地回放预览也走 blob URL。
+	#       缺了它的表现是"能进房间但看不到自己的画面"，或加密房间直接失败。
+	#    ⚠️ 重要边界：WebRTC 的媒体包（SRTP over UDP/TCP）**不受 CSP 管辖**，
+	#       TURN/TLS 的 443 连接由浏览器内核发起、同样不经 connect-src。
+	#       所以"CSP 配通了"绝不等于"媒体面通了"—— TURN 必须单独验证，
+	#       方法见 docs/development/deployment.md 的 TURN 章节。
+	#
+	# 7) media-src 'self' blob:
+	#    <video>/<audio> 的播放源。摄像头/麦克风是通过 srcObject 直接绑定
+	#    MediaStream 的，不触发 CSP 取流；blob: 覆盖的是"抓帧回放/本地预览"这类场景。
+	#
+	# 8) worker-src 'self' blob:
+	#    livekit-client 会创建 Web Worker。缺了它，部分浏览器上会在建立连接后
+	#    立刻抛错（同样只在控制台可见）。
+	#
+	# 9) frame-src 'self' blob:
+	#    预留：个别屏幕共享/预览实现用 iframe 承载 blob。收紧后如果发现黑屏，
+	#    第一个要检查的就是这里。
+	#
+	# 10) object-src 'none'
+	#    彻底禁用 <object>/<embed>（插件是历史 XSS 重灾区），本项目不需要。
+	#
+	# 11) base-uri 'self'
+	#    阻止注入 <base> 把页面里所有相对路径劫持到攻击者域名 ——
+	#    这是"绕过 script-src 也能把 API 请求偷走"的经典手法。
+	#
+	# 12) form-action 'self'
+	#    表单只能提交回本站，避免被改成向外部地址外发凭据。
+	#
+	# 13) frame-ancestors 'none'
+	#    禁止任何站点用 iframe 嵌本系统（防点击劫持）。比 X-Frame-Options 更彻底，
+	#    而且被嵌入的页面本来也拿不到摄像头/屏幕共享权限。
+	#
+	# 14) upgrade-insecure-requests
+	#    把页面里残留的 http:// 子资源请求自动升级为 https，兜住"某处硬编码了 http"。
+}
+
+# ── 反向代理到控制面 API（普通 HTTP 路径）──────────────────────────────────
+(api_proxy) {
+	reverse_proxy {$API_UPSTREAM:api:8080} {
+		# 客户端 IP 的传递方式（**已实测确认**，见下）：
+		#
+		# X-Forwarded-For：**故意不写 header_up**，用 Caddy 的默认行为。
+		#   实测（caddy 2.10，未配置 Caddy 自身的 trusted_proxies）：
+		#     请求头带 `X-Forwarded-For: 1.2.3.4` → 上游收到的是 Caddy 自己观察
+		#     到的对端地址，客户端伪造的那一段被**整个丢弃**。也就是说
+		#     "客户端能否伪造自己的 IP"这个问题在代理层就已经被回答了：不能。
+		#   （若显式写 `header_up X-Forwarded-For {remote_host}`，结果完全一样，
+		#     但 caddy validate 会对每一处都报 "Unnecessary header_up"，因此不写。
+		#     ⚠️ 如果日后给 Caddy 配上 trusted_proxies（前置 CDN），它就会改成
+		#     "追加"语义，客户端伪造的前缀会保留在链首 —— 那时仍然安全，因为
+		#     API 的 ClientIPResolver 是**从右往左**跳过可信代理取值，最右边的
+		#     那一段才是 Caddy 真正看到的地址。）
+		#
+		# X-Real-IP：必须显式覆盖。Caddy 对这个头没有特殊处理，默认原样透传，
+		#   而 API 在没有可用 XFF 时会回退读它 —— 不覆盖就等于留了一条伪造路径。
+		header_up X-Real-IP {remote_host}
+		# X-Forwarded-Proto / X-Forwarded-Host 由 Caddy 自动设置，不要手写。
+	}
+}
+
+# ── 反向代理到控制面 API（实时通道，WebSocket）──────────────────────────────
+(websocket_proxy) {
+	# 这段是整份配置里最容易"看起来对、实际坏"的地方。
+	#
+	# WebSocket 握手 = 一个 HTTP GET + `Connection: Upgrade` / `Upgrade: websocket`。
+	# 代理如果把这两个头当普通头丢掉（nginx 里必须手写 proxy_set_header 才转发），
+	# 浏览器拿到的不是 101 Switching Protocols 而是一个普通 200，前端只会看到
+	# "连不上，正在重连"。后果很隐蔽：视频/语音在 ICE 打通的前提下可能仍是好的，
+	# 于是现象常被误判成"媒体面故障"，而真正坏掉的是
+	# /ws/student、/ws/teacher（点名、掉线、私聊邀请等实时状态）。
+	#
+	# Caddy 的 reverse_proxy **默认**识别 Upgrade 并自动完成协议切换，也会正确
+	# 处理 hop-by-hop 的 Connection 头。这里**故意不**手写
+	#   header_up Upgrade {http.request.header.Upgrade}
+	#   header_up Connection "upgrade"
+	# 因为照抄 nginx 的做法有害：Connection 是 hop-by-hop 头，HTTP/2 下不允许出现，
+	# 显式写入可能把 h2 客户端写坏；而 Upgrade 本来就已被默认透传。
+	#
+	# 真正需要显式声明的只有"长连接不要有空闲超时"。
+	reverse_proxy {$API_UPSTREAM:api:8080} {
+		# 客户端 IP 的传递：与 api_proxy 完全一致（XFF 用默认行为，X-Real-IP 显式覆盖）。
+		header_up X-Real-IP {remote_host}
+		# 关闭响应缓冲：保证 101 与随后的每一帧立即透传。
+		# 默认的缓冲会把心跳/状态帧攒起来批量发送，表现为"实时状态延迟好几秒"。
+		flush_interval -1
+		transport http {
+			# 0 = 不设超时。一节课 45 分钟，任何"顺手加个 30s 空闲超时"的改动
+			# 都会让连接在课中被服务端单方面切断（表现为周期性重连 + 状态丢帧）。
+			read_timeout 0
+			write_timeout 0
+		}
+	}
+}
+
+# ---------------------------------------------------------------------------
+# 三个前端入口
+# ---------------------------------------------------------------------------
+#
+# WHY 三个前端站点**也**反代 /api 与 /ws，而不是让浏览器直连 api.<domain>：
+#   前端代码用的是**同源相对路径**（/api/v1/...、/ws/student，见
+#   packages/api-client/src/realtime-socket.ts 注释），生产同源带来三个直接好处：
+#     1) 不触发 CORS 预检，也就没有"漏配白名单导致某个入口登录失败"这类问题；
+#     2) Cookie 的 SameSite=Lax 在完全同源下语义最简单（跨子域虽然也是 same-site，
+#        但让正确性依赖这条容易记错的规则并不划算）；
+#     3) 少一次 DNS/TLS 建连，进入课堂更快。
+#   api.<domain> 仍然独立存在：LiveKit Cloud 的 webhook 回调需要一个稳定的服务端
+#   入口，而且运维排障时可以只打 API、绕开前端。
+
+{$STUDENT_HOST} {
+	import security_headers
+	import csp
+	import request_body_limit
+	encode zstd gzip
+
+	# ── 静态资源缓存策略 ───────────────────────────────────────────────────
+	# 默认 no-store：index.html 与任何未显式声明的东西都不缓存。
+	# WHY 单独强调 index.html：它一旦被缓存，发版后用户会继续用旧 HTML，而旧 HTML
+	# 引用的旧 hash 资源已经被删 —— 表现是"白屏 + 控制台一堆 404"，强制刷新才好。
+	# 这是最典型的"发版后一部分用户坏了、开发机上永远复现不了"的事故。
+	header Cache-Control "no-store"
+	# 带内容哈希的构建产物（Vite 输出到 /assets/<name>-<hash>.js|css）内容永不变化，
+	# 可以放心长缓存。首屏性能主要来自这一条。
+	# 注意：这条写在默认 no-store **之后**，同一响应头以后写的为准。
+	@immutable path /assets/* /favicon.ico /favicon.svg
+	header @immutable Cache-Control "public, max-age=31536000, immutable"
+
+	# 实时通道（§47）。必须与 api 站点用完全相同的处理方式。
+	handle /ws/* {
+		import websocket_proxy
+	}
+
+	# REST API：与前端同源，因此浏览器不需要 CORS 预检。
+	handle /api/* {
+		import api_proxy
+	}
+
+	# 探针也同源透传：前端页面上"依赖不可用"的提示依赖它（dev 下由 Vite 代理）。
+	handle /healthz {
+		import api_proxy
+	}
+	handle /readyz {
+		import api_proxy
+	}
+
+	# 兜底：SPA 静态产物 + history fallback。
+	# ⚠️ 必须放在**最后**：Caddy 的 handle 按书写顺序匹配，第一条命中的生效；
+	#    它没有 matcher，是 catch-all。
+	handle {
+		root * {$WEB_ROOT:/srv/classwatch/web}/student
+		# WHY try_files：前端是 history 路由（/student/classroom/<uuid> 这类深链接），
+		# 服务器上并不存在对应文件，需要回落到 index.html 交给前端路由。
+		# 不做的话，用户**刷新**深链接会 404，而站内点击跳转一切正常 —— 很容易漏测。
+		try_files {path} /index.html
+		file_server
+	}
+}
+
+{$TEACHER_HOST} {
+	import security_headers
+	import csp
+	import request_body_limit
+	encode zstd gzip
+
+	header Cache-Control "no-store"
+	@immutable path /assets/* /favicon.ico /favicon.svg
+	header @immutable Cache-Control "public, max-age=31536000, immutable"
+
+	handle /ws/* {
+		import websocket_proxy
+	}
+	handle /api/* {
+		import api_proxy
+	}
+	handle /healthz {
+		import api_proxy
+	}
+	handle /readyz {
+		import api_proxy
+	}
+
+	handle {
+		root * {$WEB_ROOT:/srv/classwatch/web}/teacher
+		try_files {path} /index.html
+		file_server
+	}
+}
+
+{$ADMIN_HOST} {
+	import security_headers
+	import csp
+	import request_body_limit
+	encode zstd gzip
+
+	header Cache-Control "no-store"
+	@immutable path /assets/* /favicon.ico /favicon.svg
+	header @immutable Cache-Control "public, max-age=31536000, immutable"
+
+	handle /ws/* {
+		import websocket_proxy
+	}
+	handle /api/* {
+		import api_proxy
+	}
+	handle /healthz {
+		import api_proxy
+	}
+	handle /readyz {
+		import api_proxy
+	}
+
+	handle {
+		root * {$WEB_ROOT:/srv/classwatch/web}/admin
+		try_files {path} /index.html
+		file_server
+	}
+}
+
+# ---------------------------------------------------------------------------
+# API 入口
+# ---------------------------------------------------------------------------
+
+{$API_HOST} {
+	import security_headers
+	# api 站点不返回 HTML，CSP 在这里的作用只是兜住错误页/将来可能加的文档页；
+	# 保留它是为了让"安全头清单"只有一个地方需要审阅。
+	import csp
+	import request_body_limit
+	encode zstd gzip
+
+	# API 响应一律不缓存：里面有会话、学生名单、媒体 Token。
+	header Cache-Control "no-store"
+
+	# ── 探针 ───────────────────────────────────────────────────────────────
+	# /healthz 与 /readyz 在服务端**故意**不鉴权、不限流（限流器不能让健康进程
+	# 在编排器眼里看起来是死的）。响应体只有 {"status":...,"checks":{...}}，
+	# 不含版本号之外的任何内部信息，因此对公网开放是可接受的。
+	# 若你的监控源在固定 IP 上，可以收紧成：
+	#   @monitor remote_ip 203.0.113.10/32 2001:db8::/32
+	#   handle @monitor { ... 把下面四个 handle 换成只对 @monitor 生效 ... }
+	handle /healthz {
+		import api_proxy
+	}
+	handle /readyz {
+		import api_proxy
+	}
+
+	# ── LiveKit Cloud 的 webhook 回调（§45）─────────────────────────────────
+	# POST /internal/livekit/webhook。**必须**能从公网访问，否则媒体面的状态
+	# （谁真的进来了、谁真的掉线了）永远不会回流到控制面，现象是
+	# "学生明明已经断线，老师端还显示在线"。
+	# 路径不在 /api 下，所以必须单独列出；漏了它不会有任何报错，只是状态不对。
+	# 安全边界：该 handler 用 LiveKit 签名验证请求体，未签名请求在触碰任何状态之前
+	# 就被 401 拒绝（services/api/internal/httpapi/webhook.go），且故意不受 IP 限流。
+	handle /internal/livekit/webhook {
+		import api_proxy
+	}
+
+	handle /ws/* {
+		import websocket_proxy
+	}
+
+	handle /api/* {
+		import api_proxy
+	}
+
+	# 兜底：api 站点没有静态内容，其余路径也交给 API，
+	# 让它返回统一的 JSON 错误信封（而不是一个 HTML 404 页面）。
+	handle {
+		import api_proxy
+	}
+}
+
+# ---------------------------------------------------------------------------
+# rtc.<domain>（媒体面）
+# ---------------------------------------------------------------------------
+#
+# 当前部署用 **LiveKit Cloud**：信令（wss://<project>.livekit.cloud）、WebRTC
+# 传输与 **TURN/TLS 全部由 LiveKit Cloud 提供**。因此：
+#   - 本机**不需要** rtc.<domain>，也**不需要**自建 coturn；
+#   - RTC_HOST 留空即可，下面的站点块保持注释状态；
+#   - 客户端出站只需要 TCP 443（TURN/TLS 兜底）与 UDP 50000-60000（直连 SFU）；
+#     两者都被封的极端网络下，LiveKit Cloud 的 TURN/TLS 仍应可用 —— 但这必须
+#     实测（见 docs/development/deployment.md 的多网络矩阵与 relay-only 验证）。
+#
+# 只有"自建 LiveKit"时才需要下面这些。三件事必须一起做，缺一件就只剩 host 候选：
+#
+#   1) rtc.<domain> 的 A/AAAA 记录指向这台服务器；
+#   2) LiveKit 配置里 rtc.use_external_ip: true 并固定 node_ip
+#      （否则容器/云主机拿到的是私网地址，ICE 候选不可达）；
+#   3) 防火墙放行：443/tcp（信令 + TURN/TLS）、7881/tcp（RTC over TCP 兜底）、
+#      50000-60000/udp（RTC over UDP）、5349/tcp + 3478/udp（自建 coturn 时）。
+#
+# 自建时的反向代理（TLS 在 Caddy 终结，LiveKit 侧仍是 7880 明文 WS）：
+#
+# {$RTC_HOST} {
+# 	reverse_proxy livekit:7880 {
+# 		header_up X-Forwarded-For {remote_host}
+# 		flush_interval -1
+# 		transport http {
+# 			read_timeout 0
+# 			write_timeout 0
+# 		}
+# 	}
+# }
+#
+# ⚠️ **TURN/TLS 不要用 Caddy（或任何 HTTP 反代）来转发。**
+#    TURN over TLS 是把 TLS 之上的字节流交给 TURN 协议解析，本质不是 HTTP；
+#    用 HTTP 反代转发必然失败，表现为 ICE 里永远只有 host/srflx 候选、
+#    选不到 relay —— 而且在服务器侧看不出任何错误。
+#    自建时由 coturn（或 LiveKit 内置 TURN）自己监听 5349/tcp 并持有证书。

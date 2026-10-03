@@ -1,0 +1,399 @@
+# ============================================================================
+# ClassWatch 生产编排（任务书 §62 / §77 Phase 11）
+#
+# 用法（**所有**变量来自 --env-file；仓库里没有、也不该有任何真实密钥）：
+#
+#   cp deploy/.env.production.example deploy/.env.production   # 逐项填写（该文件必须 gitignore）
+#   docker compose --env-file deploy/.env.production -f deploy/docker-compose.prod.yml config
+#   docker compose --env-file deploy/.env.production -f deploy/docker-compose.prod.yml up -d --build
+#
+# ---------------------------------------------------------------------------
+# 安全边界（谁能从公网到达谁）—— 这是本文件最重要的一张"地图"
+#
+#   edge 网络（有网关、能出网）：**只有 caddy**。80/443 是整份编排里唯一
+#                               published 端口。
+#   app  网络（有网关、能出网）：caddy ↔ api。api 挂在这里因此具备出网能力
+#                               （需要调用 LiveKit Cloud 的 RoomService/Twirp）。
+#   data 网络（internal: true）：api/migrate ↔ postgres/redis。**没有网关**：
+#                               这两个数据存储既不能被公网访问，也不能主动出网
+#                               （即使被拿下，也没有可直接外传数据的路径）。
+#
+# 为什么要拆三张网，而不是"一张 default 网全放进去"：把"公网可达"压缩到恰好
+# 一个容器上。postgres/redis 不写端口映射只是"默认不发布"，一旦有人在排障时
+# 顺手加个 `ports: 5432:5432`，暴露就是一瞬间的事；把它们放在没有网关的网络上，
+# 这类误操作不会立刻变成互联网可达的数据库。
+#
+# ---------------------------------------------------------------------------
+# 单实例限制（必须知道，Phase 11 明确不做多副本）
+#
+#   api 的业务 WebSocket hub 与"私密语音"的进行中状态都在**进程内**
+#   （services/api/internal/realtime、internal/session）。因此：
+#     - api 必须保持 `replicas: 1`（本文件不声明 deploy.replicas，默认即 1）；
+#     - 不能用 `--scale api=2`，也不要加负载均衡轮询：两个副本之间不会互相
+#       转发 WS 消息，老师端会随机丢失一半学生的状态更新；
+#     - 多副本要等 Redis fan-out（订阅/发布）落地，那是 Phase 11 之后的工作。
+#   在 Caddy 侧也不要做任何 api 上游的负载均衡（本文件就是单上游）。
+# ============================================================================
+name: classwatch-prod
+
+# ── 日志轮转（所有服务共用）─────────────────────────────────────────────────
+# WHY 必须显式配置：docker 默认的 json-file 驱动**不轮转**，一块 40GB 的盘
+# 会被一个日志死循环在几小时内写满，随后 PostgreSQL 写入失败、全线不可用。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: '${LOG_MAX_SIZE:-10m}'
+    max-file: '${LOG_MAX_FILE:-5}'
+
+# ── api / migrate 共用的镜像 ────────────────────────────────────────────────
+# 生产必须用**不可变的版本标签**（不要 latest）：回滚就是把这个值改回上一个 tag。
+# 同一个镜像同时提供 api / migrate / adminctl 三个二进制，保证"应用迁移的那份代码"
+# 与"随后启动的服务"版本完全一致（见 services/api/Dockerfile 顶部注释）。
+x-api-image: &api-image
+  image: ${API_IMAGE:?API_IMAGE 未设置：请在 .env.production 里写入不可变镜像标签，如 registry.example.com/classwatch/api:0.11.0}
+  build:
+    context: ../services/api
+    dockerfile: Dockerfile
+    args:
+      VERSION: ${APP_VERSION:-0.11.0}
+      COMMIT: ${APP_COMMIT:-unknown}
+
+# ── api / migrate 共用的环境变量 ────────────────────────────────────────────
+# 两份进程必须看到**完全一致**的连接信息，否则会出现"迁移连的是 A 库、
+# 服务连的是 B 库"这类极难定位的事故。
+x-api-environment: &api-environment
+  APP_ENV: production
+  API_ADDR: ':8080'
+  # 生产日志格式由 APP_ENV=production 决定为 JSON（services/api/internal/
+  # infrastructure/logging），这里只调级别。INFO 足以覆盖访问日志与状态迁移。
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+
+  DATABASE_URL: postgres://${POSTGRES_USER:?POSTGRES_USER 未设置}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB 未设置}?sslmode=disable
+  # 连接池上限与 PostgreSQL 的 max_connections 是同一个预算的两半。
+  # 默认 10 是给"单实例 api + 20~30 学生"的量级（课堂是短事务、低并发写）。
+  DB_MAX_CONNS: ${DB_MAX_CONNS:-10}
+  DB_MIN_CONNS: ${DB_MIN_CONNS:-2}
+  # 迁移由 migrate 一次性服务显式执行，API 启动时**永不**自动迁移（§60）。
+  DB_AUTO_MIGRATE: 'false'
+  # 依赖连不上时拒绝启动，而不是带病对外报告健康。
+  STARTUP_REQUIRE_DEPENDENCIES: 'true'
+
+  REDIS_ADDR: redis:6379
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD 未设置：Redis 只监听内网，但它是会话与限流的状态存储，仍必须设密码}
+  REDIS_DB: ${REDIS_DB:-0}
+  # last_seen_at 的写入节流（可观测性），避免每个请求一次写。
+  SESSION_IDLE_TOUCH_INTERVAL: ${SESSION_IDLE_TOUCH_INTERVAL:-5m}
+  # 指标里"在线课堂/在线上课人数"的刷新周期（定时巡检的间隔）。
+  METRICS_SESSION_REFRESH_INTERVAL: ${METRICS_SESSION_REFRESH_INTERVAL:-15s}
+
+  # 媒体面（LiveKit Cloud）。两个地址协议不同，写错的表现完全不同：
+  #   LIVEKIT_URL     下发给浏览器 → 必须 wss://
+  #   LIVEKIT_API_URL 后端调用 RoomService → 必须 https://
+  LIVEKIT_URL: ${LIVEKIT_URL:?LIVEKIT_URL 未设置：应形如 wss://<project>.livekit.cloud}
+  LIVEKIT_API_URL: ${LIVEKIT_API_URL:?LIVEKIT_API_URL 未设置：应形如 https://<project>.livekit.cloud}
+  LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?LIVEKIT_API_KEY 未设置}
+  LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?LIVEKIT_API_SECRET 未设置：只注入后端，绝不能进前端产物或日志}
+  LIVEKIT_TOKEN_TTL: ${LIVEKIT_TOKEN_TTL:-2h}
+
+  # 会话 Cookie：生产强制 Secure（下面的值写死不接受环境覆盖，
+  # 因为"生产环境误发非 Secure 会话 Cookie"等于把会话明文交给同网络的人）。
+  SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME:-classwatch_session}
+  SESSION_TTL: ${SESSION_TTL:-24h}
+  SESSION_COOKIE_SECURE: 'true'
+
+  PASSWORD_MIN_LENGTH: ${PASSWORD_MIN_LENGTH:-12}
+  RATE_LIMIT_LOGIN_PER_MINUTE: ${RATE_LIMIT_LOGIN_PER_MINUTE:-10}
+  RATE_LIMIT_LOGIN_PER_ACCOUNT_PER_10MIN: ${RATE_LIMIT_LOGIN_PER_ACCOUNT_PER_10MIN:-5}
+  RATE_LIMIT_API_PER_MINUTE: ${RATE_LIMIT_API_PER_MINUTE:-300}
+
+  # 请求体上限（单位：字节）。同一个变量同时注入 Caddy（request_body max_size）
+  # 与 API（http.MaxBytesReader），两端取值一致才不会出现"代理放行、应用拒绝"
+  # 这类需要在两个日志里对时间的错位问题。
+  # 注意单位：这里必须是**整数字节**（Caddy 的 max_size 也接受这个写法），
+  # 不要写 "1MB" —— API 那边按整数解析，写带单位的字符串会让它拒绝启动。
+  HTTP_MAX_BODY_BYTES: ${HTTP_MAX_BODY_BYTES:-1048576}
+
+  # 可信反向代理。**配错的两个后果完全相反**（详见 docs/development/deployment.md）：
+  #   空/写错 → 所有请求的"客户端 IP"都变成 Caddy 容器的内网地址，
+  #             全站共用一个限流桶（一个学生触发限流 = 全校被限流）；
+  #   写得过宽（如 0.0.0.0/0）→ 任何人都能用 X-Forwarded-For 伪造 IP，
+  #             限流被彻底绕过，sessions.ip 这列变成虚构数据。
+  # 这里默认从 CADDY_APP_IP 派生（两者必须一致）；前置 CDN 时才显式覆盖。
+  TRUSTED_PROXIES: ${TRUSTED_PROXIES:-${CADDY_APP_IP:?CADDY_APP_IP 未设置}/32}
+
+  # CORS 白名单：三个真实入口的 https 来源，逗号分隔。
+  # 生产同源反代（见 deploy/Caddyfile）下通常不会触发跨源请求，但这份白名单是
+  # "万一前端被改成直连 api.<domain>"时的第二道门，必须写真实值；禁止 *。
+  CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:?CORS_ALLOWED_ORIGINS 未设置：应列出三个 https 来源}
+
+services:
+  # ── 一次性数据库迁移（发布动作，必须在 api 之前跑完）─────────────────────
+  # WHY 独立成服务而不是藏在 API 启动流程里：迁移是**发布动作**，需要可评审、
+  # 可重跑、可观测。把它藏进启动流程会让"服务起来了但 schema 半新半旧"这种
+  # 故障极难排查（§60）。
+  migrate:
+    <<: *api-image
+    restart: 'no'
+    entrypoint: ['/app/migrate']
+    command: ['up']
+    environment:
+      <<: *api-environment
+    networks: [data]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *default-logging
+
+  # ── 破窗工具：创建第一个管理员 / 重置密码（§4 / §63）─────────────────────
+  # 放进 tools profile：`up -d` 不会启动它，必须显式 `run --rm`。
+  # 密码只从 stdin 传入（adminctl 不支持命令行明文密码参数），
+  # 避免它进入 shell history、`ps` 输出与 CI 日志。
+  # 网络只接 data：这个工具永远不需要出网。
+  adminctl:
+    <<: *api-image
+    profiles: ['tools']
+    restart: 'no'
+    entrypoint: ['/app/adminctl']
+    environment:
+      <<: *api-environment
+    networks: [data]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *default-logging
+
+  # ── 控制面 API ─────────────────────────────────────────────────────────
+  api:
+    <<: *api-image
+    restart: unless-stopped
+    # ⚠️ 故意**没有** ports：API 只在内网被 Caddy 访问。
+    # 一旦在这里发布端口，就绕过了 Caddy 的 TLS、安全响应头、请求体上限与
+    # 统一的 XFF 处理（限流会按伪造 IP 计），等于把 §63 的一半做废。
+    environment:
+      <<: *api-environment
+    networks: [app, data]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # 只读根文件系统 + 无特权提升：API 是唯一直接终止不可信输入的进程，
+    # 被拿下的收益最大，所以加固也最值得花在这里。它不需要写任何本地文件
+    # （迁移是独立进程，日志走 stdout），因此只读是零成本的。
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      # 这里用 /readyz 而不是 /healthz，与镜像自带的 HEALTHCHECK 故意不同：
+      #   - compose 层的健康状态决定 **caddy 是否放行流量**（depends_on），
+      #     所以它必须是 readiness：连不上 PostgreSQL 的副本不该接流量；
+      #   - 镜像自带的 HEALTHCHECK 仍是 /healthz，因为它的语义是"要不要重启容器"，
+      #     而重启数据库抖动只会把一次小故障放大成重启风暴。
+      test: ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:8080/readyz || exit 1']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # 给长连接留出优雅退出时间：课堂进行中被强杀会让所有学生端同时重连。
+    stop_grace_period: 30s
+    deploy:
+      # 单实例（见文件头"单实例限制"）：WS hub 与私密语音状态在进程内。
+      replicas: 1
+      resources:
+        limits:
+          cpus: '${API_CPU_LIMIT:-2.0}'
+          memory: ${API_MEM_LIMIT:-1g}
+          pids: 512
+        reservations:
+          cpus: '0.25'
+          memory: 256m
+    logging: *default-logging
+
+  # ── 数据库（唯一 Source of Truth）───────────────────────────────────────
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER 未设置}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB 未设置}
+      # 固定 UTF8：display_name 是中文，编码必须在建库时就定死。
+      POSTGRES_INITDB_ARGS: '--encoding=UTF8'
+    # ⚠️ 故意**没有** ports：数据库只能被 data 网络内的 api/migrate 访问。
+    # 需要 psql 时用 `docker compose exec postgres psql ...`，不要临时发布端口。
+    networks: [data]
+    volumes:
+      # postgres:18 起 PGDATA 位于 /var/lib/postgresql/<major>/docker，
+      # 挂载父目录才能跨大版本安全保留数据（与开发环境一致的取舍）。
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    # PostgreSQL 收到 SIGTERM 后会等待当前事务收尾；默认 10s 可能不够，
+    # 被 SIGKILL 的后果是下次启动要走崩溃恢复。
+    stop_grace_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: '${POSTGRES_CPU_LIMIT:-2.0}'
+          memory: ${POSTGRES_MEM_LIMIT:-1g}
+        reservations:
+          memory: 256m
+    logging: *default-logging
+
+  # ── Redis（会话 + 限流状态）─────────────────────────────────────────────
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    # 需要密码：Redis 里存的是会话索引与限流计数器，虽然只在内网，
+    # 但"内网"不等于"可信"——同宿主机上任何别的容器都能连到它。
+    # ⚠️ 命令行参数会出现在 docker inspect / ps 里；这里接受这一点，因为该值
+    # 同时也以环境变量形式存在于 api 容器中，本身不是长期密钥，
+    # 且轮换成本很低（改 .env.production 后重启 redis 与 api 即可）。
+    command:
+      - redis-server
+      - --appendonly
+      - 'yes'
+      - --requirepass
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD 未设置}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD 未设置}
+    # ⚠️ 故意**没有** ports。
+    networks: [data]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli -a "$$REDIS_PASSWORD" ping | grep -q PONG']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '${REDIS_CPU_LIMIT:-1.0}'
+          memory: ${REDIS_MEM_LIMIT:-512m}
+    logging: *default-logging
+
+  # ── 三个 SPA 的构建产物发布（一次性容器）────────────────────────────────
+  # 把镜像里已经构建好的静态产物拷进 webdist 卷，caddy 只读挂载它。
+  # WHY 用"一次性容器 + 卷"而不是 bind mount 宿主的 dist 目录：
+  #   bind mount 一个**不存在**的宿主目录时，Docker 会静默创建空目录，
+  #   站点打开是白屏而不是报错 —— "部署成功但站点是空的"是最难查的失败形态。
+  #   走镜像还能让 CI/生产使用完全相同的 Node/pnpm/lockfile，回滚 = 换镜像 tag。
+  web-dist:
+    image: ${WEB_IMAGE:?WEB_IMAGE 未设置：应为三个 SPA 的构建镜像标签，见 deploy/docker/web.Dockerfile}
+    build:
+      context: ..
+      dockerfile: deploy/docker/web.Dockerfile
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:26-alpine}
+    restart: 'no'
+    # 只做本地文件拷贝，不需要任何网络（连 DNS 都不需要）。
+    network_mode: 'none'
+    volumes:
+      - webdist:/dest
+    logging: *default-logging
+
+  # ── 反向代理 / TLS 终结（唯一对公网暴露的容器）──────────────────────────
+  caddy:
+    # 固定次版本：Caddy 的指令与默认行为会随小版本演进，回滚时行为必须可复现。
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+      # HTTP/3（QUIC）。如果云防火墙不允许 UDP 443，删掉这一行即可 ——
+      # 只会退回 HTTP/2，不影响课堂（媒体面不走这里）。
+      - '443:443/udp'
+    environment:
+      # 域名一律通过环境变量注入，Caddyfile 里不出现任何真实域名。
+      STUDENT_HOST: ${STUDENT_HOST:?STUDENT_HOST 未设置}
+      TEACHER_HOST: ${TEACHER_HOST:?TEACHER_HOST 未设置}
+      ADMIN_HOST: ${ADMIN_HOST:?ADMIN_HOST 未设置}
+      API_HOST: ${API_HOST:?API_HOST 未设置}
+      RTC_HOST: ${RTC_HOST:-}
+      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL 未设置：证书到期提醒的收件人，写真实可收信的地址}
+      # 静态产物在容器内的挂载点（与 Caddyfile 的 {$WEB_ROOT} 对应）。
+      WEB_ROOT: /srv/classwatch/web
+      # 上游用 compose 的**服务名**而不是 localhost：caddy 与 api 同处 app 网络。
+      API_UPSTREAM: api:8080
+      HTTP_MAX_BODY_BYTES: ${HTTP_MAX_BODY_BYTES:-1MB}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # 前端静态产物（由 web-dist 一次性容器填充）。
+      - webdist:/srv/classwatch/web:ro
+      # ⚠️ 证书与 ACME 账户**必须持久化**：重签一次就要重新向 Let's Encrypt
+      # 申请（每周 50 个同名证书的速率限制，很可能把生产卡死一整天）。
+      - caddydata:/data
+      - caddyconfig:/config
+    networks:
+      app:
+        # 固定 IP：TRUSTED_PROXIES 要精确指向"代理本身"。
+        # 写成整个网段也能用，但那等于允许 app 网内任何容器伪造客户端 IP。
+        ipv4_address: ${CADDY_APP_IP:?CADDY_APP_IP 未设置：例如 172.31.0.2}
+      edge: {}
+    depends_on:
+      # 先有静态产物（web-dist 退出码 0），再有站点。
+      web-dist:
+        condition: service_completed_successfully
+      # 再等 API **就绪**：否则 Caddy 会在 API 还没连上数据库时对外提供
+      # 502/500，用户看到的是"网站坏了"。
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '${CADDY_CPU_LIMIT:-1.0}'
+          memory: ${CADDY_MEM_LIMIT:-256m}
+    logging: *default-logging
+
+# ---------------------------------------------------------------------------
+# 网络
+# ---------------------------------------------------------------------------
+networks:
+  # 面向公网的一侧：只有 caddy 加入。自动分配网段。
+  edge:
+    driver: bridge
+
+  # caddy ↔ api：api 在这里获得出网能力（调 LiveKit Cloud）。
+  # 固定网段是为了让 TRUSTED_PROXIES 能够被写成确定的 /32。
+  # 如果与服务器上已有的 docker 网络冲突（表现为 up 时报
+  # "Pool overlaps with other one on this address space"），改这里的网段，
+  # 并同步修改 .env.production 里的 CADDY_APP_IP。
+  app:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+
+  # 数据存储：internal: true = 没有网关。
+  # postgres/redis 既不能被公网访问，也不能主动出网。
+  data:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.1.0/24
+
+# ---------------------------------------------------------------------------
+# 卷
+# ---------------------------------------------------------------------------
+volumes:
+  # 数据库数据。**备份脚本只备份这个卷里的逻辑内容**（pg_dump），
+  # 不要试图备份卷目录本身：在数据库运行中拷贝文件级快照得到的是坏备份。
+  pgdata:
+  redisdata:
+  # 三个 SPA 的静态产物（web-dist 写、caddy 只读）。
+  webdist:
+  # ACME 账户与证书。丢了不会丢数据，但会触发重新签发（见 caddy 的注释）。
+  caddydata:
+  caddyconfig:

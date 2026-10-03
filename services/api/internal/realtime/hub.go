@@ -11,6 +11,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+
+	"github.com/classwatch/classwatch/services/api/internal/metrics"
 )
 
 // Role is which entry point a connection came in through (§5). It is part of a
@@ -49,6 +51,11 @@ type HubConfig struct {
 	// bytes, so the limit is a safety net against a client that streams megabytes into
 	// a supervision server.
 	ReadLimit int64
+	// Metrics is the §77 instrumentation: live connection gauge, message counters and
+	// the slow-consumer counter. It is optional — a nil value makes every recording a
+	// no-op — and it is recorded at the hub rather than in the HTTP handler because the
+	// hub is what owns connection lifetime and the write queue.
+	Metrics *metrics.Metrics
 }
 
 // defaultHubConfig returns the production timings, named so the reasoning is greppable.
@@ -89,6 +96,7 @@ func defaultHubConfig() HubConfig {
 type Hub struct {
 	cfg      HubConfig
 	logger   *slog.Logger
+	metrics  *metrics.Metrics
 	upgrader websocket.Upgrader
 
 	mu       sync.RWMutex
@@ -130,6 +138,7 @@ func NewHub(cfg HubConfig) *Hub {
 	return &Hub{
 		cfg:      cfg,
 		logger:   logger,
+		metrics:  cfg.Metrics,
 		students: make(map[uuid.UUID]map[*conn]struct{}),
 		teachers: make(map[uuid.UUID]map[*conn]struct{}),
 		upgrader: websocket.Upgrader{
@@ -399,10 +408,12 @@ func (c *conn) readPump() closeReason {
 			Type string `json:"type"`
 		}
 		if err := json.Unmarshal(raw, &envelope); err != nil {
+			c.hub.metrics.IncWSMessage(metrics.DirectionIn, inboundMessageLabel(""))
 			c.logger.Debug("websocket message ignored",
 				"action", "ws_message_ignored", "reason", "not a json object")
 			continue
 		}
+		c.hub.metrics.IncWSMessage(metrics.DirectionIn, inboundMessageLabel(envelope.Type))
 		switch MessageType(envelope.Type) {
 		case TypePing:
 			c.enqueue(newMessage(TypePong, nil))
@@ -445,6 +456,10 @@ func (c *conn) writePump() {
 			if err := c.ws.WriteJSON(msg); err != nil {
 				return
 			}
+			// Counted after the write succeeded: a message that never left the
+			// process is not traffic, and counting it would hide a broken socket
+			// behind a healthy-looking rate.
+			c.hub.metrics.IncWSMessage(metrics.DirectionOut, outboundMessageLabel(msg.Type))
 
 		case <-ticker.C:
 			// A control PING is the liveness probe: the browser answers it without any
@@ -487,6 +502,7 @@ func (c *conn) enqueue(msg Message) {
 	select {
 	case c.send <- msg:
 	default:
+		c.hub.metrics.IncWSSlowConsumerDisconnect()
 		c.hub.logger.Warn("websocket client too slow; dropping the connection",
 			"action", "ws_slow_consumer",
 			"role", string(c.role),
@@ -527,9 +543,16 @@ func (c *conn) closeText() string {
 }
 
 // register adds a connection to the registry.
+//
+// The live-connection gauge is incremented here and decremented in unregister, which
+// are exactly paired: a connection is registered once (right after a successful
+// upgrade) and unregistered once (by the write pump's deferred cleanup, whatever
+// ended it). Recording it anywhere else would drift on the paths that end a socket
+// without a message — a client close, a read deadline, a policy violation.
 func (h *Hub) register(c *conn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.metrics.AddWSConnection(metricsRole(c.role), 1)
 	index := h.students
 	if c.role == RoleTeacher {
 		index = h.teachers
@@ -544,6 +567,7 @@ func (h *Hub) register(c *conn) {
 func (h *Hub) unregister(c *conn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.metrics.AddWSConnection(metricsRole(c.role), -1)
 	index := h.students
 	if c.role == RoleTeacher {
 		index = h.teachers
@@ -660,6 +684,46 @@ func (h *Hub) Shutdown(ctx context.Context) {
 		// closed by the write pumps' deferred Close (or by the OS).
 		h.logger.Warn("websocket shutdown timed out", "action", "ws_shutdown_timeout")
 	}
+}
+
+// metricsRole maps a connection's entry point onto the metric label.
+//
+// The mapping is explicit rather than a string conversion so that adding a role to
+// this package cannot silently create a new time series: the compiler forces a
+// decision here, and the label set stays closed (see docs/architecture/observability.md).
+func metricsRole(role Role) string {
+	if role == RoleTeacher {
+		return metrics.WSRoleTeacher
+	}
+	return metrics.WSRoleStudent
+}
+
+// inboundMessageLabel bounds the `type` label of a CLIENT message.
+//
+// The type comes from the client, so it is unbounded: a script that sends
+// {"type":"<30 random characters>"} in a loop would otherwise create one time
+// series per message, and a scraper would fall over long before the hub did. Only
+// the single message type this protocol accepts keeps its name; everything else
+// collapses into a fixed label.
+func inboundMessageLabel(messageType string) string {
+	switch MessageType(messageType) {
+	case TypePing:
+		return messageType
+	case "":
+		return "unparseable"
+	default:
+		return "other"
+	}
+}
+
+// outboundMessageLabel maps a server message onto its label. Server types are a
+// closed set generated by this codebase, so the value passes through; the fallback
+// exists so a zero-value message cannot produce an empty label.
+func outboundMessageLabel(messageType MessageType) string {
+	if messageType == "" {
+		return "unknown"
+	}
+	return string(messageType)
 }
 
 // closeReason is why a connection ended, in the vocabulary of a WebSocket close code.

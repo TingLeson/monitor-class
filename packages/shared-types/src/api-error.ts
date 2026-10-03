@@ -110,6 +110,18 @@ export const BACKEND_API_ERROR_CODES = [
    */
   'TEACHER_MIC_REQUIRED',
   'PRIVATE_TALK_UNAVAILABLE',
+  /**
+   * Phase 11 新增的四个 HTTP 语义码（§63/§77）。
+   *
+   * WHY 不再复用 INVALID_REQUEST：加固后这几类拒绝各自对应**完全不同的处置**——
+   * 404/405 是前端调错地址/方法（改代码，重试无用），413 是提交内容过大（改内容），
+   * 503 是服务端正在排空/重启（**应当退避重试**，也是唯一"等一下就好"的一类）。
+   * 塌缩成一个码，界面只能对用户说一句无用的话，或者对着 503 白重试。
+   */
+  'NOT_FOUND',
+  'METHOD_NOT_ALLOWED',
+  'PAYLOAD_TOO_LARGE',
+  'SERVICE_UNAVAILABLE',
 ] as const
 
 /**
@@ -169,6 +181,16 @@ export const API_ERROR_MESSAGES: Record<ApiErrorCode, string> = {
   // 前端优先展示后端那句话；这条只是它没给 message 时的兜底。
   INVALID_REQUEST: '请求未被接受，请检查填写内容后重试。',
 
+  /**
+   * Phase 11：地址/方法错误属**开发期错误**（路径或方法写错），用户改不了，
+   * 所以文案给"刷新/联系管理员"，而不是让他反复重试。
+   */
+  NOT_FOUND: '请求的接口不存在。请刷新页面后重试；若仍然出现，请联系管理员。',
+  METHOD_NOT_ALLOWED: '请求方式不被支持。这通常是程序缺陷，请刷新页面后重试。',
+  /** 提交内容过大（与 404/405 不同：用户**可以**改小内容后重试）。 */
+  PAYLOAD_TOO_LARGE: '提交的内容过大，请减小后重试。',
+  /** 排空/重启期：全站唯一一类"等一下再试就有用"的错误，前端可据此退避重试。 */
+  SERVICE_UNAVAILABLE: '服务暂时不可用（可能正在升级）。请稍候，页面会自动重试。',
   CLASSROOM_NOT_FOUND: '课堂不存在或已被删除。',
   CLASSROOM_NOT_OWNER: '只有课堂的创建老师可以执行该操作。',
   CLASSROOM_CLOSED: '课堂尚未开启或已经关闭。',
