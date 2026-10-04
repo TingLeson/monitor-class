@@ -409,6 +409,23 @@
 		import api_proxy
 	}
 
+	# ── /metrics 不对外发布 ────────────────────────────────────────────────
+	#
+	# WHY 必须显式拦：下面那条兜底 handle 会把**所有**未列出的路径都转给 API，
+	# 于是 /metrics 就被顺带公开了（实际部署时就是这样，公网 GET 返回 200）。
+	# 文档里写着"仅内网抓取"，但文档不是执行者——必须在这里写死。
+	#
+	# 只允许白名单来源抓取（默认仅本机回环）；其余一律 404 而不是 403：
+	# 403 等于告诉扫描器"这里有个受保护的端点"，404 什么都不透露。
+	@metrics path /metrics
+	handle @metrics {
+		@metrics_allowed remote_ip {$METRICS_ALLOWED_CIDRS:127.0.0.1/8 ::1}
+		handle @metrics_allowed {
+			import api_proxy
+		}
+		respond 404
+	}
+
 	# 兜底：api 站点没有静态内容，其余路径也交给 API，
 	# 让它返回统一的 JSON 错误信封（而不是一个 HTML 404 页面）。
 	handle {
