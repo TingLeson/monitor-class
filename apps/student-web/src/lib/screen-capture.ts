@@ -46,7 +46,15 @@ export const SCREEN_CAPTURE_ERROR_CODES = [
 
 /** 能力自检失败的三种具体原因（§17 逐项检查）。 */
 export type ScreenCaptureUnsupportedReason =
-  'no-mediaDevices' | 'no-getDisplayMedia' | 'no-getSettings'
+  /**
+   * 页面不在**安全上下文**里（http:// 的局域网 IP 或域名）。
+   *
+   * WHY 必须与 `no-mediaDevices` 分开：在 http:// 下 `navigator.mediaDevices`
+   * **就是** undefined，两者在代码层长得一模一样，但学生的动作完全相反——
+   * 换浏览器没有用，必须换成 https:// 或 localhost。真实课堂测试里就有人
+   * 被"请使用最新版 Chrome 或 Edge"骗去升级浏览器，而问题在地址栏。
+   */
+  'insecureContext' | 'no-mediaDevices' | 'no-getDisplayMedia' | 'no-getSettings'
 
 /**
  * `getSettings().displaySurface` 的取值。
@@ -228,6 +236,11 @@ export class ScreenGateError extends Error {
  * 这是纯读取检查，**不产生任何副作用**：不会请求权限、不会弹窗。
  */
 export function checkScreenCaptureSupport(): ScreenCaptureSupport {
+  // 顺序很关键：安全上下文必须**先**判。不安全时 mediaDevices 本来就是 undefined，
+  // 放到后面判会永远命中 no-mediaDevices，把"地址不对"误报成"浏览器太旧"。
+  if (typeof window !== 'undefined' && window.isSecureContext === false) {
+    return { supported: false, reason: 'insecureContext' }
+  }
   const devices: MediaDevices | undefined = navigator.mediaDevices
   if (!devices) return { supported: false, reason: 'no-mediaDevices' }
   if (typeof devices.getDisplayMedia !== 'function') {

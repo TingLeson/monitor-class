@@ -375,6 +375,30 @@ describe('文案（§16 / §17 / §22 原文）', () => {
     expect(message.description).toContain('请使用系统支持的最新版 Chrome 或 Edge')
   })
 
+  it('http:// 局域网地址（非安全上下文）必须报 insecureContext，而不是"浏览器太旧"', () => {
+    // 真实测试暴露的问题：在 http:// + 局域网 IP 下 navigator.mediaDevices 就是
+    // undefined，早期实现把它归成 no-mediaDevices，于是界面让学生去"升级浏览器"，
+    // 而真正要做的是换成 https://。两者的学生动作完全相反，必须分开。
+    const original = Object.getOwnPropertyDescriptor(window, 'isSecureContext')
+    Object.defineProperty(window, 'isSecureContext', { value: false, configurable: true })
+    try {
+      const support = checkScreenCaptureSupport()
+      expect(support.supported).toBe(false)
+      expect(support.reason).toBe('insecureContext')
+      // `reason` 在类型上是可选的（只在 supported === false 时有意义），
+      // 所以这里显式收窄一次，而不是用非空断言把类型系统关掉。
+      if (support.supported || support.reason === undefined) {
+        throw new Error('能力自检应当报 insecureContext')
+      }
+      const message = describeScreenGateFailure({ kind: 'unsupported', reason: support.reason })
+      expect(message.description).toContain('https://')
+      expect(message.description).toContain('localhost')
+    } finally {
+      if (original) Object.defineProperty(window, 'isSecureContext', original)
+      else Reflect.deleteProperty(window, 'isSecureContext')
+    }
+  })
+
   it('displaySurface 缺失：同样是 §16/§17 原文', () => {
     const message = describeScreenGateFailure({
       kind: 'capture',

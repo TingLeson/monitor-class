@@ -33,6 +33,15 @@ export const SCREEN_UNVERIFIABLE_NOTICE =
  * "系统坏了"。措辞刻意保持为可读的中文，不是堆栈。
  */
 const UNSUPPORTED_REASONS: Record<ScreenCaptureUnsupportedReason, string> = {
+  /**
+   * 最容易被误判的一种：**换浏览器解决不了**，所以要给出地址栏层面的动作。
+   * Chrome / Edge / Safari 都只在 https:// 或 localhost 下提供屏幕捕获——
+   * 用 http:// + 局域网 IP 打开时，浏览器连 API 都不暴露。这是浏览器的安全模型，
+   * 不是浏览器版本问题，也不是本系统的限制。
+   */
+  insecureContext:
+    '当前地址不是安全上下文：浏览器只在 https:// 或 localhost 下提供屏幕捕获接口，' +
+    '而你现在用的是 http:// 的局域网地址。请让老师把入口换成 https://，或在运行服务的那台电脑上用 localhost 打开。',
   'no-mediaDevices': '这个浏览器没有提供任何媒体设备接口（navigator.mediaDevices 不存在）。',
   'no-getDisplayMedia': '这个浏览器没有屏幕共享接口（getDisplayMedia 不存在）。',
   'no-getSettings':
