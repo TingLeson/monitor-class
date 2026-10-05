@@ -1,6 +1,8 @@
 {
   "extends": ["@vue/tsconfig/tsconfig.dom.json", "../../tsconfig.base.json"],
   "compilerOptions": {
+    // 该 app 的测试里有一条仓库级守卫（读源码找"给开发者看的文字"），需要 node 类型。
+    "types": ["node"],
     // composite + noEmit：允许 `vue-tsc --build` 增量检查 .vue 文件而不产出 JS。
     "composite": true,
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo"

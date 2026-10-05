@@ -132,7 +132,7 @@ onMounted(async () => {
           required
           :disabled="submitting"
           :error="passwordError ?? undefined"
-          hint="管理员账号只能由破窗工具创建；忘记密码请联系其他管理员或使用 make create-admin。"
+          hint="忘记密码请联系其他管理员，或让运维人员在服务器上重置。"
           @enter="onSubmit"
         />
 

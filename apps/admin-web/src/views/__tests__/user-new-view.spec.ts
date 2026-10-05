@@ -65,13 +65,27 @@ describe('管理端新建账号页', () => {
     createUserMock.mockReset().mockResolvedValue(makeStudent())
   })
 
-  it('不提供"管理员"选项，并写明原因（§4 只允许运维创建管理员）', async () => {
+  it('不提供"管理员"选项，并对用户说明管理员账号从哪里来（§4）', async () => {
     const { wrapper } = await mountUserNewView()
 
     expect(wrapper.find('[data-testid="role-option-ADMIN"]').exists()).toBe(false)
     expect(wrapper.find('[data-testid="role-option-TEACHER"]').exists()).toBe(true)
     expect(wrapper.find('[data-testid="role-option-STUDENT"]').exists()).toBe(true)
-    expect(wrapper.find('[data-testid="no-admin-notice"]').text()).toContain('make create-admin')
+    expect(wrapper.find('[data-testid="no-admin-notice"]').text()).toContain(
+      '运维人员在服务器上创建',
+    )
+  })
+
+  it('界面上不出现任何"给开发者看"的文字（规范条款 / 阶段 / 服务器命令）', async () => {
+    // 用户看得见的地方只讲"你能做什么"。§、Phase、服务器命令这类信息属于代码注释，
+    // 一旦渲进界面，用户会以为系统缺功能或者没做完。
+    const { wrapper } = await mountUserNewView()
+    const visible = wrapper.text()
+
+    expect(visible).not.toMatch(/§/)
+    expect(visible).not.toMatch(/Phase\s*\d/)
+    expect(visible).not.toMatch(/make\s+create-admin|adminctl/)
+    expect(visible).not.toMatch(/V1\b|缺功能/)
   })
 
   it('选学生时不存在密码输入框，并说明免密是业务规则（§2.2）', async () => {
@@ -79,7 +93,9 @@ describe('管理端新建账号页', () => {
 
     expect(wrapper.find('input[type="password"]').exists()).toBe(false)
     expect(wrapper.find('[data-testid="password-field"]').exists()).toBe(false)
-    expect(wrapper.find('[data-testid="student-no-password-notice"]').text()).toContain('§2.2')
+    expect(wrapper.find('[data-testid="student-no-password-notice"]').text()).toContain(
+      '只需输入账号',
+    )
   })
 
   it('创建学生时请求体里没有 password 字段', async () => {

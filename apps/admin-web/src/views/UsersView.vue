@@ -371,8 +371,7 @@ async function copyOneTimePassword(): Promise<void> {
       <div class="space-y-1">
         <h1 class="text-2xl font-semibold tracking-tight">用户管理</h1>
         <p class="max-w-2xl text-sm leading-relaxed text-ink-muted">
-          创建老师与学生账号、编辑显示名、启用或停用账号、重置老师密码。管理员账号由运维用
-          <code>make create-admin</code> 创建，不在这里管理。
+          创建老师与学生账号、编辑显示名、启用或停用账号、重置老师密码。管理员账号由运维人员在服务器上创建，不在这里管理。
         </p>
       </div>
       <!-- 用链接而不是 router.push 的按钮：管理端页面也要能被中键/新标签页打开。 -->

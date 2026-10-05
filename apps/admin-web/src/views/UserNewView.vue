@@ -31,7 +31,7 @@ const store = useUsersStore()
 const ACCOUNT_PATTERN = /^[A-Za-z0-9._-]{3,64}$/
 
 const ROLE_HINTS: Record<AdminCreatableRole, { label: string; hint: string }> = {
-  STUDENT: { label: '学生', hint: '只需账号，登录时不输入密码（§2.2）' },
+  STUDENT: { label: '学生', hint: '只需账号，登录时不输入密码' },
   TEACHER: { label: '老师', hint: '账号 + 初始密码，可创建并管理自己的课堂' },
 }
 
@@ -174,9 +174,7 @@ async function onSubmit(): Promise<void> {
   <div class="mx-auto flex max-w-2xl flex-col gap-6">
     <header class="space-y-1">
       <h1 class="text-2xl font-semibold tracking-tight">新建账号</h1>
-      <p class="text-sm leading-relaxed text-ink-muted">
-        账号由管理员创建，V1 不提供任何自助注册入口（§2.2 / §68）。
-      </p>
+      <p class="text-sm leading-relaxed text-ink-muted">账号由管理员创建，系统不提供自助注册。</p>
     </header>
 
     <AppCard>
@@ -211,11 +209,13 @@ async function onSubmit(): Promise<void> {
           </div>
         </fieldset>
 
-        <!-- 说明为什么没有管理员选项：不说清楚，管理员会以为是系统缺功能（§4）。 -->
+        <!--
+            为什么界面上没有"管理员选项"（§4）：管理员账号只能由运维在服务器上创建，
+            管理端接口刻意不提供该能力——否则一个被盗的管理员会话就能造出永久后门。
+            界面只讲"能做什么"，这段安全推理留在注释里，不渲进页面。
+          -->
         <AppAlert tone="info" data-testid="no-admin-notice">
-          这里没有"管理员"选项，后端也会拒绝创建管理员：§4 只允许运维在服务器上执行
-          <code>make create-admin</code> 创建管理员。管理端接口若能造管理员，一个被盗的管理员会话
-          就能留下一个永久后门。
+          管理员账号由运维人员在服务器上创建，这里只能创建老师与学生账号。
         </AppAlert>
 
         <AppTextField
@@ -253,10 +253,9 @@ async function onSubmit(): Promise<void> {
           data-testid="password-field"
         />
 
-        <!-- 学生免密是业务规则，必须写出来：否则会被当成"忘了做密码框"。 -->
+        <!-- 学生免密是业务规则（§2.2），必须写出来：否则会被当成"忘了做密码框"。 -->
         <AppAlert v-else tone="info" data-testid="student-no-password-notice">
-          学生账号不设置密码：学生登录时只输入账号（§2.2 明确的业务规则，不是缺功能）。
-          因此这里没有密码框，后端也会拒绝"带密码的学生"。
+          学生账号不使用密码：学生登录时只需输入账号。
         </AppAlert>
 
         <AppAlert v-if="submitError" tone="danger" data-testid="submit-error">

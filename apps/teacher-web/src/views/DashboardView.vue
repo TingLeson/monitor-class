@@ -70,7 +70,7 @@ function formatLastLogin(value: string | null | undefined): string {
       </div>
     </AppCard>
 
-    <AppCard title="我的课堂" description="这些数字来自你的课堂列表，不是另一个统计接口。">
+    <AppCard title="我的课堂" description="这里是你名下课堂的当前情况。">
       <div class="grid gap-6 sm:grid-cols-2">
         <div class="space-y-1">
           <p class="text-xs tracking-wide text-ink-muted uppercase">课堂总数</p>

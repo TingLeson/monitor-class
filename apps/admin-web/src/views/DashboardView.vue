@@ -94,8 +94,7 @@ onMounted(() => {
     <header class="space-y-1">
       <h1 class="text-2xl font-semibold tracking-tight">管理概览</h1>
       <p class="max-w-2xl text-sm leading-relaxed text-ink-muted">
-        管理员的职责是账号体系：创建老师与学生、启停账号、重置老师密码。课堂由老师自己管理，
-        管理员不进入任何课堂（§4）。
+        管理员的职责是账号体系：创建老师与学生、启停账号、重置老师密码。课堂由老师自己管理，管理员不进入课堂。
       </p>
     </header>
 
@@ -163,7 +162,7 @@ onMounted(() => {
           <div class="space-y-1">
             <h2 class="text-lg font-semibold tracking-tight">账号概览</h2>
             <p class="max-w-2xl text-sm leading-relaxed text-ink-muted">
-              数字来自后端列表接口的 total（每项只取 1 条记录）。
+              这里的数字是各类账号的当前数量，随账号变动自动更新。
             </p>
           </div>
           <AppButton
